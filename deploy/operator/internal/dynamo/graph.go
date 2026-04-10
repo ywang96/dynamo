@@ -1297,6 +1297,7 @@ func GeneratePodSpecForComponent(
 var dgdPropagatedAnnotationKeys = []string{
 	commonconsts.KubeAnnotationEnableMetrics,
 	commonconsts.KubeAnnotationDynamoDiscoveryBackend,
+	commonconsts.KubeAnnotationDynamoKubeDiscoveryMode,
 	commonconsts.KubeAnnotationDynamoOperatorOriginVersion,
 	commonconsts.KubeAnnotationVLLMDistributedExecutorBackend,
 }
@@ -1424,6 +1425,17 @@ func GenerateGrovePodCliqueSet(
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate podSpec for role %s: %w", r.Name, err)
 			}
+
+			// Inject kube discovery mode env var into all containers if annotation is set
+			if mode, ok := component.Annotations[commonconsts.KubeAnnotationDynamoKubeDiscoveryMode]; ok && mode != "" {
+				for i := range podSpec.Containers {
+					podSpec.Containers[i].Env = append(podSpec.Containers[i].Env,
+						corev1.EnvVar{Name: "CONTAINER_NAME", Value: podSpec.Containers[i].Name},
+						corev1.EnvVar{Name: "DYN_KUBE_DISCOVERY_MODE", Value: mode},
+					)
+				}
+			}
+
 			if operatorConfig.Checkpoint.Enabled {
 				if err := checkpoint.InjectCheckpointIntoPodSpec(
 					ctx,

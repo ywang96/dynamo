@@ -1077,6 +1077,22 @@ func (r *DynamoComponentDeploymentReconciler) generatePodTemplateSpec(ctx contex
 
 	podLabels[commonconsts.KubeLabelDynamoSelector] = kubeName
 
+	// Add discovery labels to pod template for Pod-based daemon filtering
+	if commonController.IsK8sDiscoveryEnabled(r.Config.Discovery.Backend, opt.dynamoComponentDeployment.Spec.Annotations) {
+		podLabels[commonconsts.KubeLabelDynamoDiscoveryBackend] = "kubernetes"
+		podLabels[commonconsts.KubeLabelDynamoDiscoveryEnabled] = commonconsts.KubeLabelValueTrue
+	}
+
+	// Inject kube discovery mode env var into all containers if annotation is set
+	if mode, ok := opt.dynamoComponentDeployment.Spec.Annotations[commonconsts.KubeAnnotationDynamoKubeDiscoveryMode]; ok && mode != "" {
+		for i := range podSpec.Containers {
+			podSpec.Containers[i].Env = append(podSpec.Containers[i].Env,
+				corev1.EnvVar{Name: "CONTAINER_NAME", Value: podSpec.Containers[i].Name},
+				corev1.EnvVar{Name: "DYN_KUBE_DISCOVERY_MODE", Value: mode},
+			)
+		}
+	}
+
 	extraPodMetadata := opt.dynamoComponentDeployment.Spec.ExtraPodMetadata
 
 	if extraPodMetadata != nil {
