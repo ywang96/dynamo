@@ -1267,6 +1267,75 @@ fn accumulate_reasoning_dispatch(
     events
 }
 
+/// Per-stream state for the `reasoning_split` post-processor: one
+/// [`BasicReasoningParser`] per choice index, keeping cross-chunk buffer state.
+#[derive(Default)]
+struct ReasoningSplitState {
+    parsers: HashMap<u32, dynamo_parsers::BasicReasoningParser>,
+}
+
+impl ReasoningSplitState {
+    fn parser_for(&mut self, index: u32) -> &mut dynamo_parsers::BasicReasoningParser {
+        self.parsers.entry(index).or_insert_with(|| {
+            // `force_reasoning=false`: the upstream `minimax_append_think` parser
+            // prepends a real `<think>` token to the first content chunk, so the
+            // frontend sees the opener naturally. `stream_reasoning=true` so
+            // reasoning is emitted incrementally instead of buffered.
+            dynamo_parsers::BasicReasoningParser::new(
+                "<think>".into(),
+                "</think>".into(),
+                false,
+                true,
+            )
+        })
+    }
+}
+
+/// Lifts a `<think>...</think>` prefix out of a streaming delta's `content`
+/// text into `reasoning_content`. No-op for multimodal `Parts` content, and
+/// pass-through if the upstream worker already split reasoning out itself
+/// (in which case `content` won't contain the think tags).
+fn apply_reasoning_split_to_delta(
+    delta: &mut ChatCompletionStreamResponseDelta,
+    index: u32,
+    state: &mut ReasoningSplitState,
+) {
+    use dynamo_parsers::ReasoningParser;
+    let text = match delta.content.take() {
+        Some(ChatCompletionMessageContent::Text(s)) => s,
+        other => {
+            delta.content = other;
+            return;
+        }
+    };
+    if text.is_empty() {
+        return;
+    }
+    let result = state
+        .parser_for(index)
+        .parse_reasoning_streaming_incremental(&text, &[]);
+    if !result.reasoning_text.is_empty() {
+        match delta.reasoning_content.as_mut() {
+            Some(existing) => existing.push_str(&result.reasoning_text),
+            None => delta.reasoning_content = Some(result.reasoning_text),
+        }
+    }
+    if !result.normal_text.is_empty() {
+        delta.content = Some(ChatCompletionMessageContent::Text(result.normal_text));
+    }
+}
+
+/// Walks every choice in a streaming response and applies the per-choice
+/// reasoning-split transform.
+fn apply_reasoning_split_to_stream_response(
+    response: &mut NvCreateChatCompletionStreamResponse,
+    state: &mut ReasoningSplitState,
+) {
+    for choice in &mut response.inner.choices {
+        apply_reasoning_split_to_delta(&mut choice.delta, choice.index, state);
+    }
+}
+
 /// OpenAI Chat Completions Request Handler
 ///
 /// This method will handle the incoming request for the /v1/chat/completions endpoint. The endpoint is a "source"
@@ -1285,6 +1354,10 @@ async fn chat_completions(
     check_ready(&state)?;
 
     let request_id = request.id().to_string();
+
+    // Capture `reasoning_split` before validation/consumption. Defaults to false,
+    // preserving current inline-`<think>` behavior.
+    let reasoning_split = request.reasoning_split().unwrap_or(false);
 
     // Determine streaming mode early
     // todo - decide on default
@@ -1381,6 +1454,32 @@ async fn chat_completions(
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
+
+    // When `reasoning_split=true`, wrap the engine stream so each chunk has
+    // any leading `<think>...</think>` block lifted out of `content` into
+    // `reasoning_content`. The transform is a no-op for chunks that don't
+    // contain think markers, so it's also safe across multi-choice (n>1)
+    // responses and upstreams that already split reasoning themselves.
+    let stream: std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>
+                + Send,
+        >,
+    > = if reasoning_split {
+        let split_state = Arc::new(tokio::sync::Mutex::new(ReasoningSplitState::default()));
+        Box::pin(stream.then(move |mut item| {
+            let split_state = split_state.clone();
+            async move {
+                if let Some(resp) = item.data.as_mut() {
+                    let mut state = split_state.lock().await;
+                    apply_reasoning_split_to_stream_response(resp, &mut state);
+                }
+                item
+            }
+        }))
+    } else {
+        Box::pin(stream)
+    };
 
     // prepare any requested annotations
     let annotations = annotations.map_or(Vec::new(), |annotations| {
@@ -4753,5 +4852,91 @@ mod tests {
             !is_empty_completion_stream_response(&make_completion_chunk("", None, Some(usage))),
             "usage present → not empty",
         );
+    }
+
+    fn make_split_delta(content: &str) -> dynamo_protocols::types::ChatChoiceStream {
+        dynamo_protocols::types::ChatChoiceStream {
+            delta: ChatCompletionStreamResponseDelta {
+                content: Some(ChatCompletionMessageContent::Text(content.to_string())),
+                function_call: None,
+                tool_calls: None,
+                role: Some(dynamo_protocols::types::Role::Assistant),
+                refusal: None,
+                reasoning_content: None,
+            },
+            index: 0,
+            finish_reason: None,
+            logprobs: None,
+        }
+    }
+
+    fn split_text(choice: &dynamo_protocols::types::ChatChoiceStream) -> Option<String> {
+        match &choice.delta.content {
+            Some(ChatCompletionMessageContent::Text(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_reasoning_split_full_block_in_one_chunk() {
+        let mut state = ReasoningSplitState::default();
+        let mut choice = make_split_delta("<think>analyse</think>final answer");
+        apply_reasoning_split_to_delta(&mut choice.delta, choice.index, &mut state);
+
+        assert_eq!(choice.delta.reasoning_content.as_deref(), Some("analyse"));
+        assert_eq!(split_text(&choice).as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn test_reasoning_split_across_chunks() {
+        let mut state = ReasoningSplitState::default();
+        let chunks = ["<think>step", " one", "</think>", "result"];
+
+        let mut all_reasoning = String::new();
+        let mut all_content = String::new();
+        for c in chunks {
+            let mut choice = make_split_delta(c);
+            apply_reasoning_split_to_delta(&mut choice.delta, choice.index, &mut state);
+            if let Some(ref r) = choice.delta.reasoning_content {
+                all_reasoning.push_str(r);
+            }
+            if let Some(t) = split_text(&choice) {
+                all_content.push_str(&t);
+            }
+        }
+
+        assert_eq!(all_reasoning, "step one");
+        assert_eq!(all_content, "result");
+    }
+
+    #[test]
+    fn test_reasoning_split_passthrough_when_no_think() {
+        let mut state = ReasoningSplitState::default();
+        let mut choice = make_split_delta("plain answer with no reasoning");
+        apply_reasoning_split_to_delta(&mut choice.delta, choice.index, &mut state);
+
+        assert!(choice.delta.reasoning_content.is_none());
+        assert_eq!(
+            split_text(&choice).as_deref(),
+            Some("plain answer with no reasoning")
+        );
+    }
+
+    #[test]
+    fn test_reasoning_split_per_choice_state_is_independent() {
+        let mut state = ReasoningSplitState::default();
+
+        // choice 0: reasoning opens in first chunk
+        let mut c0 = make_split_delta("<think>only-zero");
+        c0.index = 0;
+        apply_reasoning_split_to_delta(&mut c0.delta, 0, &mut state);
+        assert_eq!(c0.delta.reasoning_content.as_deref(), Some("only-zero"));
+
+        // choice 1: independent stream still outside reasoning
+        let mut c1 = make_split_delta("hello");
+        c1.index = 1;
+        apply_reasoning_split_to_delta(&mut c1.delta, 1, &mut state);
+        assert!(c1.delta.reasoning_content.is_none());
+        assert_eq!(split_text(&c1).as_deref(), Some("hello"));
     }
 }
