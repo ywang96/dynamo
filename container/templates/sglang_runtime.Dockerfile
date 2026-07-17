@@ -103,6 +103,10 @@ ENV IMAGEIO_FFMPEG_EXE=/usr/local/bin/ffmpeg
 # shared dev stage after the workspace is bind-mounted.
 COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
 
+# Kimi walle: runtime library for the walle-validation-enabled frontend wheel.
+COPY --from=walle_builder /usr/local/lib/libwalle.so /usr/local/lib/libwalle.so
+RUN ldconfig
+
 {% if device == "xpu" %}
 RUN pip install --no-deps \
         /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \

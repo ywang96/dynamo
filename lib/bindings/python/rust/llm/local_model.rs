@@ -142,6 +142,16 @@ impl ModelRuntimeConfig {
     }
 
     #[setter]
+    fn set_kimi_schema_validation(&mut self, kimi_schema_validation: Option<bool>) {
+        self.inner.kimi_schema_validation = kimi_schema_validation;
+    }
+
+    #[setter]
+    fn set_kimi_schema_validation_level(&mut self, kimi_schema_validation_level: Option<String>) {
+        self.inner.kimi_schema_validation_level = kimi_schema_validation_level;
+    }
+
+    #[setter]
     fn set_data_parallel_start_rank(&mut self, data_parallel_start_rank: u32) {
         self.inner.data_parallel_start_rank = data_parallel_start_rank;
     }

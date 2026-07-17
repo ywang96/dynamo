@@ -117,6 +117,10 @@ ENV VIRTUAL_ENV=/opt/dynamo/venv \
 # this path and runs in dev-derived test images.
 COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
 
+# Kimi walle: runtime library for the walle-validation-enabled frontend wheel.
+COPY --from=walle_builder /usr/local/lib/libwalle.so /usr/local/lib/libwalle.so
+RUN ldconfig
+
 {% if target not in ("dev", "local-dev") %}
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=bind,source=./container/deps/requirements.trtllm.txt,target=/tmp/requirements.trtllm.txt \

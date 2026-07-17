@@ -105,6 +105,8 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
     preprocess_workers: int
     tokenizer_backend: str
     trust_remote_code: bool
+    kimi_schema_validation: Optional[bool]
+    kimi_schema_validation_level: Optional[str]
 
     kimi_api_compliance: bool
     kimi_default_max_completion_tokens: int
@@ -625,4 +627,30 @@ class FrontendArgGroup(ArgGroup):
                 "Trust remote code when loading the tokenizer. Required for models "
                 "that ship custom tokenizer code (e.g. Qwen, Falcon)."
             ),
+        )
+
+        add_negatable_bool_argument(
+            g,
+            flag_name="--kimi-schema-validation",
+            env_var="DYN_KIMI_SCHEMA_VALIDATION",
+            default=None,
+            dest="kimi_schema_validation",
+            help=(
+                "Kimi API compliance: reject tool `parameters` schemas that walle "
+                "rejects at ingress (MFJS validation). Only effective if the frontend "
+                "was built with the walle-validation feature."
+            ),
+        )
+
+        add_argument(
+            g,
+            flag_name="--kimi-schema-validation-level",
+            env_var="DYN_KIMI_SCHEMA_VALIDATION_LEVEL",
+            default=None,
+            dest="kimi_schema_validation_level",
+            help=(
+                "Walle validation level used by --kimi-schema-validation: 'strict' "
+                "(default) or 'lite' (a strict superset)."
+            ),
+            choices=["strict", "lite"],
         )

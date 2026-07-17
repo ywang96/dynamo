@@ -115,6 +115,10 @@ RUN apt-get update && \
 COPY --chmod=664 --chown=dynamo:0 LICENSE /workspace/
 COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
 
+# Kimi walle: runtime library for the walle-validation-enabled frontend wheel.
+COPY --from=walle_builder /usr/local/lib/libwalle.so /usr/local/lib/libwalle.so
+RUN ldconfig
+
 {% set pip_target = "--system" if device == "cuda" else "--python /opt/venv/bin/python" %}
 {% if device != "cuda" %}
 # NIXL meta package always tries to find a cuda-backend

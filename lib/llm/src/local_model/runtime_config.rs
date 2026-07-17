@@ -142,6 +142,16 @@ pub struct ModelRuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer_backend: Option<TokenizerBackend>,
 
+    /// Kimi API compliance: reject `tools[].function.parameters` schemas that walle
+    /// rejects at ingress (MFJS validation). Only effective when the frontend was built
+    /// with the `walle-validation` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_schema_validation: Option<bool>,
+
+    /// Walle validation level for `kimi_schema_validation`: "strict" (default) or "lite".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_schema_validation_level: Option<String>,
+
     /// Whether structural tag guided decoding is enabled for tool calls.
     #[serde(default)]
     pub structural_tag_mode: StructuralTagMode,
@@ -260,6 +270,8 @@ impl Default for ModelRuntimeConfig {
             tool_call_parser: None,
             reasoning_parser: None,
             tokenizer_backend: None,
+            kimi_schema_validation: None,
+            kimi_schema_validation_level: None,
             structural_tag_mode: StructuralTagMode::Off,
             structural_tag_scope: StructuralTagScope::Auto,
             structural_tag_schema: StructuralTagSchemaMode::Auto,

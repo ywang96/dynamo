@@ -14,6 +14,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     build_protos()?;
 
+    // Kimi MFJS schema validation (feature `walle-validation`): dynamically link the
+    // MoonshotAI/walle c-shared library (libwalle.so) from $WALLE_LIB_DIR. The container
+    // build produces the .so there; when the feature is off this block is skipped, so
+    // normal builds need neither the lib nor a Go toolchain.
+    if std::env::var_os("CARGO_FEATURE_WALLE_VALIDATION").is_some() {
+        let dir = env::var("WALLE_LIB_DIR").unwrap_or_else(|_| "/usr/local/lib".to_string());
+        println!("cargo:rustc-link-search=native={dir}");
+        println!("cargo:rustc-link-lib=dylib=walle");
+        println!("cargo:rerun-if-env-changed=WALLE_LIB_DIR");
+    }
+
     // Get FATBIN path and copy it to OUT_DIR for embedding
     if let Some(fatbin_path) = find_fatbin_file() {
         // Copy FATBIN to OUT_DIR so we can include it with a predictable path

@@ -17,6 +17,21 @@ FROM --platform=linux/arm64 quay.io/pypa/manylinux_2_28_aarch64 AS manylinux_arm
 {% endif %}
 
 ##################################
+##### walle_builder ##############
+##################################
+# Kimi MFJS schema validation: build MoonshotAI/walle as a c-shared library
+# (libwalle.so) that the dynamo-llm frontend links when built with the
+# `walle-validation` feature (see lib/llm/build.rs). Isolated in its own stage so
+# the Go toolchain never touches the wheel builders.
+FROM golang:1.23 AS walle_builder
+ARG WALLE_REF=196bb0ca9c2f2271cfa9623108308f0780e411ee
+RUN git clone https://github.com/MoonshotAI/walle /src/walle \
+    && git -C /src/walle checkout "${WALLE_REF}" \
+    && cd /src/walle/python/c-shared \
+    && go build -buildmode=c-shared -o /usr/local/lib/libwalle.so main.go \
+    && test -f /usr/local/lib/libwalle.so
+
+##################################
 ##### wheel_builder_base #########
 ##################################
 # Shared base for all wheel builds: tools, system deps, and native libraries (except nixl).
@@ -501,6 +516,11 @@ COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml 
 COPY lib/ /opt/dynamo/lib/
 COPY components/ /opt/dynamo/components/
 
+# Kimi walle: libwalle.so so the dynamo-llm build can link it when the
+# walle-validation feature is enabled (WALLE_LIB_DIR is exported below).
+COPY --from=walle_builder /usr/local/lib/libwalle.so /usr/local/lib/libwalle.so
+RUN ldconfig
+
 # Build ai-dynamo (pure Python) and ai-dynamo-runtime (maturin) wheels
 ARG USE_SCCACHE
 ARG ENABLE_MEDIA_FFMPEG
@@ -521,9 +541,9 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     uv build --wheel --out-dir /opt/dynamo/dist && \
     cd /opt/dynamo/lib/bindings/python && \
     if [ "$ENABLE_MEDIA_FFMPEG" = "true" ]; then \
-        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass" --out /opt/dynamo/dist; \
+        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,walle-validation" --out /opt/dynamo/dist; \
     else \
-        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass" --out /opt/dynamo/dist; \
+        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,walle-validation" --out /opt/dynamo/dist; \
     fi && \
     /tmp/use-sccache.sh show-stats "Dynamo Runtime"
 

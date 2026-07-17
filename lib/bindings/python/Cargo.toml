@@ -38,6 +38,9 @@ nvtx = ["dynamo-runtime/nvtx"]
 # recipes pass this flag explicitly; the dev container's
 # `.devcontainer/post-create.sh` also enables it for local workflows.
 mm-routing = ["dynamo-llm/mm-routing"]
+# Kimi MFJS schema validation via MoonshotAI/walle (forwards to dynamo-llm; links libwalle.so).
+# Opt-in at the wheel build (`maturin build --features walle-validation`).
+walle-validation = ["dynamo-llm/walle-validation"]
 
 [dependencies]
 # AIC perf model: pure-Rust hot-path latency engine. Pinned to aiconfigurator

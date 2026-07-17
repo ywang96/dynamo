@@ -106,6 +106,8 @@ pub async fn run(
                 prefill_load_estimator.clone(),
                 local_model_path,
                 model.runtime_config().tokenizer_backend,
+                model.runtime_config().kimi_schema_validation,
+                model.runtime_config().kimi_schema_validation_level.clone(),
                 generate_engine_enabled,
             )
             .await?;
@@ -188,6 +190,8 @@ async fn run_watcher(
     prefill_load_estimator: Option<Arc<dyn dynamo_kv_router::PrefillLoadEstimator>>,
     local_model_path: Option<PathBuf>,
     tokenizer_backend: Option<TokenizerBackend>,
+    kimi_schema_validation: Option<bool>,
+    kimi_schema_validation_level: Option<String>,
     generate_engine_enabled: bool,
 ) -> anyhow::Result<()> {
     // Start the LoRA allocation controller when LoRA serving is enabled. The
@@ -210,6 +214,7 @@ async fn run_watcher(
     );
     watch_obj.set_local_model_path(local_model_path);
     watch_obj.set_tokenizer_backend(tokenizer_backend);
+    watch_obj.set_kimi_schema_validation(kimi_schema_validation, kimi_schema_validation_level);
     watch_obj.set_generate_engine_enabled(generate_engine_enabled);
     tracing::debug!("Waiting for remote model");
     let discovery = runtime.discovery();

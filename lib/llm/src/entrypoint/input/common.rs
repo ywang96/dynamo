@@ -342,6 +342,10 @@ pub async fn prepare_engine(
                 watcher.set_local_model_path(Some(local_model.path().to_path_buf()));
             }
             watcher.set_tokenizer_backend(local_model.runtime_config().tokenizer_backend);
+            watcher.set_kimi_schema_validation(
+                local_model.runtime_config().kimi_schema_validation,
+                local_model.runtime_config().kimi_schema_validation_level.clone(),
+            );
             let watch_obj = Arc::new(watcher);
             let discovery = distributed_runtime.discovery();
             let discovery_stream = discovery

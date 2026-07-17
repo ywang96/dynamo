@@ -257,6 +257,8 @@ async def async_main():
         "enable_streaming_tool_dispatch": config.enable_streaming_tool_dispatch,
         "enable_streaming_reasoning_dispatch": config.enable_streaming_reasoning_dispatch,
         "tokenizer_backend": config.tokenizer_backend,
+        "kimi_schema_validation": config.kimi_schema_validation,
+        "kimi_schema_validation_level": config.kimi_schema_validation_level,
     }
     if config.migration_max_seq_len is not None:
         kwargs["migration_max_seq_len"] = config.migration_max_seq_len

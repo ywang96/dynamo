@@ -32,6 +32,9 @@ bench = ["dynamo-kv-router/bench"]
 kv-router-stress = ["dep:clap", "dep:indicatif", "bench"]
 mm-routing = ["dep:llm-multimodal", "dep:llm-tokenizer"]
 request-trace-bench = []
+# Kimi MFJS schema validation via MoonshotAI/walle (libwalle.so FFI). Off by default;
+# when enabled, build.rs links libwalle and the ingress validator (walle.rs) is active.
+walle-validation = []
 
 [[bench]]
 name = "tokenizer_simple"

@@ -20,6 +20,7 @@ mod structural_tag;
 mod tool_choice;
 pub mod tools;
 mod unified;
+mod walle;
 use anyhow::Context;
 use anyhow::{Result, bail};
 
@@ -3393,6 +3394,11 @@ impl
     ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
         // unpack the request
         let (mut request, context) = request.into_parts();
+
+        // Kimi API compliance: reject tool `parameters` schemas that walle rejects at
+        // ingress (no-op unless --kimi-schema-validation is set and the frontend was
+        // built with the walle-validation feature).
+        self.validate_kimi_tool_schemas(&request)?;
 
         // Preserve original inbound streaming flag before any internal overrides
         let request_id = context.id().to_string();

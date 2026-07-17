@@ -228,6 +228,12 @@ pub struct ModelWatcher {
     local_model_path: Option<PathBuf>,
     /// Frontend-level tokenizer backend override for discovered model cards.
     tokenizer_backend: Option<TokenizerBackend>,
+    /// Frontend-level Kimi walle schema-validation override for discovered model
+    /// cards. `--kimi-schema-validation` / `--kimi-schema-validation-level` are set
+    /// on the frontend, but the preprocessor reads the (worker-published) card's
+    /// runtime_config; these thread the frontend intent onto every discovered card.
+    kimi_schema_validation: Option<bool>,
+    kimi_schema_validation_level: Option<String>,
     /// Whether the frontend configured the vLLM-compatible Generate API.
     /// Keep the raw Generate pipeline out of non-HTTP and default-off paths.
     generate_engine_enabled: bool,
@@ -354,6 +360,8 @@ impl ModelWatcher {
             pending_lora_adds: DashMap::new(),
             local_model_path: None,
             tokenizer_backend: None,
+            kimi_schema_validation: None,
+            kimi_schema_validation_level: None,
             generate_engine_enabled: false,
         }
     }
@@ -370,6 +378,11 @@ impl ModelWatcher {
         self.tokenizer_backend = tokenizer_backend;
     }
 
+    pub fn set_kimi_schema_validation(&mut self, enabled: Option<bool>, level: Option<String>) {
+        self.kimi_schema_validation = enabled;
+        self.kimi_schema_validation_level = level;
+    }
+
     pub fn set_generate_engine_enabled(&mut self, enabled: bool) {
         self.generate_engine_enabled = enabled;
     }
@@ -377,6 +390,18 @@ impl ModelWatcher {
     fn apply_tokenizer_backend_override(&self, card: &mut ModelDeploymentCard) {
         if let Some(tokenizer_backend) = self.tokenizer_backend {
             card.runtime_config.tokenizer_backend = Some(tokenizer_backend);
+        }
+    }
+
+    /// Thread the frontend's Kimi walle schema-validation intent onto the
+    /// discovered card, so the preprocessor (which reads the card's
+    /// runtime_config, not the frontend LocalModel's) actually enforces it.
+    fn apply_kimi_schema_validation_override(&self, card: &mut ModelDeploymentCard) {
+        if let Some(enabled) = self.kimi_schema_validation {
+            card.runtime_config.kimi_schema_validation = Some(enabled);
+        }
+        if let Some(level) = self.kimi_schema_validation_level.clone() {
+            card.runtime_config.kimi_schema_validation_level = Some(level);
         }
     }
 
@@ -546,6 +571,7 @@ impl ModelWatcher {
                     }
 
                     self.apply_tokenizer_backend_override(&mut card);
+                    self.apply_kimi_schema_validation_override(&mut card);
 
                     // If a WorkerSet already exists for this (model, namespace, type),
                     // validate that the new worker's checksum matches. Different
@@ -734,6 +760,7 @@ impl ModelWatcher {
                 }
             };
             self.apply_tokenizer_backend_override(&mut card);
+            self.apply_kimi_schema_validation_override(&mut card);
 
             if !is_registration_complete(&self.manager, &mcid, &card)
                 && self.retry_model_registration(mcid, card).await
@@ -2038,6 +2065,7 @@ impl ModelWatcher {
             match instance.deserialize_model::<ModelDeploymentCard>() {
                 Ok(mut card) => {
                     self.apply_tokenizer_backend_override(&mut card);
+                    self.apply_kimi_schema_validation_override(&mut card);
                     let endpoint_id = match &instance {
                         dynamo_runtime::discovery::DiscoveryInstance::Model {
                             namespace,
