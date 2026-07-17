@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Sync inferact-internal to kimi-dev
+
+# Every merged PR updates inferact-internal. Triggering on the resulting push also
+# covers squash, rebase, and merge commits, as well as direct commits to the branch.
+on:
+  push:
+    branches:
+      - inferact-internal
+
+permissions:
+  contents: write
+
+# Serialize target-branch updates. Each run replays every missing first-parent
+# commit up to its source SHA, so runs are safe even if GitHub queues them out of order.
+concurrency:
+  group: sync-inferact-internal-to-kimi-dev
+  cancel-in-progress: false
+
+jobs:
+  cherry-pick:
+    name: Cherry-pick into kimi-dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out kimi-dev
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: kimi-dev
+          fetch-depth: 0
+
+      - name: Cherry-pick missing source commits
+        env:
+          SOURCE_BRANCH: inferact-internal
+          SOURCE_SHA: ${{ github.sha }}
+          TARGET_BRANCH: kimi-dev
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --no-tags origin \
+            "+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}"
+
+          if ! git cat-file -e "$SOURCE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$SOURCE_SHA"
+          fi
+
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" "origin/${SOURCE_BRANCH}"; then
+            echo "::error::Source commit $SOURCE_SHA is no longer on $SOURCE_BRANCH."
+            exit 1
+          fi
+
+          if ! common_base=$(git merge-base HEAD "$SOURCE_SHA"); then
+            echo "::error::Branches $SOURCE_BRANCH and $TARGET_BRANCH have no common ancestor."
+            exit 1
+          fi
+
+          source_commits=()
+          while IFS= read -r commit; do
+            source_commits+=("$commit")
+          done < <(git rev-list --reverse --first-parent "$common_base..$SOURCE_SHA")
+
+          if (( ${#source_commits[@]} == 0 )); then
+            echo "$TARGET_BRANCH already contains the source history through $SOURCE_SHA."
+            exit 0
+          fi
+
+          starting_sha=$(git rev-parse HEAD)
+
+          for commit in "${source_commits[@]}"; do
+            trailer="cherry picked from commit $commit"
+            if git log --format='%H' --fixed-strings --grep="$trailer" -1 | grep -q .; then
+              echo "Skipping $commit; it was already cherry-picked."
+              continue
+            fi
+
+            parent_count=$(git rev-list --parents -n 1 "$commit" | awk '{ print NF - 1 }')
+            if (( parent_count > 1 )); then
+              # Replay a merge commit as the net change relative to the source branch.
+              echo "Cherry-picking merge commit $commit into $TARGET_BRANCH."
+              if git cherry-pick -m 1 -x "$commit"; then
+                continue
+              fi
+            else
+              echo "Cherry-picking $commit into $TARGET_BRANCH."
+              if git cherry-pick -x "$commit"; then
+                continue
+              fi
+            fi
+
+            if [[ -n "$(git ls-files --unmerged)" ]]; then
+              echo "::error title=Cherry-pick conflict::Failed to cherry-pick $commit into $TARGET_BRANCH."
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+
+            # A manually applied equivalent patch produces an empty cherry-pick.
+            # Treat it as synchronized instead of failing the workflow.
+            if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null && \
+                git diff --quiet && git diff --cached --quiet; then
+              echo "Skipping $commit; its patch is already present in $TARGET_BRANCH."
+              git cherry-pick --skip
+              continue
+            fi
+
+            echo "::error::Cherry-pick of $commit failed for an unexpected reason."
+            git status --short
+            exit 1
+          done
+
+          if [[ "$(git rev-parse HEAD)" == "$starting_sha" ]]; then
+            echo "$TARGET_BRANCH is already synchronized through $SOURCE_SHA."
+            exit 0
+          fi
+
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
