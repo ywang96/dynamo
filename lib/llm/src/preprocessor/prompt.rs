@@ -14,6 +14,8 @@
 //!
 //! Everything else imports from `dynamo_renderer` directly.
 
+pub mod kimi_k3;
+
 use anyhow::{Context, Result};
 use minijinja::value::Value;
 

@@ -1270,10 +1270,44 @@ impl ModelDeploymentCard {
                 let path_str = p.to_str().ok_or_else(|| {
                     anyhow::anyhow!("Tokenizer path contains invalid UTF-8: {}", p.display())
                 })?;
-                let tokenizer = crate::tokenizers::TikTokenTokenizer::from_file_auto(path_str)
+                // Kimi-K3's model_type isn't recognized by from_file_auto; build the
+                // tokenizer explicitly with the (byte-identical) Kimi BPE pattern and
+                // the specials from tokenizer_config.json, mirroring from_file_auto's
+                // reserved-token gap fill.
+                use crate::preprocessor::prompt::kimi_k3;
+                let model_dir = p.parent().ok_or_else(|| {
+                    anyhow::anyhow!("Cannot determine model dir of {}", p.display())
+                })?;
+                let model_type: Option<String> =
+                    crate::file_json_field(&model_dir.join("config.json"), "model_type").ok();
+                let tokenizer = if model_type
+                    .as_deref()
+                    .is_some_and(kimi_k3::is_kimi_k3_model_type)
+                {
+                    let tok_cfg_path = model_dir.join("tokenizer_config.json");
+                    let contents = std::fs::read_to_string(&tok_cfg_path)
+                        .with_context(|| format!("Failed to read {}", tok_cfg_path.display()))?;
+                    let tok_cfg: serde_json::Value = serde_json::from_str(&contents)
+                        .with_context(|| format!("Failed to parse {}", tok_cfg_path.display()))?;
+                    let mut special_tokens = kimi_k3::load_k3_special_tokens(&tok_cfg);
+                    let num_base_tokens = kimi_k3::count_base_tokens(path_str)?;
+                    kimi_k3::fill_reserved_special_tokens(&mut special_tokens, num_base_tokens);
+                    crate::tokenizers::TikTokenTokenizer::from_file(
+                        path_str,
+                        kimi_k3::KIMI_K3_BPE_PATTERN,
+                        special_tokens,
+                    )
                     .with_context(|| {
-                        format!("Failed to load tiktoken tokenizer from {}", p.display())
-                    })?;
+                        format!(
+                            "Failed to load Kimi-K3 tiktoken tokenizer from {}",
+                            p.display()
+                        )
+                    })?
+                } else {
+                    crate::tokenizers::TikTokenTokenizer::from_file_auto(path_str).with_context(
+                        || format!("Failed to load tiktoken tokenizer from {}", p.display()),
+                    )?
+                };
 
                 let specials = tokenizer.special_tokens().to_vec();
                 let raw: Arc<dyn crate::tokenizers::traits::Tokenizer> = Arc::new(tokenizer);
