@@ -21,6 +21,13 @@ mod tool_choice;
 pub mod tools;
 mod unified;
 mod walle;
+
+/// Parser names implemented by the delegated unified vLLM parser path.
+///
+/// These names are absent from the split-parser registries in `dynamo-parsers`
+/// and must still be exposed to CLI validation.
+pub const DELEGATED_UNIFIED_PARSERS: &[&str] = &["kimi_k3"];
+
 use anyhow::Context;
 use anyhow::{Result, bail};
 
