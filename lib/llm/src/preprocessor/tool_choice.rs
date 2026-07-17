@@ -30,21 +30,28 @@ impl OpenAIPreprocessor {
         common_request: &mut PreprocessedRequest,
         prompt_injected_reasoning: bool,
     ) -> Result<bool, DynamoError> {
+        let tool_choice = request
+            .inner
+            .tool_choice
+            .as_ref()
+            .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
+
         if unified::kimi_k3::is_selected(
             self.runtime_config.reasoning_parser.as_deref(),
             self.tool_call_parser.as_deref(),
         ) {
+            if matches!(tool_choice, ChatCompletionToolChoiceOption::Named(_)) {
+                return Err(invalid_argument(
+                    "Named tool choice is not supported for Kimi K3. \
+                     Use `tool_choice` set to \"auto\", \"required\", or \"none\" instead.",
+                ));
+            }
             // TODO: Add Kimi K3-native tool-choice constraints once guided decoding can
             // express its XTML tools/call/argument grammar. The available generic JSON
             // schema and structural-tag formats do not match the unified K3 parser.
             return Ok(false);
         }
 
-        let tool_choice = request
-            .inner
-            .tool_choice
-            .as_ref()
-            .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
         let tools = request.inner.tools.as_deref().unwrap_or(&[]);
         let is_forced_tool_choice = matches!(
             tool_choice,

@@ -159,6 +159,24 @@ impl NvCreateChatCompletionRequest {
             .as_ref()
             .and_then(|effort| serde_json::to_value(effort).ok())
             .or(thinking_effort);
+        // Kimi-dialect extras carried on the `thinking` object: `effort` feeds
+        // the K3 renderer's thinking-effort control message (passed through
+        // verbatim; the renderer validates the {low,medium,high,max} set and
+        // renders nothing for other values, python parity) and `keep`
+        // normalizes to the `preserve_thinking` history switch. Inert for
+        // formatters that don't read these keys.
+        let thinking_extras = self
+            .thinking
+            .as_ref()
+            .and_then(|value| value.as_object())
+            .map(|obj| {
+                (
+                    obj.get("effort")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    obj.get("keep").cloned(),
+                )
+            });
 
         if thinking_mode.is_none() && reasoning_effort.is_none() && thinking_keep.is_none() {
             return Ok(());
@@ -190,6 +208,42 @@ impl NvCreateChatCompletionRequest {
         }
         if let Some(keep) = thinking_keep {
             args.insert("thinking_keep".to_string(), keep);
+        }
+
+        // Request-level `thinking.effort` / `thinking.keep` are authoritative:
+        // inserted after the user-supplied chat_template_args merge above so
+        // they overwrite any user-provided `thinking_effort`/`preserve_thinking`.
+        if let Some((effort, keep)) = thinking_extras {
+            if let Some(effort) = effort {
+                args.insert(
+                    "thinking_effort".to_string(),
+                    serde_json::Value::String(effort),
+                );
+            }
+            match keep.as_ref().and_then(|v| v.as_str()) {
+                Some("all") => {
+                    args.insert(
+                        "preserve_thinking".to_string(),
+                        serde_json::Value::Bool(false),
+                    );
+                }
+                Some("interleaved") => {
+                    args.insert(
+                        "preserve_thinking".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+                _ => {
+                    if let Some(keep) = keep {
+                        // Never a 400: unknown values leave history handling at
+                        // the renderer default (keep-normalization rule).
+                        tracing::warn!(
+                            ?keep,
+                            "unrecognized `thinking.keep` value; leaving history handling at renderer default"
+                        );
+                    }
+                }
+            }
         }
 
         // The raw `thinking` payload has been folded into `chat_template_args`;
@@ -1234,6 +1288,110 @@ mod tests {
             .normalize_reasoning_template_args()
             .expect_err("adaptive thinking payload should be rejected");
         assert!(err.to_string().contains("enabled` or `disabled"));
+    }
+
+    fn normalize_thinking_object(thinking: serde_json::Value) -> NvCreateChatCompletionRequest {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": thinking
+        });
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking payload should normalize");
+        request
+    }
+
+    #[test]
+    fn test_kimi_thinking_effort_and_keep_all_normalize() {
+        let request = normalize_thinking_object(json!({
+            "type": "enabled", "effort": "high", "keep": "all"
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&json!(true)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
+        assert_eq!(args.get("thinking_effort"), Some(&json!("high")));
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(false)));
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn test_kimi_thinking_keep_interleaved_preserves_history() {
+        let request = normalize_thinking_object(json!({
+            "type": "enabled", "keep": "interleaved"
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
+        // No effort on the request: key absent (renderer default applies).
+        assert_eq!(args.get("thinking_effort"), None);
+    }
+
+    #[test]
+    fn test_kimi_thinking_keep_absent_leaves_key_absent() {
+        let request = normalize_thinking_object(json!({"type": "enabled", "effort": "low"}));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("preserve_thinking"), None);
+        assert_eq!(args.get("thinking_effort"), Some(&json!("low")));
+    }
+
+    #[test]
+    fn test_kimi_thinking_keep_unknown_value_warns_and_skips() {
+        // Never a 400: unknown keep values leave the key unset.
+        let request = normalize_thinking_object(json!({
+            "type": "enabled", "keep": "sometimes"
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("preserve_thinking"), None);
+    }
+
+    #[test]
+    fn test_kimi_thinking_effort_passes_through_verbatim() {
+        // The renderer owns effort validation ({low,medium,high,max} renders,
+        // anything else renders nothing) — normalization must not filter it.
+        let request = normalize_thinking_object(json!({
+            "type": "enabled", "effort": "ultra"
+        }));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking_effort"), Some(&json!("ultra")));
+    }
+
+    #[test]
+    fn test_kimi_request_level_effort_wins_over_user_kwargs() {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "chat_template_args": {"thinking_effort": "low", "preserve_thinking": false},
+            "thinking": {"type": "enabled", "effort": "high", "keep": "interleaved"}
+        });
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking payload should normalize");
+        let args = request.chat_template_args.as_ref().unwrap();
+        // Authoritative request fields overwrite user-supplied kwargs.
+        assert_eq!(args.get("thinking_effort"), Some(&json!("high")));
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn test_kimi_user_kwargs_survive_when_thinking_object_has_no_extras() {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "chat_template_args": {"thinking_effort": "low"},
+            "thinking": {"type": "enabled"}
+        });
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking payload should normalize");
+        let args = request.chat_template_args.as_ref().unwrap();
+        // Absent request-level extras leave user kwargs untouched.
+        assert_eq!(args.get("thinking_effort"), Some(&json!("low")));
     }
 
     #[test]

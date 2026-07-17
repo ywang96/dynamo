@@ -145,3 +145,109 @@ async fn k3_preprocess_marks_prompt_injected_reasoning() {
         "K3 with thinking off must not mark prompt-injected reasoning"
     );
 }
+/// Decode synthetic-vocab token ids back to text: ids < 256 are raw bytes,
+/// 300..=307 are the K3 wire markers registered in `synthetic_k3_dir`.
+fn decode_synthetic(ids: &[u32]) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    for &id in ids {
+        match id {
+            0..=255 => bytes.push(id as u8),
+            300 => bytes.extend_from_slice(b"<|open|>"),
+            301 => bytes.extend_from_slice(b"<|close|>"),
+            302 => bytes.extend_from_slice(b"<|sep|>"),
+            303 => bytes.extend_from_slice(b"<|end_of_msg|>"),
+            304 => bytes.extend_from_slice(b"<|media_begin|>"),
+            305 => bytes.extend_from_slice(b"<|media_content|>"),
+            306 => bytes.extend_from_slice(b"<|media_pad|>"),
+            307 => bytes.extend_from_slice(b"<|media_end|>"),
+            other => panic!("unexpected token id {other}"),
+        }
+    }
+    String::from_utf8(bytes).expect("synthetic decode is utf-8")
+}
+
+/// End-to-end request-gate flow: `thinking {type, effort, keep}` normalized at
+/// ingress (mirroring the HTTP handler) must reach the renderer as
+/// `thinking_effort` / `preserve_thinking` — the thinking-effort control
+/// message renders and prior-turn think blocks are preserved.
+#[tokio::test]
+async fn k3_thinking_effort_and_keep_render_end_to_end() {
+    let dir = synthetic_k3_dir();
+    let mut mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");
+    mdc.runtime_config.reasoning_parser = Some("kimi_k3".to_string());
+    let preprocessor = OpenAIPreprocessor::new(mdc.clone()).expect("build preprocessor");
+
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": mdc.slug().to_string(),
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "reasoning_content": "old think", "content": "a1"},
+            {"role": "user", "content": "q2"}
+        ],
+        "thinking": {"type": "enabled", "effort": "high", "keep": "interleaved"}
+    }))
+    .expect("request deserializes");
+
+    // The HTTP ingress normalizes `thinking` into chat_template_args before
+    // the preprocessor runs; mirror that here.
+    request
+        .normalize_reasoning_template_args()
+        .expect("normalize thinking");
+
+    let (preprocessed, _, injected) = preprocessor
+        .preprocess_request(&request, None)
+        .await
+        .expect("preprocess K3 request");
+    let text = decode_synthetic(&preprocessed.token_ids);
+
+    // REQ4: the thinking-effort control message renders with the request value.
+    assert!(
+        text.contains("thinking_effort=high"),
+        "missing thinking-effort control message: {text}"
+    );
+    // keep=interleaved => preserve_thinking=true => prior-turn think survives.
+    assert!(
+        text.contains("old think"),
+        "history think dropped despite keep=interleaved: {text}"
+    );
+    // Thinking enabled: generation prefix ends inside the think channel.
+    assert!(
+        injected,
+        "thinking enabled must mark prompt-injected reasoning"
+    );
+    assert!(text.ends_with("<|open|>think<|sep|>"), "prefix: {text}");
+}
+
+/// keep=all (the default history rule) drops prior-turn think blocks.
+#[tokio::test]
+async fn k3_thinking_keep_all_drops_history_think() {
+    let dir = synthetic_k3_dir();
+    let mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");
+    let preprocessor = OpenAIPreprocessor::new(mdc.clone()).expect("build preprocessor");
+
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": mdc.slug().to_string(),
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "reasoning_content": "old think", "content": "a1"},
+            {"role": "user", "content": "q2"}
+        ],
+        "thinking": {"type": "enabled", "keep": "all"}
+    }))
+    .expect("request deserializes");
+    request
+        .normalize_reasoning_template_args()
+        .expect("normalize thinking");
+
+    let (preprocessed, _, _) = preprocessor
+        .preprocess_request(&request, None)
+        .await
+        .expect("preprocess K3 request");
+    let text = decode_synthetic(&preprocessed.token_ids);
+    assert!(
+        !text.contains("old think"),
+        "keep=all must drop pre-final-assistant think blocks: {text}"
+    );
+    // a1 (the response content) still renders.
+    assert!(text.contains("a1"), "history response missing: {text}");
+}
