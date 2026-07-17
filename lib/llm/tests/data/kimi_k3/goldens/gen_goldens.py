@@ -84,6 +84,15 @@ case("assistant_raw_json_block_args", [
         {"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{not json"}}]},
     {"role": "tool", "tool_call_id": "c1", "content": "ok"},
     {"role": "user", "content": "y"}])
+# Float notation parity: CPython repr writes 1e-07 / 1.5e-05 (signed,
+# zero-padded exponents); guards the Rust python_float_repr writer.
+case("float_exponent_args", [
+    {"role": "user", "content": "x"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {
+            "name": "t", "arguments": "{\"tiny\": 1e-07, \"sci\": 1.5e-05}"}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    {"role": "user", "content": "y"}])
 case("attr_escaping", [{"role": "user", "name": "a&b\"c", "content": "hi"}])
 case("image_placeholder_split",
      [{"role": "user", "content": "look <|kimi_image_placeholder|> here"}],

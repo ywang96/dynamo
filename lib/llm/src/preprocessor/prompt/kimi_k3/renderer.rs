@@ -85,9 +85,11 @@ impl Default for RenderArgs {
 mod json_dumps {
     //! Serialize a [`serde_json::Value`] like Python's
     //! `json.dumps(value, ensure_ascii=False)`: spaced `", "`/`": "`
-    //! separators, single line, raw UTF-8. serde_json only ships compact and
-    //! pretty formatters; XTML argument bodies must match the python spacing
-    //! byte-for-byte.
+    //! separators (default writer) or `","`/`":"` (compact writer), single
+    //! line, raw UTF-8, and CPython `repr(float)` number notation. serde_json
+    //! only ships compact and pretty formatters and formats floats via ryu
+    //! (`1e-7`, `1e20`), while python emits `1e-07`, `1e+20`; XTML bodies must
+    //! match the python bytes exactly.
 
     use std::io;
 
@@ -96,6 +98,101 @@ mod json_dumps {
         Value,
         ser::{Formatter, Serializer},
     };
+
+    /// Render `value` the way CPython's `repr(float)` / `json.dumps` does.
+    ///
+    /// ryu (serde_json's float writer) and CPython both print the shortest
+    /// round-trip decimal, but their NOTATION differs: python uses scientific
+    /// form iff the decimal exponent is `< -4` or `>= 16`, always writes the
+    /// exponent sign, and zero-pads the exponent to two digits; integral
+    /// positionals carry a trailing `.0`. This re-renders ryu's digits under
+    /// python's rules.
+    ///
+    /// Known ingress-level divergence (documented, not fixable here):
+    /// integers beyond i64/u64 range (e.g. 10^20) are parsed lossily into f64
+    /// by serde_json at request ingress (`arbitrary_precision` is off
+    /// workspace-wide), so python's `100000000000000000000` renders as
+    /// `1e+20`. Floats themselves are exact.
+    pub(super) fn python_float_repr(value: f64) -> String {
+        if value == 0.0 {
+            return if value.is_sign_negative() {
+                "-0.0".to_string()
+            } else {
+                "0.0".to_string()
+            };
+        }
+        // Shortest round-trip digits from serde_json's own (ryu) writer.
+        let shortest = match serde_json::Number::from_f64(value) {
+            Some(n) => n.to_string(),
+            None => return "null".to_string(), // NaN/inf: unreachable via Value
+        };
+        let (sign, body) = match shortest.strip_prefix('-') {
+            Some(rest) => ("-", rest),
+            None => ("", shortest.as_str()),
+        };
+        // Parse `body` = digits[.digits][e[+|-]digits] into significant
+        // digits + the exponent of the leading digit.
+        let (mantissa, ryu_exp) = match body.split_once(['e', 'E']) {
+            Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+            None => (body, 0),
+        };
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (mantissa, ""),
+        };
+        // Significant digits with leading zeros stripped; e10 = exponent of
+        // the first significant digit (value = 0.d1d2... * 10^(e10+1)).
+        let all: String = format!("{int_part}{frac_part}");
+        let first_sig = all.find(|c: char| c != '0').unwrap_or(0);
+        let digits = all[first_sig..].trim_end_matches('0').to_string();
+        let digits = if digits.is_empty() {
+            "0".to_string()
+        } else {
+            digits
+        };
+        let e10: i32 = int_part.len() as i32 - 1 - first_sig as i32 + ryu_exp;
+
+        if (-4..16).contains(&e10) {
+            // Positional notation.
+            let d = digits.as_bytes();
+            let n = d.len() as i32;
+            let mut out = String::from(sign);
+            if e10 < 0 {
+                out.push_str("0.");
+                for _ in 0..(-e10 - 1) {
+                    out.push('0');
+                }
+                out.push_str(&digits);
+            } else if n > e10 + 1 {
+                out.push_str(&digits[..(e10 + 1) as usize]);
+                out.push('.');
+                out.push_str(&digits[(e10 + 1) as usize..]);
+            } else {
+                out.push_str(&digits);
+                for _ in 0..(e10 + 1 - n) {
+                    out.push('0');
+                }
+                out.push_str(".0");
+            }
+            out
+        } else {
+            // Scientific notation: d[.rest]e{+|-}NN (exponent >= 2 digits).
+            let mut out = String::from(sign);
+            out.push_str(&digits[..1]);
+            if digits.len() > 1 {
+                out.push('.');
+                out.push_str(&digits[1..]);
+            }
+            out.push('e');
+            if e10 < 0 {
+                out.push('-');
+            } else {
+                out.push('+');
+            }
+            out.push_str(&format!("{:02}", e10.abs()));
+            out
+        }
+    }
 
     struct PythonDefaultFormatter;
 
@@ -119,16 +216,39 @@ mod json_dumps {
         ) -> io::Result<()> {
             if first { Ok(()) } else { w.write_all(b", ") }
         }
+
+        fn write_f64<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
+            w.write_all(python_float_repr(value).as_bytes())
+        }
     }
 
-    /// Serialize `value` like `json.dumps(value, ensure_ascii=False)`.
-    pub(super) fn to_string(value: &Value) -> String {
+    /// Compact separators (serde default) but python float notation.
+    struct PythonCompactFormatter;
+
+    impl Formatter for PythonCompactFormatter {
+        fn write_f64<W: ?Sized + io::Write>(&mut self, w: &mut W, value: f64) -> io::Result<()> {
+            w.write_all(python_float_repr(value).as_bytes())
+        }
+    }
+
+    fn serialize_with<F: Formatter>(value: &Value, formatter: F) -> String {
         let mut buf = Vec::new();
-        let mut ser = Serializer::with_formatter(&mut buf, PythonDefaultFormatter);
+        let mut ser = Serializer::with_formatter(&mut buf, formatter);
         if value.serialize(&mut ser).is_err() {
             return "null".to_string();
         }
         String::from_utf8(buf).unwrap_or_else(|_| "null".to_string())
+    }
+
+    /// Serialize `value` like `json.dumps(value, ensure_ascii=False)`.
+    pub(super) fn to_string(value: &Value) -> String {
+        serialize_with(value, PythonDefaultFormatter)
+    }
+
+    /// Serialize `value` like
+    /// `json.dumps(value, ensure_ascii=False, separators=(",", ":"))`.
+    pub(super) fn to_string_compact(value: &Value) -> String {
+        serialize_with(value, PythonCompactFormatter)
     }
 }
 
@@ -228,7 +348,7 @@ fn append_text(segs: &mut Vec<Segment>, text: &str) {
 
 /// `json.dumps(value, ensure_ascii=False, separators=(",", ":"))` — compact.
 fn json_compact(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+    json_dumps::to_string_compact(value)
 }
 
 /// `json.dumps(value, ensure_ascii=False)` — python default `", "`/`": "`.
@@ -495,7 +615,7 @@ fn normalize_tool_result_messages(messages: &[Value]) -> Vec<Value> {
             }
         } else {
             // Stable sort by (position, offset).
-            run.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            run.sort_by_key(|a| (a.0, a.1));
             for (_, _, msg, name) in run {
                 match name {
                     None => output.push(msg),
@@ -1383,5 +1503,59 @@ mod tests {
         );
         assert_eq!(json_default(&json!({})), "{}");
         assert_eq!(json_default(&json!([])), "[]");
+    }
+
+    /// Battery of `(f64, CPython json.dumps output)` pairs, generated with
+    /// `python3 -c "import json; print(json.dumps(v))"`. Guards the
+    /// notation-parity rules (scientific iff exp < -4 or >= 16; signed,
+    /// zero-padded exponents; `.0` on integral positionals).
+    #[test]
+    fn python_float_repr_matches_cpython() {
+        let cases: &[(f64, &str)] = &[
+            (1e-07, "1e-07"),
+            (1.5e-05, "1.5e-05"),
+            (1e-05, "1e-05"),
+            (1e-4, "0.0001"),
+            (0.0001234, "0.0001234"),
+            (2.5, "2.5"),
+            (200000.0, "200000.0"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1e17, "1e+17"),
+            (1.2345678901234568e+17, "1.2345678901234568e+17"),
+            (1e+20, "1e+20"),
+            (12.34567, "12.34567"),
+            (-1e-07, "-1e-07"),
+            (-1e+20, "-1e+20"),
+            (1e-100, "1e-100"),
+            (1e+100, "1e+100"),
+            (5e-324, "5e-324"),
+            (1.7976931348623157e+308, "1.7976931348623157e+308"),
+            (123.456, "123.456"),
+            (0.5, "0.5"),
+            (10.0, "10.0"),
+            (1234567890.12345, "1234567890.12345"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                json_dumps::python_float_repr(*value),
+                *expected,
+                "python_float_repr({value:e})"
+            );
+        }
+        // Both writers route floats through the python notation.
+        assert_eq!(
+            json_default(&json!({"tiny": 1e-07, "big": 1e+20})),
+            r#"{"tiny": 1e-07, "big": 1e+20}"#
+        );
+        assert_eq!(
+            json_compact(&json!({"tiny": 1e-07, "big": 1e+20})),
+            r#"{"tiny":1e-07,"big":1e+20}"#
+        );
+        // serde round-trip from JSON text (the request-ingress path).
+        let parsed: Value = serde_json::from_str(r#"{"sci": 1.5e-05}"#).unwrap();
+        assert_eq!(json_default(&parsed), r#"{"sci": 1.5e-05}"#);
     }
 }
