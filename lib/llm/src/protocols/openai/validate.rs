@@ -113,9 +113,20 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy(DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS));
 
+/// Standard OpenAI request fields that Dynamo does not act on but accepts and
+/// silently ignores rather than rejecting with a 400.
+///
+/// Unlike [`PASSTHROUGH_EXTRA_FIELDS`], nothing downstream reads these: they land
+/// in the request's `skip_serializing` `unsupported_fields` catch-all and are
+/// dropped before the request is forwarded. This keeps clients that always send
+/// such hints from failing — e.g. `prompt_cache_key`, a server-side prompt-cache
+/// optimization hint Dynamo does not implement.
+pub const IGNORED_EXTRA_FIELDS: &[&str] = &["prompt_cache_key"];
+
 /// Validates that no unsupported fields are present in the request.
 ///
 /// Fields in `PASSTHROUGH_EXTRA_FIELDS` are validated by downstream handlers.
+/// Fields in `IGNORED_EXTRA_FIELDS` are accepted and silently ignored.
 /// Other fields may be ignored and dropped when
 /// `DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS` is truthy.
 pub fn validate_no_unsupported_fields(
@@ -133,7 +144,10 @@ fn validate_no_unsupported_fields_with_ignore(
 ) -> Result<(), anyhow::Error> {
     let unknown: Vec<_> = unsupported_fields
         .keys()
-        .filter(|k| !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str()))
+        .filter(|k| {
+            !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str())
+                && !IGNORED_EXTRA_FIELDS.contains(&k.as_str())
+        })
         .map(|s| format!("`{}`", s))
         .collect();
     if !unknown.is_empty() && !ignore_unsupported_fields {

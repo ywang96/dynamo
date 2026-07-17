@@ -263,8 +263,11 @@ impl Discovery for KubeDiscoveryClient {
         )?;
 
         if let Err(e) = apply_cr(&self.kube_client, &self.pod_info.pod_namespace, &cr).await {
-            // Rollback local state on CR persistence failure
-            tracing::warn!(
+            // Rollback local state on CR persistence failure.
+            // apply_cr already logs per-attempt warnings, and the shutdown
+            // orchestrator logs the final error, so keep this at debug to avoid
+            // triple-logging the same failure.
+            tracing::debug!(
                 "Failed to persist metadata removal to CR, rolling back local state: {}",
                 e
             );

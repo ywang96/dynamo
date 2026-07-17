@@ -96,8 +96,8 @@ class ImageLoader:
     @staticmethod
     def _open_image_sync(image_data: BytesIO) -> Image.Image:
         """Open, validate, and decode an image from raw bytes. Runs in a thread."""
-        image = Image.open(image_data, formats=["JPEG", "PNG", "WEBP"])
-        if image.format not in ("JPEG", "PNG", "WEBP"):
+        image = Image.open(image_data, formats=["JPEG", "PNG", "WEBP", "GIF"])
+        if image.format not in ("JPEG", "PNG", "WEBP", "GIF"):
             raise ValueError(f"Unsupported image format: {image.format}")
         # Image.open() is lazy — convert() forces the actual pixel decode
         return image.convert("RGB")

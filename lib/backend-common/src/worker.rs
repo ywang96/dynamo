@@ -743,10 +743,19 @@ impl Worker {
     /// grace period → engine drain → cleanup. Shared by every shutdown path —
     /// pre-serve (mid-start signal) and the serve loop's signal arm.
     async fn orchestrator_steps(&mut self, endpoint: &dynamo_runtime::component::Endpoint) {
-        if let Err(e) = endpoint.unregister_endpoint_instance().await {
-            tracing::warn!(error = %e, "discovery unregister failed");
-        } else {
-            tracing::info!("Endpoint unregistered from discovery");
+        match endpoint.unregister_endpoint_instance().await {
+            Ok(()) => {
+                tracing::info!("Endpoint unregistered from discovery");
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "discovery unregister failed after retries; frontends may keep \
+                     routing to this worker until pod garbage-collection completes. \
+                     Graceful shutdown contract violated — expect transient \
+                     'instance_id not found' errors during the grace period."
+                );
+            }
         }
         self.run_engine_shutdown_steps().await;
     }

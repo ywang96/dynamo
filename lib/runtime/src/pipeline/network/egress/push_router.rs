@@ -1517,6 +1517,7 @@ where
         }
 
         let engine_ctx = stream.context();
+        let engine_ctx_for_timeout = engine_ctx.clone();
         let client = self.client.clone();
         let client_for_timeout = self.client.clone();
         let stream = stream.map(move |res| {
@@ -1531,40 +1532,59 @@ where
             res
         });
 
-        let stream: Pin<Box<dyn Stream<Item = U> + Send>> =
-            if let Some(timeout) = self.response_timeout {
-                Box::pin(async_stream::stream! {
-                    let mut inner = Box::pin(stream);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            item = inner.next() => {
-                                match item {
-                                    Some(item) => yield item,
-                                    None => break,
-                                }
-                            }
-                            _ = tokio::time::sleep(timeout) => {
-                                tracing::warn!(
-                                    instance_id,
-                                    timeout_secs = timeout.as_secs(),
-                                    "backend response inactivity timeout — quarantining worker"
-                                );
-                                client_for_timeout.report_instance_down(instance_id);
-                                yield U::from_err(
-                                    crate::error::DynamoError::builder()
-                                        .error_type(crate::error::ErrorType::ResponseTimeout)
-                                        .message("backend response inactivity timeout")
-                                        .build()
-                                );
-                                break;
+        let stream: Pin<Box<dyn Stream<Item = U> + Send>> = if let Some(timeout) =
+            self.response_timeout
+        {
+            Box::pin(async_stream::stream! {
+                let mut inner = Box::pin(stream);
+                loop {
+                    tokio::select! {
+                        biased;
+                        item = inner.next() => {
+                            match item {
+                                Some(item) => yield item,
+                                None => break,
                             }
                         }
+                        _ = tokio::time::sleep(timeout) => {
+                            tracing::warn!(
+                                instance_id,
+                                timeout_secs = timeout.as_secs(),
+                                "backend response inactivity timeout — quarantining worker"
+                            );
+                            client_for_timeout.report_instance_down(instance_id);
+                            // Propagate the cancellation to the worker — same signal
+                            // the client-disconnect path issues (disconnect.rs). The
+                            // kill flips the context registered with the response-plane
+                            // TCP server, whose receive handler sends
+                            // ControlMessage::Kill to the worker; the worker-side
+                            // handler kills its request context and the engine abort
+                            // monitor drops the request even while it is still queued.
+                            // Without this the worker only learns when its next
+                            // publish fails, leaving a zombie that wastes GPU compute
+                            // and skews least-loaded occupancy. Must run BEFORE the
+                            // yield: once downstream consumes the error item it stops
+                            // polling, so code after the yield never executes.
+                            tracing::info!(
+                                instance_id,
+                                request_id = engine_ctx_for_timeout.id(),
+                                "issuing cancellation to instance {instance_id} after inactivity timeout"
+                            );
+                            engine_ctx_for_timeout.kill();
+                            yield U::from_err(
+                                crate::error::DynamoError::builder()
+                                    .error_type(crate::error::ErrorType::ResponseTimeout)
+                                    .message("backend response inactivity timeout")
+                                    .build()
+                            );
+                            break;
+                        }
                     }
-                })
-            } else {
-                Box::pin(stream)
-            };
+                }
+            })
+        } else {
+            Box::pin(stream)
+        };
 
         Ok(ResponseStream::new(stream, engine_ctx))
     }

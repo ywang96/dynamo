@@ -529,6 +529,9 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 /// Implements `ValidateRequest` for `NvCreateChatCompletionRequest`,
 /// allowing us to validate the data.
 impl ValidateRequest for NvCreateChatCompletionRequest {
+    // `max_tokens` is deprecated upstream but still honored as a fallback in
+    // `get_max_tokens` (max_completion_tokens.or(max_tokens)), so it must be validated.
+    #[allow(deprecated)]
     fn validate(&self) -> Result<(), anyhow::Error> {
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
         validate::validate_chat_template_args(self.chat_template_args.as_ref())?;
@@ -541,7 +544,9 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_logit_bias(&self.inner.logit_bias)?;
         // none for logprobs
         validate::validate_top_logprobs(self.inner.top_logprobs)?;
-        // validate::validate_max_tokens(self.inner.max_tokens)?; // warning depricated field
+        // Honor the deprecated `max_tokens` fallback: reject 0 at the frontend (400)
+        // instead of letting the vLLM worker reject it as a 500.
+        validate::validate_max_tokens(self.inner.max_tokens)?;
         validate::validate_max_completion_tokens(self.inner.max_completion_tokens)?;
         validate::validate_n(self.inner.n)?;
         validate_completion_token_ids_single_choice(
@@ -749,6 +754,24 @@ mod tests {
     }
 
     #[test]
+    fn test_max_tokens_zero_rejected() {
+        // Deprecated `max_tokens` is still honored as a fallback in `get_max_tokens`,
+        // so 0 must be rejected at the frontend (-> 400) instead of reaching the worker (-> 500).
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 0
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+        let err = ValidateRequest::validate(&request).expect_err("max_tokens 0 must be rejected");
+        assert!(
+            err.to_string().contains("Max tokens"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_completion_token_ids_rejected_for_multi_choice() {
         let request_json = json!({
             "model": "test-model",
@@ -820,6 +843,32 @@ mod tests {
             serde_json::from_value(request_json).expect("Failed to deserialize request");
 
         assert!(ValidateRequest::validate(&request).is_err());
+    }
+
+    #[test]
+    fn test_prompt_cache_key_ignored() {
+        // `prompt_cache_key` is a standard OpenAI prompt-cache hint Dynamo does
+        // not implement. It must be accepted (not 400'd) and silently ignored.
+        let request_json = json!({
+            "model": "MiniMaxAI/MiniMax-M3",
+            "messages": [
+                {"role": "system", "content": "[Session: nKYaXRvj7uff0LYT] You are a helpful assistant for cache testing."},
+                {"role": "user", "content": "Say hi in one word."}
+            ],
+            "max_tokens": 64,
+            "stream": false,
+            "prompt_cache_key": "NbrnTP3fAbnFbmOH"
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        assert!(
+            ValidateRequest::validate(&request).is_ok(),
+            "prompt_cache_key must be accepted and ignored, not rejected"
+        );
+        // It is captured by the catch-all but `unsupported_fields` is
+        // `skip_serializing`, so it is dropped before forwarding downstream.
+        assert!(request.unsupported_fields.contains_key("prompt_cache_key"));
     }
 
     // -----------------------------------------------------------------------

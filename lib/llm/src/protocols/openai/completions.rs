@@ -824,6 +824,26 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_cache_key_ignored() {
+        // `prompt_cache_key` is a standard OpenAI prompt-cache hint Dynamo does
+        // not implement; it must be accepted and silently ignored, not rejected.
+        let request_json = json!({
+            "model": "test-model",
+            "prompt": "Say hi in one word.",
+            "max_tokens": 64,
+            "prompt_cache_key": "NbrnTP3fAbnFbmOH"
+        });
+        let request: NvCreateCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        assert!(
+            ValidateRequest::validate(&request).is_ok(),
+            "prompt_cache_key must be accepted and ignored, not rejected"
+        );
+        assert!(request.unsupported_fields.contains_key("prompt_cache_key"));
+    }
+
+    #[test]
     fn test_completion_token_ids_rejected_for_multi_choice() {
         let request_json = json!({
             "model": "test-model",

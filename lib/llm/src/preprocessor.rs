@@ -1987,8 +1987,11 @@ impl OpenAIPreprocessor {
         if max_len > 0 && token_count >= max_len {
             return Err(DynamoError::builder()
                 .error_type(ErrorType::InvalidArgument)
+                // The "Validation: " prefix must stay in sync with VALIDATION_PREFIX
+                // in lib/llm/src/http/service/openai.rs — classify_error_for_metrics
+                // keys off it to meter this 400 as error_type:validation (not internal).
                 .message(format!(
-                    "This model's maximum context length is {} tokens. \
+                    "Validation: This model's maximum context length is {} tokens. \
                      However, your messages resulted in {} tokens. \
                      Please reduce the length of the messages.",
                     max_len, token_count,

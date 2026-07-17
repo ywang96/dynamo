@@ -59,8 +59,15 @@ async def _unregister_endpoints(endpoints: Iterable) -> None:
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for result in results:
         if isinstance(result, Exception):
-            logger.warning(
-                "Failed to unregister endpoint instance from discovery: %s",
+            # The Rust apply_cr path already retries with a fresh kube client on
+            # 401/403 (stale projected token). Reaching here means unregister
+            # truly failed after retries — the worker will exit without leaving
+            # discovery, so frontends keep routing to it until pod GC. Surface
+            # loudly: expect transient "instance_id not found" 500s during the
+            # grace period.
+            logger.error(
+                "Failed to unregister endpoint instance from discovery after retries: %s; "
+                "graceful shutdown contract violated, frontends may keep routing to this worker",
                 result,
             )
 

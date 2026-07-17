@@ -2536,7 +2536,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     None,
                     None,
                     {
-                        "finish_reason": f"error: Invalid prompt_embeds: {msg}",
+                        "finish_reason": normalize_finish_reason(
+                            f"error: Invalid prompt_embeds: {msg}"
+                        ),
                         "token_ids": [],
                     },
                 )
@@ -2561,7 +2563,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     None,
                     None,
                     {
-                        "finish_reason": f"error: Invalid prompt_embeds: {e}",
+                        "finish_reason": normalize_finish_reason(
+                            f"error: Invalid prompt_embeds: {e}"
+                        ),
                         "token_ids": [],
                     },
                 )
@@ -2732,10 +2736,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         request_id,
                         lora_request,
                     )
-                    # Use string format "error: message" for consistency with vLLM's string-based finish_reason
-                    # Rust will parse this into FinishReason::Error(message)
+                    # Route through normalize_finish_reason() so the wire format is
+                    # the FE-compatible {"error": "<msg>"} object form that matches
+                    # the Rust FinishReason::Error(String) newtype variant. Emitting
+                    # a bare "error: ..." string here would fail serde at the FE and
+                    # be silently dropped — see production trace
+                    # 5cf40fe6-b935-4aa0-9e39-158fe54ea178 and ai-dynamo/dynamo#8549.
                     yield {
-                        "finish_reason": "error: No outputs from vLLM engine",
+                        "finish_reason": normalize_finish_reason(
+                            "error: No outputs from vLLM engine"
+                        ),
                         "index": 0,
                         "token_ids": [],
                     }
@@ -3249,7 +3259,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                 {
                                     "index": 0,
                                     "delta": {"role": "assistant", "content": ""},
-                                    "finish_reason": "error",
+                                    "finish_reason": normalize_finish_reason(
+                                        "error: vllm engine returned empty outputs or internal abort; check worker logs"
+                                    ),
                                 }
                             ],
                         }

@@ -680,6 +680,15 @@ mod context_length_validation {
             .downcast_ref::<DynamoError>()
             .expect("error should be DynamoError");
         assert_eq!(dynamo_err.error_type(), ErrorType::InvalidArgument);
+        // The message must carry the "Validation: " prefix so the HTTP-service
+        // metrics classifier (classify_error_for_metrics) tags this 400 as a
+        // client validation error (error_type:validation) rather than falling
+        // back to error_type:internal. See lib/llm/src/http/service/openai.rs.
+        assert!(
+            dynamo_err.message().starts_with("Validation: "),
+            "context-length error must start with the Validation: prefix, got: {}",
+            dynamo_err.message()
+        );
         assert!(
             dynamo_err
                 .message()
