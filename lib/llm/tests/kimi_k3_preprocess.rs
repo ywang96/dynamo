@@ -37,7 +37,11 @@ fn synthetic_k3_dir() -> tempfile::TempDir {
             "architectures": ["KimiK3ForConditionalGeneration"],
             "eos_token_id": 303,
             "max_position_embeddings": 8192,
-            "vocab_size": 512
+            "vocab_size": 512,
+            // Mirrors the real K3 config (163605 there): the renderer emits
+            // this id for image content parts; MM routing resolves it from
+            // config.json (see lightseek_mm chat-placeholder fallback).
+            "media_placeholder_token_id": 306
         })
         .to_string(),
     )
@@ -145,6 +149,60 @@ async fn k3_preprocess_marks_prompt_injected_reasoning() {
         "K3 with thinking off must not mark prompt-injected reasoning"
     );
 }
+/// Image-bearing requests render exactly one `<|media_pad|>` (id 306 in the
+/// synthetic vocab; 163605 on the real model) per image content part —
+/// downstream MM processing expands each placeholder into the full media
+/// sequence. Text parts around the images encode as ordinary tokens.
+#[tokio::test]
+async fn k3_preprocess_image_parts_render_one_media_pad_each() {
+    const MEDIA_PAD_ID: u32 = 306;
+
+    let dir = synthetic_k3_dir();
+    let mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");
+    let preprocessor = OpenAIPreprocessor::new(mdc.clone()).expect("build preprocessor");
+
+    let messages: Vec<dynamo_protocols::types::ChatCompletionRequestMessage> =
+        serde_json::from_value(serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "compare these"},
+                {"type": "image_url", "image_url": {"url": "http://example/a.png"}},
+                {"type": "text", "text": "with"},
+                {"type": "image_url", "image_url": {"url": "http://example/b.png"}}
+            ]
+        }]))
+        .expect("content-part message deserializes");
+    let mut inner = dynamo_protocols::types::CreateChatCompletionRequestArgs::default();
+    inner.model(mdc.slug().to_string());
+    inner.messages(messages);
+    let request = NvCreateChatCompletionRequest {
+        inner: inner.build().unwrap(),
+        common: Default::default(),
+        nvext: None,
+        chat_template_args: None,
+        thinking: None,
+        media_io_kwargs: None,
+        return_tokens_as_token_ids: None,
+        unsupported_fields: Default::default(),
+    };
+
+    let (preprocessed, _, _) = preprocessor
+        .preprocess_request(&request, None)
+        .await
+        .expect("preprocess image-bearing K3 request");
+
+    let pad_count = preprocessed
+        .token_ids
+        .iter()
+        .filter(|&&id| id == MEDIA_PAD_ID)
+        .count();
+    assert_eq!(
+        pad_count, 2,
+        "exactly one <|media_pad|> per image part (got {pad_count}); ids: {:?}",
+        preprocessed.token_ids
+    );
+}
+
 /// Decode synthetic-vocab token ids back to text: ids < 256 are raw bytes,
 /// 300..=307 are the K3 wire markers registered in `synthetic_k3_dir`.
 fn decode_synthetic(ids: &[u32]) -> String {
