@@ -94,7 +94,7 @@ async def test_fetch_with_policy_returns_first_response(
 
     call_count = {"n": 0}
 
-    async def _fake(url, timeout):
+    async def _fake(url, timeout, *, max_bytes=None):
         call_count["n"] += 1
         return b"body-bytes", None
 
@@ -113,20 +113,26 @@ async def test_fetch_with_policy_follows_safe_redirect(
     monkeypatch.setenv("DYN_HTTP_BACKEND", backend_name)
     client = mm_http.get_default_client()
 
-    hops: list[str] = []
+    hops: list[tuple[str, int | None]] = []
 
-    async def _fake(url, timeout):
-        hops.append(url)
+    async def _fake(url, timeout, *, max_bytes=None):
+        hops.append((url, max_bytes))
         if url == "https://example.com/x.png":
             return None, "https://example.com/final.png"
         return b"final-bytes", None
 
     with patch.object(client, "_fetch_body_or_redirect", _fake):
         result = await mm_http.fetch_bytes(
-            "https://example.com/x.png", 30.0, policy=_PERMISSIVE
+            "https://example.com/x.png",
+            30.0,
+            policy=_PERMISSIVE,
+            max_bytes=1024,
         )
     assert result == b"final-bytes"
-    assert hops == ["https://example.com/x.png", "https://example.com/final.png"]
+    assert hops == [
+        ("https://example.com/x.png", 1024),
+        ("https://example.com/final.png", 1024),
+    ]
 
 
 @pytest.mark.parametrize("backend_name", ["aiohttp", "httpx"])
@@ -138,7 +144,7 @@ async def test_fetch_with_policy_blocks_redirect_to_private_ip(
 
     strict = UrlValidationPolicy(allow_private_ips=False)
 
-    async def _fake(url, timeout):
+    async def _fake(url, timeout, *, max_bytes=None):
         return None, "http://169.254.169.254/latest/meta-data/"
 
     with patch.object(client, "_fetch_body_or_redirect", _fake):
@@ -161,7 +167,7 @@ async def test_fetch_with_policy_enforces_redirect_limit(
         "https://example.com/d": "https://example.com/e",
     }
 
-    async def _fake(url, timeout):
+    async def _fake(url, timeout, *, max_bytes=None):
         return None, chain[url]
 
     with patch.object(client, "_fetch_body_or_redirect", _fake):

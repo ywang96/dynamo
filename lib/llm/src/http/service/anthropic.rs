@@ -30,7 +30,9 @@ use tracing::Instrument;
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, monitor_for_disconnects_tracking_first_token,
+    },
     metrics::{
         CancellationLabels, Endpoint,
         process_chat_response_and_observe_metrics as process_response_and_observe_metrics,
@@ -439,6 +441,10 @@ async fn anthropic_messages(
 
         let mut http_queue_guard = Some(http_queue_guard);
         let mut engine_stream = engine_stream;
+        let (finish_reason_tx, finish_reason_rx) =
+            tokio::sync::watch::channel::<Option<crate::protocols::common::FinishReason>>(None);
+        let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_token_flag = first_token_seen.clone();
 
         let full_stream = async_stream::stream! {
             let mut events = Vec::with_capacity(4);
@@ -449,7 +455,11 @@ async fn anthropic_messages(
 
             let mut saw_error = false;
 
-            while let Some(annotated_chunk) = engine_stream.next().await {
+            while let Some(mut annotated_chunk) = engine_stream.next().await {
+                super::openai::intercept_backend_error_event(
+                    &mut annotated_chunk,
+                    &finish_reason_tx,
+                );
                 process_response_and_observe_metrics(
                     &annotated_chunk,
                     &mut response_collector,
@@ -462,6 +472,18 @@ async fn anthropic_messages(
                     }
                     continue;
                 };
+                if !super::openai::is_empty_stream_response(&stream_resp) {
+                    first_token_flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(reason) = stream_resp
+                    .inner
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.finish_reason.as_ref())
+                {
+                    let _ = finish_reason_tx
+                        .send(Some(super::openai::map_chat_finish_reason(reason)));
+                }
 
                 converter.append_chunk_events(&stream_resp, &mut events);
                 for event in events.drain(..) {
@@ -479,7 +501,14 @@ async fn anthropic_messages(
             }
         };
 
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects_tracking_first_token(
+            full_stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            finish_reason_rx,
+            first_token_seen,
+        );
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import numpy as np
@@ -8,7 +9,7 @@ import pytest
 
 import dynamo.common.multimodal.video_loader as video_loader_module
 from dynamo.common.http.url_validator import UrlValidationPolicy
-from dynamo.common.multimodal.video_loader import VideoLoader
+from dynamo.common.multimodal.video_loader import VideoLoader, VideoValidationError
 
 pytestmark = [
     pytest.mark.unit,
@@ -48,6 +49,47 @@ async def test_load_video_uses_vllm_media_connector():
     assert loaded_frames.flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(loaded_frames, np.ascontiguousarray(frames))
     assert loaded_metadata == metadata
+
+
+def _patch_oversized_fetch(monkeypatch, loader):
+    """Return 100 URL bytes against a 10-byte cap without importing vLLM IO."""
+    validate = AsyncMock(side_effect=lambda url, policy: url)
+    fetch = AsyncMock(return_value=b"x" * 100)
+    monkeypatch.setattr(video_loader_module, "validate_media_url", validate)
+    monkeypatch.setattr(video_loader_module, "fetch_bytes", fetch)
+    # The size check fires before any method on the decoder is invoked.
+    loader._create_vllm_video_io = lambda: object()  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_load_video_over_size_limit_raises_validation_error(monkeypatch):
+    """Oversized URL video bytes should be rejected before decoder invocation."""
+    loader = VideoLoader(max_video_bytes=10)
+    _patch_oversized_fetch(monkeypatch, loader)
+
+    with pytest.raises(VideoValidationError, match="exceeds maximum size"):
+        await loader.load_video("https://example.com/big.mp4")
+
+
+@pytest.mark.asyncio
+async def test_load_video_batch_preserves_size_validation_error(monkeypatch):
+    """The batch path must retain the typed client validation error."""
+    loader = VideoLoader(max_video_bytes=10)
+    _patch_oversized_fetch(monkeypatch, loader)
+
+    with pytest.raises(VideoValidationError, match="exceeds maximum size"):
+        await loader.load_video_batch([{"Url": "https://example.com/big.mp4"}])
+
+
+@pytest.mark.asyncio
+async def test_load_video_batch_preserves_cancellation():
+    loader = VideoLoader()
+    loader.load_video = AsyncMock(  # type: ignore[method-assign]
+        side_effect=asyncio.CancelledError
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await loader.load_video_batch([{"Url": "https://example.com/video.mp4"}])
 
 
 @pytest.mark.asyncio

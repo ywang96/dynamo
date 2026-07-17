@@ -52,7 +52,12 @@ pub enum ErrorType {
     /// A connection or request timed out.
     ConnectionTimeout,
     /// The backend accepted the request but stopped responding (stream inactivity timeout).
+    /// Phase-agnostic; used by the HTTP-layer safety-net timer.
     ResponseTimeout,
+    /// Request-plane timer fired before the first generated token arrived.
+    FirstTokenTimeout,
+    /// Request-plane timer fired between generated tokens.
+    IntraTokenTimeout,
     /// The request was cancelled (e.g., client disconnected).
     Cancelled,
     /// The system does not have enough resources to handle the request.
@@ -72,6 +77,8 @@ impl fmt::Display for ErrorType {
             ErrorType::Disconnected => write!(f, "Disconnected"),
             ErrorType::ConnectionTimeout => write!(f, "ConnectionTimeout"),
             ErrorType::ResponseTimeout => write!(f, "ResponseTimeout"),
+            ErrorType::FirstTokenTimeout => write!(f, "FirstTokenTimeout"),
+            ErrorType::IntraTokenTimeout => write!(f, "IntraTokenTimeout"),
             ErrorType::Cancelled => write!(f, "Cancelled"),
             ErrorType::ResourceExhausted => write!(f, "ResourceExhausted"),
             ErrorType::Unavailable => write!(f, "Unavailable"),
@@ -471,6 +478,14 @@ mod tests {
             "ConnectionTimeout"
         );
         assert_eq!(ErrorType::ResponseTimeout.to_string(), "ResponseTimeout");
+        assert_eq!(
+            ErrorType::FirstTokenTimeout.to_string(),
+            "FirstTokenTimeout"
+        );
+        assert_eq!(
+            ErrorType::IntraTokenTimeout.to_string(),
+            "IntraTokenTimeout"
+        );
         assert_eq!(ErrorType::Cancelled.to_string(), "Cancelled");
         assert_eq!(
             ErrorType::ResourceExhausted.to_string(),

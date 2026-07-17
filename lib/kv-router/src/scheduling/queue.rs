@@ -27,8 +27,8 @@ use super::queue_admission::{
 };
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
-    KvSchedulerError, OverloadedWorkerProvider, RequestOutcome, SchedulingContext,
-    SchedulingRequest, SchedulingResponse,
+    KvSchedulerError, OverloadedWorkerProvider, RequestOutcome, RoutableWorkerProvider,
+    SchedulingContext, SchedulingRequest, SchedulingResponse,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerWithDpRank,
@@ -95,6 +95,23 @@ enum AdmissionCommand {
         request_id: String,
     },
     Cleanup,
+}
+
+/// One provider snapshot shared by capacity gating and worker selection for a
+/// scheduling decision. Keeping these views together prevents an idle but
+/// unroutable worker from bypassing queue admission.
+struct WorkerGatingSnapshot {
+    overloaded: Option<HashSet<WorkerId>>,
+    routable: Option<HashSet<WorkerId>>,
+}
+
+impl WorkerGatingSnapshot {
+    fn eligibility<'a>(&'a self, request: &'a SchedulingRequest) -> RoutingEligibility<'a> {
+        request.eligibility_with_overloaded_and_routable(
+            self.overloaded.as_ref(),
+            self.routable.as_ref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +260,7 @@ struct SchedulerQueueActor<
     overlap_scores_refresh: Option<Arc<RF>>,
     overlap_refresh_after: Option<Duration>,
     overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+    routable_worker_provider: Option<RoutableWorkerProvider>,
 }
 
 /// Queue that gates scheduling requests behind a capacity check.
@@ -291,6 +309,7 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        routable_worker_provider: Option<RoutableWorkerProvider>,
     ) -> Self {
         let profile = PolicyProfile::synthetic(threshold_frac, queue_policy);
         Self::new_with_policy_profile(
@@ -302,6 +321,7 @@ impl<
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            routable_worker_provider,
         )
         .expect("synthetic policy profile does not require admission strategies")
     }
@@ -316,6 +336,7 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        routable_worker_provider: Option<RoutableWorkerProvider>,
     ) -> Result<Self, KvSchedulerError> {
         Self::new_with_policy_profile_and_admission_strategies(
             slots,
@@ -326,6 +347,7 @@ impl<
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            routable_worker_provider,
             Duration::from_secs(60),
             PolicyClassAdmissionStrategies::new(),
         )
@@ -341,6 +363,7 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        routable_worker_provider: Option<RoutableWorkerProvider>,
         queue_recheck_interval: Duration,
         admission_strategies: PolicyClassAdmissionStrategies,
     ) -> Result<Self, KvSchedulerError> {
@@ -353,6 +376,7 @@ impl<
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            routable_worker_provider,
             queue_recheck_interval,
             admission_strategies,
             ADMISSION_CHANNEL_CAPACITY,
@@ -369,6 +393,7 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        routable_worker_provider: Option<RoutableWorkerProvider>,
         queue_recheck_interval: Duration,
         admission_strategies: PolicyClassAdmissionStrategies,
         admission_channel_capacity: usize,
@@ -409,6 +434,11 @@ impl<
         } else {
             None
         };
+        if routable_worker_provider.is_some() {
+            tracing::info!(
+                "Router queue routable-worker gate enabled; selector skips workers absent from routable_ids"
+            );
+        }
         let pending_count = Arc::new(AtomicUsize::new(0));
         let pending_isl_tokens = Arc::new(AtomicUsize::new(0));
         let class_counters = Arc::new(
@@ -446,6 +476,7 @@ impl<
             overlap_scores_refresh,
             overlap_refresh_after,
             overloaded_worker_provider,
+            routable_worker_provider,
         };
         tokio::spawn(actor.run(admission_rx));
         Ok(Self {
@@ -491,6 +522,7 @@ impl<
             prefill_load_estimator,
             None,
             None,
+            None,
         )
     }
 
@@ -515,6 +547,7 @@ impl<
             prefill_load_estimator,
             None,
             overloaded_worker_provider,
+            None,
         )
     }
 }
@@ -863,6 +896,7 @@ impl<
         lifecycle_generation: Option<LifecycleGeneration>,
     ) -> (bool, bool) {
         let decay_now = Instant::now();
+        let gating = self.gating_snapshot();
         // Synthetic and explicit selections avoid cache work. Family classification
         // samples overlap once and reuses it if the request enters queue storage.
         let (admission_class_index, mut snapshot) = if let Some(class_index) = self
@@ -897,14 +931,19 @@ impl<
             let routing_constraints = request.routing_constraints.clone();
             let workers = self.workers_with_configs.clone();
             let overloaded_worker_provider = self.overloaded_worker_provider.clone();
+            let routable_worker_provider = self.routable_worker_provider.clone();
             let worker_eligibility = WorkerEligibility::new(move || {
                 let workers = workers.borrow();
                 let overloaded_worker_ids = overloaded_worker_provider
                     .as_ref()
                     .and_then(|provider| provider());
-                let structural_eligibility = RoutingEligibility::new(
+                let routable_worker_ids = routable_worker_provider
+                    .as_ref()
+                    .and_then(|provider| provider());
+                let structural_eligibility = RoutingEligibility::with_routable(
                     allowed_worker_ids.as_ref(),
                     None,
+                    routable_worker_ids.as_ref(),
                     pinned_worker,
                     &routing_constraints,
                 );
@@ -965,11 +1004,12 @@ impl<
         let class = self.profile.class(queue_class_index);
         let should_queue = deferred
             || self.should_queue(queue_class_index, class, || {
-                self.all_workers_prefill_busy(class, request.eligibility(), decay_now)
+                self.all_workers_prefill_busy(class, gating.eligibility(&request), decay_now)
             });
         if !should_queue {
             return self.admit_one(
                 request,
+                &gating,
                 decay_now,
                 admission.map(|(admission, _)| admission),
             );
@@ -1062,6 +1102,19 @@ impl<
         // Preserve backlog anti-bypass and lazily avoid worker scans when an
         // earlier condition already decides admission.
         class.queueing_enabled() && (self.pending.has_backlog(class_index) || all_workers_busy())
+    }
+
+    fn gating_snapshot(&self) -> WorkerGatingSnapshot {
+        WorkerGatingSnapshot {
+            overloaded: self
+                .overloaded_worker_provider
+                .as_ref()
+                .and_then(|provider| provider()),
+            routable: self
+                .routable_worker_provider
+                .as_ref()
+                .and_then(|provider| provider()),
+        }
     }
 
     fn snapshot_for(&self, request: &SchedulingRequest) -> QueueSnapshot {
@@ -1190,12 +1243,13 @@ impl<
     fn has_dispatchable_ready_head(&self) -> bool {
         let active_tokens = self.slots.active_tokens(Instant::now());
         let configs = self.workers_with_configs.borrow();
+        let gating = self.gating_snapshot();
         self.pending.any_ready_head(|_, class, queued| {
             !Self::all_workers_prefill_busy_with(
                 &active_tokens,
                 &configs,
                 class,
-                queued.request.eligibility(),
+                gating.eligibility(&queued.request),
             )
         })
     }
@@ -1417,6 +1471,7 @@ impl<
         loop {
             let decay_now = Instant::now();
             let active_tokens = self.slots.active_tokens(decay_now);
+            let gating = self.gating_snapshot();
             let popped = {
                 let configs = self.workers_with_configs.borrow();
                 self.pending.pop_next(|_, class, queued| {
@@ -1427,7 +1482,7 @@ impl<
                         &active_tokens,
                         &configs,
                         class,
-                        queued.request.eligibility(),
+                        gating.eligibility(&queued.request),
                     )
                 })
             };
@@ -1483,7 +1538,10 @@ impl<
                 policy_class = class.name,
                 "scheduling request from pending queue"
             );
-            let _ = self.admit_one(request, admit_now, admission);
+            // Refresh provider state after overlap refresh so selection never
+            // uses a worker quarantined while this actor was awaiting.
+            let admit_gating = self.gating_snapshot();
+            let _ = self.admit_one(request, &admit_gating, admit_now, admission);
         }
     }
 
@@ -1492,6 +1550,7 @@ impl<
     fn admit_one(
         &mut self,
         mut request: SchedulingRequest,
+        gating: &WorkerGatingSnapshot,
         decay_now: Instant,
         admission: Option<RequestAdmission>,
     ) -> (bool, bool) {
@@ -1508,11 +1567,7 @@ impl<
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
-            let overloaded_worker_ids = self
-                .overloaded_worker_provider
-                .as_ref()
-                .and_then(|provider| provider());
-            let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+            let eligibility = gating.eligibility(&request);
             self.selector
                 .select_worker(&workers, &request, eligibility, self.block_size)
                 .map(|selection| {
@@ -2105,6 +2160,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap(),
         );
@@ -2153,6 +2209,55 @@ mod tests {
             RouterQueuePolicy::Fcfs,
             None,
             Some(overloaded_worker_provider),
+        ));
+
+        (queue, slots)
+    }
+
+    fn make_queue_with_routable_provider(
+        num_workers: usize,
+        block_size: u32,
+        isl: usize,
+        threshold_frac: Option<f64>,
+        routable_worker_provider: RoutableWorkerProvider,
+    ) -> (
+        Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
+        Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
+    ) {
+        let dp_range = (0..num_workers as u64)
+            .map(|worker_id| (worker_id, (0, 1)))
+            .collect();
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            block_size as usize,
+            dp_range,
+            false,
+            0,
+            "test",
+        ));
+        let configs = (0..num_workers as u64)
+            .map(|worker_id| {
+                (
+                    worker_id,
+                    SimpleWorkerConfig {
+                        max_num_batched_tokens: Some(isl as u64),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let (_config_tx, config_rx) = watch::channel(configs);
+        let queue = Arc::new(SchedulerQueue::new_with_overlap_refresh(
+            Arc::clone(&slots),
+            config_rx,
+            threshold_frac,
+            block_size,
+            DefaultWorkerSelector::new(None, "test"),
+            RouterQueuePolicy::Fcfs,
+            None,
+            None,
+            None,
+            Some(routable_worker_provider),
         ));
 
         (queue, slots)
@@ -2260,6 +2365,7 @@ mod tests {
             None,
             Some(refresher),
             None,
+            None,
         ));
 
         (queue, slots)
@@ -2316,6 +2422,7 @@ mod tests {
                 DefaultWorkerSelector::new(None, "test"),
                 None,
                 Some(refresher),
+                None,
                 None,
                 Duration::from_secs(60),
                 PolicyClassAdmissionStrategies::new(),
@@ -2529,6 +2636,7 @@ policy_classes:
                 profile,
                 16,
                 DefaultWorkerSelector::new(None, "test"),
+                None,
                 None,
                 None,
                 None,
@@ -4039,6 +4147,106 @@ policy_classes:
             .expect("queued request should have been scheduled");
         let response = scheduled.expect("scheduling returned error");
         assert_eq!(response.best_worker.worker_id, 0);
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_routable_provider_skips_quarantined_worker() {
+        let provider: RoutableWorkerProvider = Arc::new(|| Some(HashSet::from([1])));
+        let (queue, _slots) = make_queue_with_routable_provider(2, 16, 256, None, provider);
+
+        let (request, response) = make_request("after-quarantine", 256);
+        queue.enqueue(request).await;
+
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.best_worker.worker_id, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_routable_provider_empty_set_yields_no_endpoints() {
+        let provider: RoutableWorkerProvider = Arc::new(|| Some(HashSet::new()));
+        let (queue, _slots) = make_queue_with_routable_provider(2, 16, 256, None, provider);
+
+        let (request, response) = make_request("all-quarantined", 256);
+        queue.enqueue(request).await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(KvSchedulerError::NoEndpoints)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_routable_provider_is_evaluated_per_admission() {
+        let routable = Arc::new(StdMutex::new(HashSet::from([1])));
+        let provider_state = Arc::clone(&routable);
+        let provider: RoutableWorkerProvider =
+            Arc::new(move || Some(provider_state.lock().unwrap().clone()));
+        let (queue, slots) = make_queue_with_routable_provider(2, 16, 256, None, provider);
+
+        let (first, first_response) = make_request("first-admission", 256);
+        queue.enqueue(first).await;
+        assert_eq!(
+            first_response.await.unwrap().unwrap().best_worker.worker_id,
+            1
+        );
+        slots
+            .mark_prefill_completed(&"first-admission".to_string(), decay_now())
+            .unwrap();
+        slots
+            .free(&"first-admission".to_string(), decay_now())
+            .unwrap();
+
+        *routable.lock().unwrap() = HashSet::from([0]);
+        let (second, second_response) = make_request("second-admission", 256);
+        queue.enqueue(second).await;
+
+        assert_eq!(
+            second_response
+                .await
+                .unwrap()
+                .unwrap()
+                .best_worker
+                .worker_id,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_routable_gate_applies_to_queue_capacity_check() {
+        let provider: RoutableWorkerProvider = Arc::new(|| Some(HashSet::from([1])));
+        let (queue, _slots) = make_queue_with_routable_provider(2, 16, 256, Some(0.0), provider);
+
+        let (active, active_response) = make_request("active-routable", 256);
+        queue.enqueue(active).await;
+        assert_eq!(
+            active_response
+                .await
+                .unwrap()
+                .unwrap()
+                .best_worker
+                .worker_id,
+            1
+        );
+
+        let (queued, _queued_response) = make_request("must-queue", 256);
+        queue.enqueue(queued).await;
+
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_all_unroutable_returns_no_endpoints_with_queue() {
+        let provider: RoutableWorkerProvider = Arc::new(|| Some(HashSet::new()));
+        let (queue, _slots) = make_queue_with_routable_provider(2, 16, 256, Some(0.0), provider);
+
+        let (request, response) = make_request("all-unroutable-queued", 256);
+        queue.enqueue(request).await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(KvSchedulerError::NoEndpoints)
+        ));
         assert_eq!(queue.pending_count(), 0);
     }
 

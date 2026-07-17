@@ -508,12 +508,20 @@ pub enum ErrorType {
     Unavailable,
     /// Request cancelled by client or timeout
     Cancelled,
-    /// Backend accepted the request but stopped responding (response inactivity timeout)
+    /// HTTP-layer phase-agnostic response inactivity timeout
     ResponseTimeout,
+    /// Request-plane timer fired before the first generated token
+    FirstTokenTimeout,
+    /// Request-plane timer fired between generated tokens
+    IntraTokenTimeout,
     /// Internal server error (500 and other unexpected errors)
     Internal,
     /// Feature not implemented (501)
     NotImplemented,
+    /// Backend explicitly reported an error finish reason
+    BackendError,
+    /// Stream closed without a terminal finish reason
+    TruncatedStream,
 }
 
 /// Track response-specific metrics
@@ -1426,12 +1434,16 @@ impl Drop for InflightGuard {
                 let detail = match self.error_type {
                     ErrorType::Cancelled => "cancelled before completion",
                     ErrorType::ResponseTimeout => "backend stream inactivity timeout",
+                    ErrorType::FirstTokenTimeout => "request-plane TTFT timeout",
+                    ErrorType::IntraTokenTimeout => "request-plane inter-token timeout",
                     ErrorType::Internal => "internal server error during processing",
                     ErrorType::Validation => "invalid request parameters",
                     ErrorType::NotFound => "model or resource not found",
                     ErrorType::Overload => "service overloaded or rate limited",
                     ErrorType::Unavailable => "no backend worker available",
                     ErrorType::NotImplemented => "requested feature not implemented",
+                    ErrorType::BackendError => "backend signalled error via finish_reason",
+                    ErrorType::TruncatedStream => "stream ended without terminal finish_reason",
                     ErrorType::None => "unknown error",
                 };
                 tracing::error!(
@@ -1529,8 +1541,12 @@ impl ErrorType {
             ErrorType::Unavailable => frontend_service::error_type::UNAVAILABLE,
             ErrorType::Cancelled => frontend_service::error_type::CANCELLED,
             ErrorType::ResponseTimeout => frontend_service::error_type::RESPONSE_TIMEOUT,
+            ErrorType::FirstTokenTimeout => frontend_service::error_type::FIRST_TOKEN_TIMEOUT,
+            ErrorType::IntraTokenTimeout => frontend_service::error_type::INTRA_TOKEN_TIMEOUT,
             ErrorType::Internal => frontend_service::error_type::INTERNAL,
             ErrorType::NotImplemented => frontend_service::error_type::NOT_IMPLEMENTED,
+            ErrorType::BackendError => frontend_service::error_type::BACKEND_ERROR,
+            ErrorType::TruncatedStream => frontend_service::error_type::TRUNCATED_STREAM,
         }
     }
 }
@@ -1925,6 +1941,28 @@ pub fn process_chat_response_and_observe_metrics(
 /// Event converter wrapper for streaming responses
 pub struct EventConverter<T>(pub crate::types::Annotated<T>);
 
+/// Preserve a typed `DynamoError` in the `axum::Error` source chain while
+/// keeping the displayed wire message equal to `DynamoError::message()`.
+struct DisplayMessageDynamoError(dynamo_runtime::error::DynamoError);
+
+impl std::fmt::Display for DisplayMessageDynamoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.message())
+    }
+}
+
+impl std::fmt::Debug for DisplayMessageDynamoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for DisplayMessageDynamoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 impl<T> From<crate::types::Annotated<T>> for EventConverter<T> {
     fn from(annotated: crate::types::Annotated<T>) -> Self {
         EventConverter(annotated)
@@ -1991,21 +2029,22 @@ fn annotated_to_sse_event<T: Serialize>(
 
     if let Some(ref msg) = annotated.event {
         if msg == "error" {
-            let error_message = if let Some(ref dynamo_err) = annotated.error
+            let dynamo_err = if let Some(dynamo_err) = annotated.error.clone()
                 && !dynamo_err.message().is_empty()
             {
-                dynamo_err.message().to_string()
+                dynamo_err
             } else if let Some(ref comments) = annotated.comment {
                 let joined = comments.join(" -- ");
-                if joined.trim().is_empty() {
+                let message = if joined.trim().is_empty() {
                     "unspecified error".to_string()
                 } else {
                     joined
-                }
+                };
+                dynamo_runtime::error::DynamoError::msg(message)
             } else {
-                "unspecified error".to_string()
+                dynamo_runtime::error::DynamoError::msg("unspecified error")
             };
-            return Err(axum::Error::new(error_message));
+            return Err(axum::Error::new(DisplayMessageDynamoError(dynamo_err)));
         }
         event = event.event(msg);
     }
@@ -3231,8 +3270,12 @@ mod tests {
         assert_eq!(ErrorType::Unavailable.as_str(), "unavailable");
         assert_eq!(ErrorType::Cancelled.as_str(), "cancelled");
         assert_eq!(ErrorType::ResponseTimeout.as_str(), "response_timeout");
+        assert_eq!(ErrorType::FirstTokenTimeout.as_str(), "first_token_timeout");
+        assert_eq!(ErrorType::IntraTokenTimeout.as_str(), "intra_token_timeout");
         assert_eq!(ErrorType::Internal.as_str(), "internal");
         assert_eq!(ErrorType::NotImplemented.as_str(), "not_implemented");
+        assert_eq!(ErrorType::BackendError.as_str(), "backend_error");
+        assert_eq!(ErrorType::TruncatedStream.as_str(), "truncated_stream");
     }
 
     #[test]
@@ -3472,8 +3515,12 @@ mod tests {
             ErrorType::Unavailable,
             ErrorType::Cancelled,
             ErrorType::ResponseTimeout,
+            ErrorType::FirstTokenTimeout,
+            ErrorType::IntraTokenTimeout,
             ErrorType::Internal,
             ErrorType::NotImplemented,
+            ErrorType::BackendError,
+            ErrorType::TruncatedStream,
         ];
 
         for error_type in &error_types {

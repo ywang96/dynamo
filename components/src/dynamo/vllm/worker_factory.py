@@ -42,10 +42,12 @@ from .health_check import (
     VllmEmbeddingHealthCheckPayload,
     VllmHealthCheckPayload,
     VllmPrefillHealthCheckPayload,
+    _get_bos_token_id_from_engine,
 )
 from .instrumented_scheduler import ENV_FPM_BENCHMARK_OUTPUT_PATH, ENV_FPM_WORKER_ID
 from .multimodal_handlers import EncodeWorkerHandler
 from .publisher import StatLoggerFactory
+from .warmup import maybe_run_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,21 @@ BENCHMARK_SOFT_TIMEOUT_GRACE_SECONDS = 90
 # have no KV cache / scheduler gauges, so setup_vllm_engine() skips the
 # LLMBackendMetrics registration there.
 EngineSetupResult = tuple[AsyncLLM, VllmConfig, Any, Any, Optional[LLMBackendMetrics]]
+
+
+async def _warm_up_engine(engine_client: AsyncLLM, config: Config) -> None:
+    """Warm engine kernels before the worker becomes discoverable."""
+    if not config.warmup_enabled:
+        return
+
+    try:
+        bos_token_id = _get_bos_token_id_from_engine(engine_client)
+        await maybe_run_warmup(engine_client, config, bos_token_id)
+    except Exception as error:
+        logger.warning(
+            "Worker warmup aborted (%s); registering anyway",
+            error,
+        )
 
 
 def _benchmark_rank_path(base_path: Path, dp_rank: int) -> Path:
@@ -969,6 +986,9 @@ class WorkerFactory:
                 bench_cfg, vllm_config
             )
 
+        # Keep cold-start JIT work private by warming before discovery registration.
+        await _warm_up_engine(engine_client, config)
+
         # Model-serving-readiness role.
         # _create_decode_worker handles both DECODE and AGGREGATED disaggregation modes.
         # `--route-to-encoder` adds Encode to the AND-set of required peers
@@ -1197,6 +1217,10 @@ class WorkerFactory:
             handler._benchmark_results = await _wait_and_load_benchmark(
                 bench_cfg, vllm_config
             )
+
+        # Prefill workers use DYN_WARMUP_OUTPUT_TOKENS=1 in deployments so the
+        # same role-agnostic driver performs a plain local prefill.
+        await _warm_up_engine(engine_client, config)
 
         perf_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.get_perf_metrics"

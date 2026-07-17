@@ -22,6 +22,7 @@ use dynamo_runtime::{
 
 use crate::{
     discovery::ModelManager,
+    http::service::error::HttpError,
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -78,6 +79,14 @@ pub enum PrefillError {
 
     #[error("No disaggregated params in prefill response: {0}")]
     NoDisaggregatedParams(String),
+
+    /// The prefill worker rejected the request with a client-facing error.
+    ///
+    /// vLLM encodes these rejections in `finish_reason: Error(..)` rather than
+    /// in the annotated stream envelope. Preserve the worker's status and
+    /// message so the HTTP layer can return the original 4xx response.
+    #[error("prefill worker rejected request: {0}")]
+    WorkerError(#[source] HttpError),
 }
 
 enum PrefillOutcome {

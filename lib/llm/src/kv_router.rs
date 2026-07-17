@@ -16,8 +16,8 @@ use dynamo_kv_router::{
     },
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, RequestProgressUpdater,
-        ScheduleMode, ScheduleRequest, TieredOverlapRefresher, effective_prefill_tokens,
-        overlap::cache_hit_estimates_from_tiered_matches,
+        RoutableWorkerProvider, ScheduleMode, ScheduleRequest, TieredOverlapRefresher,
+        effective_prefill_tokens, overlap::cache_hit_estimates_from_tiered_matches,
     },
 };
 use dynamo_runtime::{
@@ -296,6 +296,17 @@ where
         let client_for_overload = client.clone();
         let overloaded_worker_provider: OverloadedWorkerProvider =
             Arc::new(move || client_for_overload.overloaded_instance_ids());
+        // Mirror the push router's synchronously-updated view so a worker
+        // quarantined by fault detection is excluded before dispatch.
+        let client_for_routable = client.clone();
+        let routable_worker_provider: RoutableWorkerProvider = Arc::new(move || {
+            Some(
+                client_for_routable
+                    .instance_ids_avail()
+                    .into_iter()
+                    .collect(),
+            )
+        });
 
         let scheduler = KvScheduler::start(
             component.clone(),
@@ -306,6 +317,7 @@ where
             prefill_load_estimator.clone(),
             overlap_scores_refresh,
             Some(overloaded_worker_provider),
+            Some(routable_worker_provider),
             model_name.as_deref(),
             worker_type,
             cancellation_token.child_token(),

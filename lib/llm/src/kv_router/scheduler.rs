@@ -7,8 +7,8 @@ pub use dynamo_kv_router::scheduling::overlap_refresh::{
 };
 pub use dynamo_kv_router::scheduling::{
     AdmissionLease, KvSchedulerError, LocalScheduler, OverloadedWorkerProvider,
-    PolicyClassAdmissionStrategies, PotentialLoad, RequestOutcome, ScheduleRequest,
-    SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
+    PolicyClassAdmissionStrategies, PotentialLoad, RequestOutcome, RoutableWorkerProvider,
+    ScheduleRequest, SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
 };
 pub use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
@@ -60,6 +60,7 @@ where
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        routable_worker_provider: Option<RoutableWorkerProvider>,
         model_name: Option<&str>,
         worker_type: &'static str,
         cancellation_token: CancellationToken,
@@ -73,6 +74,7 @@ where
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            routable_worker_provider,
             model_name,
             worker_type,
             cancellation_token,
@@ -91,6 +93,7 @@ where
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        routable_worker_provider: Option<RoutableWorkerProvider>,
         model_name: Option<&str>,
         worker_type: &'static str,
         cancellation_token: CancellationToken,
@@ -143,6 +146,7 @@ where
                 prefill_load_estimator,
                 overlap_scores_refresh,
                 overloaded_worker_provider,
+                routable_worker_provider,
                 queue_recheck_interval,
                 kv_router_config.router_track_prefill_tokens,
                 cancellation_token.child_token(),
@@ -525,6 +529,7 @@ mod tests {
             &config,
             None,
             None::<Arc<NoopOverlapScoresRefresh>>,
+            None,
             None,
             Some("test-model"),
             "decode",

@@ -28,9 +28,32 @@ from typing import Optional
 
 import httpx
 
-from .base import HttpClient, HttpConnectionError, HttpStatusError, HttpTimeoutError
+from .base import (
+    HttpBodyTooLargeError,
+    HttpClient,
+    HttpConnectionError,
+    HttpStatusError,
+    HttpTimeoutError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def _read_body(response: httpx.Response, max_bytes: int) -> bytes:
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                raise HttpBodyTooLargeError(max_bytes)
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise HttpBodyTooLargeError(max_bytes)
+        body.extend(chunk)
+    return bytes(body)
 
 
 class HttpxClient(HttpClient):
@@ -95,15 +118,28 @@ class HttpxClient(HttpClient):
                 )
         return self._client
 
-    async def _fetch_simple(self, url: str, timeout: float) -> bytes:
+    async def _fetch_simple(
+        self, url: str, timeout: float, *, max_bytes: Optional[int] = None
+    ) -> bytes:
         client = await self._get_client()
         async with self._get_semaphore():
+            response = None
             try:
-                response = await client.get(
-                    url, timeout=self._per_call_timeout(timeout)
-                )
+                if max_bytes is None:
+                    response = await client.get(
+                        url, timeout=self._per_call_timeout(timeout)
+                    )
+                else:
+                    request = client.build_request(
+                        "GET", url, timeout=self._per_call_timeout(timeout)
+                    )
+                    response = await client.send(
+                        request, follow_redirects=True, stream=True
+                    )
                 response.raise_for_status()
-                return response.content
+                if max_bytes is None:
+                    return response.content
+                return await _read_body(response, max_bytes)
             except httpx.HTTPStatusError as e:
                 raise HttpStatusError(e.response.status_code, str(e), url) from e
             except httpx.TimeoutException as e:
@@ -112,9 +148,12 @@ class HttpxClient(HttpClient):
                 raise HttpConnectionError(f"Connection error loading {url}: {e}") from e
             except httpx.HTTPError as e:
                 raise HttpConnectionError(f"HTTP error loading {url}: {e}") from e
+            finally:
+                if max_bytes is not None and response is not None:
+                    await response.aclose()
 
     async def _fetch_body_or_redirect(
-        self, url: str, timeout: float
+        self, url: str, timeout: float, *, max_bytes: Optional[int] = None
     ) -> tuple[bytes | None, str | None]:
         client = await self._get_client()
         async with self._get_semaphore():
@@ -125,6 +164,7 @@ class HttpxClient(HttpClient):
                 response = await client.send(
                     request,
                     follow_redirects=False,
+                    stream=max_bytes is not None,
                 )
             except httpx.TimeoutException as e:
                 raise HttpTimeoutError(f"Timeout loading {url}") from e
@@ -140,13 +180,17 @@ class HttpxClient(HttpClient):
                         next_url = str(response.url.join(location))
                         return None, next_url
                     # 3xx without Location: treat as terminal, surface the body.
-                    return response.content, None
+                    if max_bytes is None:
+                        return response.content, None
+                    return await _read_body(response, max_bytes), None
 
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     raise HttpStatusError(e.response.status_code, str(e), url) from e
-                return response.content, None
+                if max_bytes is None:
+                    return response.content, None
+                return await _read_body(response, max_bytes), None
             finally:
                 await response.aclose()
 

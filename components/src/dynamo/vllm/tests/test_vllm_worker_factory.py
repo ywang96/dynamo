@@ -16,6 +16,7 @@ from dynamo.vllm.worker_factory import (
     EngineSetupResult,
     WorkerFactory,
     _wait_and_load_benchmark,
+    _warm_up_engine,
 )
 
 pytestmark = [
@@ -42,9 +43,41 @@ def _make_config(**overrides) -> Mock:
         "route_to_encoder": False,
         "disaggregation_mode": DisaggregationMode.AGGREGATED,
         "embedding_worker": False,
+        "warmup_enabled": False,
     }
     defaults.update(overrides)
     return Mock(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_warmup_disabled_skips_bos_lookup(monkeypatch):
+    get_bos_token_id = Mock(side_effect=AssertionError("unexpected BOS lookup"))
+    run_warmup = AsyncMock()
+    monkeypatch.setattr(
+        "dynamo.vllm.worker_factory._get_bos_token_id_from_engine", get_bos_token_id
+    )
+    monkeypatch.setattr("dynamo.vllm.worker_factory.maybe_run_warmup", run_warmup)
+
+    await _warm_up_engine(Mock(), _make_config(warmup_enabled=False))
+
+    get_bos_token_id.assert_not_called()
+    run_warmup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_warmup_bos_lookup_failure_is_fail_open(monkeypatch, caplog):
+    run_warmup = AsyncMock()
+    monkeypatch.setattr(
+        "dynamo.vllm.worker_factory._get_bos_token_id_from_engine",
+        Mock(side_effect=RuntimeError("missing BOS token")),
+    )
+    monkeypatch.setattr("dynamo.vllm.worker_factory.maybe_run_warmup", run_warmup)
+    caplog.set_level(logging.WARNING)
+
+    await _warm_up_engine(Mock(), _make_config(warmup_enabled=True))
+
+    run_warmup.assert_not_awaited()
+    assert "missing BOS token" in caplog.text
 
 
 def _single_rank_benchmark_payload(

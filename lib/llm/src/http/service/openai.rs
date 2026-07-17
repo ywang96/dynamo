@@ -29,11 +29,15 @@ use dynamo_runtime::{
     protocols::annotated::AnnotationsProvider,
 };
 use futures::{StreamExt, stream};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, monitor_for_disconnects,
+        monitor_for_disconnects_tracking_first_token,
+    },
     error::HttpError,
     metadata::{attach_x_request_id, extract_metadata_from_http},
     metrics::{
@@ -104,25 +108,79 @@ pub(super) fn get_body_limit() -> usize {
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 pub(crate) struct ErrorMessage {
+    message: String,
+    error_type: String,
+    // The HTTP status is carried separately in `ErrorResponse`; retaining it
+    // here keeps the existing internal/test helpers stable while the wire
+    // serializer emits only the OpenAI error envelope fields.
+    #[allow(dead_code)]
+    code: u16,
+    details: Option<Box<serde_json::Value>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpenAIErrorEnvelope {
+    error: OpenAIErrorDetail,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpenAIErrorDetail {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
-    code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Box<serde_json::Value>>,
 }
 
-fn map_error_code_to_error_type(code: StatusCode) -> String {
-    match code.canonical_reason() {
-        Some(reason) => reason.to_string(),
-        None if code.as_u16() == 529 => "Overloaded".to_string(),
-        // 499 is not IANA-registered (nginx convention for client-closed-request),
-        // so canonical_reason() returns None. Use the de facto standard name.
-        None if code.as_u16() == 499 => "Client Closed Request".to_string(),
-        None => "UnknownError".to_string(),
+impl Serialize for ErrorMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        OpenAIErrorEnvelope {
+            error: OpenAIErrorDetail {
+                message: self.message.clone(),
+                error_type: self.error_type.clone(),
+                param: None,
+                code: None,
+                details: self.details.clone(),
+            },
+        }
+        .serialize(serializer)
     }
+}
+
+impl<'de> Deserialize<'de> for ErrorMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let envelope = OpenAIErrorEnvelope::deserialize(deserializer)?;
+        Ok(Self {
+            message: envelope.error.message,
+            error_type: envelope.error.error_type,
+            // HTTP status is carried out-of-band by the response. Deserialized
+            // bodies are used only for protocol assertions in local tests.
+            code: 0,
+            details: envelope.error.details,
+        })
+    }
+}
+
+fn map_error_code_to_error_type(code: StatusCode) -> String {
+    match code.as_u16() {
+        400 | 401 | 403 | 404 | 422 => "invalid_request_error",
+        429 => "rate_limit_error",
+        501 => "not_implemented_error",
+        _ => "api_error",
+    }
+    .to_string()
 }
 
 /// Classify error for metrics based on status code and message
@@ -140,6 +198,7 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
         StatusCode::NOT_IMPLEMENTED => ErrorType::NotImplemented, // 501
         StatusCode::TOO_MANY_REQUESTS => ErrorType::Overload, // 429
         StatusCode::SERVICE_UNAVAILABLE => ErrorType::Unavailable, // 503
+        StatusCode::GATEWAY_TIMEOUT => ErrorType::ResponseTimeout, // 504
         StatusCode::INTERNAL_SERVER_ERROR => ErrorType::Internal, // 500
         _ if code.as_u16() == 529 => ErrorType::Overload, // 529
         _ if code.as_u16() == 499 => ErrorType::Cancelled, // 499 Client Closed Request
@@ -184,6 +243,19 @@ fn find_queue_rejection_in_chain<'a>(
             error.downcast_ref::<dynamo_kv_router::scheduling::QueueRejection>()
         {
             return Some(rejection);
+        }
+        current = error.source();
+    }
+    None
+}
+
+fn find_http_error_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a HttpError> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(http_error) = error.downcast_ref::<HttpError>() {
+            return Some(http_error);
         }
         current = error.source();
     }
@@ -291,6 +363,20 @@ impl ErrorMessage {
             Json(ErrorMessage {
                 message: public_msg.to_string(),
                 error_type,
+                code: code.as_u16(),
+                details: None,
+            }),
+        )
+    }
+
+    /// Gateway Timeout for a request-plane TTFT or inter-token timeout.
+    pub fn gateway_timeout(message: &str) -> ErrorResponse {
+        let code = StatusCode::GATEWAY_TIMEOUT;
+        (
+            code,
+            Json(ErrorMessage {
+                message: message.to_string(),
+                error_type: map_error_code_to_error_type(code),
                 code: code.as_u16(),
                 details: None,
             }),
@@ -410,13 +496,13 @@ impl ErrorMessage {
             );
         }
 
-        // Then check for HttpError
-        match err.downcast::<HttpError>() {
-            Ok(http_error) => ErrorMessage::from_http_error(http_error),
-            Err(err) => {
-                ErrorMessage::internal_server_error_with_details(alt_msg, format!("{err:#}"))
-            }
+        // Preserve an HTTP status even when `?` wrapped HttpError inside a
+        // domain error before it reached this boundary.
+        if let Some(http_error) = find_http_error_in_chain(err.as_ref()) {
+            return ErrorMessage::from_http_error(http_error.clone());
         }
+
+        ErrorMessage::internal_server_error_with_details(alt_msg, format!("{err:#}"))
     }
 
     /// Implementers should only be able to throw 400-499 errors.
@@ -766,6 +852,7 @@ async fn completions_single(
 
     // prepare to process any annotations
     let annotations = request.annotations();
+    let expected_choices = request.inner.n.unwrap_or(1) as usize;
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -805,6 +892,11 @@ async fn completions_single(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
+        let (finish_reason_tx, finish_reason_rx) =
+            tokio::sync::watch::channel::<Option<crate::protocols::common::FinishReason>>(None);
+        let mut completed_choices = HashSet::new();
+        let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_token_flag = first_token_seen.clone();
         let stream = stream
             .filter(|r| {
                 // Drop empty chunks from multi-byte token assembly
@@ -814,7 +906,24 @@ async fn completions_single(
                         .is_some_and(is_empty_completion_stream_response),
                 )
             })
-            .map(move |response| {
+            .map(move |mut response| {
+                intercept_backend_error_event(&mut response, &finish_reason_tx);
+                if response.data.is_some() {
+                    first_token_flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(data) = response.data.as_ref() {
+                    for choice in &data.inner.choices {
+                        if let Some(reason) = choice.finish_reason.as_ref() {
+                            record_terminal_choice(
+                                &finish_reason_tx,
+                                &mut completed_choices,
+                                expected_choices,
+                                choice.index,
+                                map_completion_finish_reason(reason),
+                            );
+                        }
+                    }
+                }
                 // Calls observe_response() on each token
                 process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
@@ -827,7 +936,14 @@ async fn completions_single(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects_tracking_first_token(
+            stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            finish_reason_rx,
+            first_token_seen,
+        );
 
         let mut sse_stream = Sse::new(stream);
 
@@ -838,8 +954,11 @@ async fn completions_single(
         Ok(sse_stream.into_response())
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
+        let timeout_message = Arc::new(Mutex::new(None));
+        let timeout_tap = timeout_message.clone();
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream.inspect(move |response| {
+            note_stream_timeout(response, &timeout_tap);
             // Calls observe_response() on each token - drops http_queue_guard on first token
             process_response_and_observe_metrics(
                 response,
@@ -851,14 +970,19 @@ async fn completions_single(
         let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
             .map_err(|e| {
-                tracing::error!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id,
-                    e
-                );
-                let err_response = ErrorMessage::internal_server_error(&format!(
-                    "Failed to fold completions stream for {request_id}"
-                ));
+                let err_response = if let Some(message) = timeout_message.lock().take() {
+                    tracing::warn!(request_id, "non-streaming request timed out");
+                    ErrorMessage::gateway_timeout(&message)
+                } else {
+                    tracing::error!(
+                        "Failed to fold completions stream for {}: {:?}",
+                        request_id,
+                        e
+                    );
+                    ErrorMessage::internal_server_error(&format!(
+                        "Failed to fold completions stream for {request_id}"
+                    ))
+                };
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
@@ -924,7 +1048,9 @@ async fn completions_batch(
 
     // Generate streams for each prompt in the batch
     let mut all_streams = Vec::new();
-    let mut first_ctx = None;
+    let mut first_ctx: Option<Arc<dyn dynamo_runtime::engine::AsyncEngineContext>> = None;
+    let prompts_with_content = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let all_prompts_have_content = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     for prompt_idx in 0..batch_size {
         // Extract single prompt at this index
@@ -945,6 +1071,11 @@ async fn completions_batch(
 
         // Generate stream for this prompt
         let stream = engine.generate(single_request_context).await.map_err(|e| {
+            // Earlier prompts may already be running if a later generate call
+            // fails. Cancel their shared parent before returning the batch error.
+            if let Some(parent_ctx) = first_ctx.as_ref() {
+                parent_ctx.kill();
+            }
             if super::metrics::request_was_rejected(e.as_ref()) {
                 state
                     .metrics_clone()
@@ -955,15 +1086,36 @@ async fn completions_batch(
             err_response
         })?;
 
-        // Capture context from first stream
-        if first_ctx.is_none() {
-            first_ctx = Some(stream.context());
+        // Use the first request as the parent cancellation context so a client
+        // disconnect or HTTP safety-net timeout cancels every prompt in the batch.
+        let stream_ctx = stream.context();
+        if let Some(parent_ctx) = first_ctx.as_ref() {
+            parent_ctx.link_child(stream_ctx);
+        } else {
+            first_ctx = Some(stream_ctx);
         }
 
         // Remap choice indices: choice.index += prompt_idx * n
         let prompt_idx_u32 = prompt_idx as u32;
         let n_u32 = n as u32;
+        let prompts_with_content = prompts_with_content.clone();
+        let all_prompts_have_content_flag = all_prompts_have_content.clone();
+        let mut prompt_has_content = false;
         let remapped_stream = stream.map(move |mut response| {
+            if streaming
+                && !prompt_has_content
+                && response
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| !is_empty_completion_stream_response(data))
+            {
+                record_batch_prompt_content(
+                    &mut prompt_has_content,
+                    &prompts_with_content,
+                    &all_prompts_have_content_flag,
+                    batch_size,
+                );
+            }
             if let Some(ref mut data) = response.data {
                 for choice in &mut data.inner.choices {
                     choice.index += prompt_idx_u32 * n_u32;
@@ -1004,6 +1156,10 @@ async fn completions_batch(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
+        let (finish_reason_tx, finish_reason_rx) =
+            tokio::sync::watch::channel::<Option<crate::protocols::common::FinishReason>>(None);
+        let mut completed_choices = HashSet::new();
+        let expected_choices = batch_size * n as usize;
         let stream = merged_stream
             .filter(|r| {
                 // Drop empty chunks from multi-byte token assembly
@@ -1013,7 +1169,21 @@ async fn completions_batch(
                         .is_some_and(is_empty_completion_stream_response),
                 )
             })
-            .map(move |response| {
+            .map(move |mut response| {
+                intercept_backend_error_event(&mut response, &finish_reason_tx);
+                if let Some(data) = response.data.as_ref() {
+                    for choice in &data.inner.choices {
+                        if let Some(reason) = choice.finish_reason.as_ref() {
+                            record_terminal_choice(
+                                &finish_reason_tx,
+                                &mut completed_choices,
+                                expected_choices,
+                                choice.index,
+                                map_completion_finish_reason(reason),
+                            );
+                        }
+                    }
+                }
                 // Calls observe_response() on each token
                 process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
@@ -1026,7 +1196,14 @@ async fn completions_batch(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects_tracking_first_token(
+            stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            finish_reason_rx,
+            all_prompts_have_content,
+        );
 
         let mut sse_stream = Sse::new(stream);
 
@@ -1037,8 +1214,11 @@ async fn completions_batch(
         Ok(sse_stream.into_response())
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
+        let timeout_message = Arc::new(Mutex::new(None));
+        let timeout_tap = timeout_message.clone();
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = merged_stream.inspect(move |response| {
+            note_stream_timeout(response, &timeout_tap);
             // Calls observe_response() on each token - drops http_queue_guard on first token
             process_response_and_observe_metrics(
                 response,
@@ -1050,14 +1230,22 @@ async fn completions_batch(
         let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
             .map_err(|e| {
-                tracing::error!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id,
-                    e
-                );
-                let err_response = ErrorMessage::internal_server_error(&format!(
-                    "Failed to fold completions stream for {request_id}"
-                ));
+                // Folding stops at the first failed substream; cancel the
+                // linked siblings instead of leaving them generating.
+                ctx.kill();
+                let err_response = if let Some(message) = timeout_message.lock().take() {
+                    tracing::warn!(request_id, "non-streaming request timed out");
+                    ErrorMessage::gateway_timeout(&message)
+                } else {
+                    tracing::error!(
+                        "Failed to fold completions stream for {}: {:?}",
+                        request_id,
+                        e
+                    );
+                    ErrorMessage::internal_server_error(&format!(
+                        "Failed to fold completions stream for {request_id}"
+                    ))
+                };
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
@@ -1453,8 +1641,15 @@ fn escape_json_string_control_chars(body: &[u8]) -> Option<Vec<u8>> {
     changed.then_some(out)
 }
 
-/// Checks if an Annotated event represents a backend error and extracts error information.
-/// Returns Some((message, status_code)) if it's an error, None otherwise.
+/// Whether an event carries the public or private backend-error marker.
+fn is_backend_error_event<T>(event: &Annotated<T>) -> bool {
+    matches!(
+        event.event.as_deref(),
+        Some("error") | Some(crate::preprocessor::ANNOTATION_BACKEND_ERROR)
+    )
+}
+
+/// Extract a backend error's message and HTTP status when present.
 fn extract_backend_error_if_present<T: serde::Serialize>(
     event: &Annotated<T>,
 ) -> Option<(String, StatusCode)> {
@@ -1464,11 +1659,16 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
         code: Option<u16>,
     }
 
-    // Check if event type is "error" (from postprocessor when FinishReason::Error is encountered)
-    if let Some(event_type) = &event.event
-        && event_type == "error"
-    {
+    // Streaming paths normalize the private preprocessor marker to "error",
+    // while non-streaming paths inspect it before that conversion.
+    if is_backend_error_event(event) {
         use dynamo_runtime::error::{BackendError, ErrorType};
+
+        if let Some(ref dynamo_error) = event.error
+            && let Some((_, _, message)) = super::disconnect::timeout_classification(dynamo_error)
+        {
+            return Some((message, StatusCode::GATEWAY_TIMEOUT));
+        }
 
         // Classify only this event's error, not its causes. An inner invalid
         // argument must not override an outer unavailable or internal error.
@@ -1575,9 +1775,23 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
     None
 }
 
+/// Save the first typed request-plane timeout before aggregation stringifies it.
+fn note_stream_timeout<T>(response: &Annotated<T>, slot: &Mutex<Option<String>>) {
+    let Some(error) = response.error.as_ref() else {
+        return;
+    };
+    let Some((_, _, message)) = super::disconnect::timeout_classification(error) else {
+        return;
+    };
+    let mut value = slot.lock();
+    if value.is_none() {
+        *value = Some(message);
+    }
+}
+
 /// Returns true for events that only carry an annotation tag (e.g. the
 /// `request_id` frame prepended to every stream): no data, no error, and
-/// an `event` field that is *not* the `"error"` marker. Annotations may
+/// an `event` field that is not a backend-error marker. Annotations may
 /// still carry a serialized value in `comment` (that is how
 /// `Annotated::from_annotation` builds them), so the comment field is
 /// not part of the check. These frames are stepped over by
@@ -1585,9 +1799,7 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
 /// slot is still caught instead of slipping through to the fold/parse
 /// path.
 fn is_annotation_frame<T>(e: &Annotated<T>) -> bool {
-    e.data.is_none()
-        && e.error.is_none()
-        && matches!(e.event.as_deref(), Some(tag) if tag != "error")
+    e.data.is_none() && e.error.is_none() && e.event.is_some() && !is_backend_error_event(e)
 }
 
 /// Cap on how many leading annotation frames `check_for_backend_error`
@@ -1620,6 +1832,9 @@ pub(super) async fn check_for_backend_error(
             continue;
         }
         if let Some((error_msg, status_code)) = extract_backend_error_if_present(&event) {
+            if status_code == StatusCode::GATEWAY_TIMEOUT {
+                return Err(ErrorMessage::gateway_timeout(&error_msg));
+            }
             return Err(match SanitizedError::for_backend_status(status_code) {
                 Some(variant) => ErrorMessage::sanitized_with_details(variant, error_msg),
                 // 4xx (non-499): protocol contract — forward backend message as-is.
@@ -1669,9 +1884,111 @@ fn push_dispatch_event(
     }
 }
 
+/// Convert the private backend-error marker into the standard error event
+/// after recording the typed finish reason for stream classification.
+pub(super) fn intercept_backend_error_event<T>(
+    annotated: &mut Annotated<T>,
+    finish_reason_tx: &tokio::sync::watch::Sender<Option<crate::protocols::common::FinishReason>>,
+) {
+    if annotated.event.as_deref() != Some(crate::preprocessor::ANNOTATION_BACKEND_ERROR) {
+        return;
+    }
+    let message = annotated
+        .error
+        .as_ref()
+        .map(|error| error.message().to_string())
+        .or_else(|| {
+            annotated
+                .comment
+                .as_ref()
+                .and_then(|comments| comments.first().cloned())
+        })
+        .unwrap_or_else(|| "backend error".to_string());
+    let _ = finish_reason_tx.send(Some(crate::protocols::common::FinishReason::Error(message)));
+    annotated.event = Some("error".to_string());
+}
+
+/// Record one choice's terminal reason without classifying a multi-choice
+/// stream as successful until every expected choice has terminated.
+fn record_terminal_choice(
+    finish_reason_tx: &tokio::sync::watch::Sender<Option<crate::protocols::common::FinishReason>>,
+    completed_choices: &mut HashSet<u32>,
+    expected_choices: usize,
+    choice_index: u32,
+    reason: crate::protocols::common::FinishReason,
+) {
+    use crate::protocols::common::FinishReason;
+
+    if matches!(&reason, FinishReason::Error(_)) {
+        let _ = finish_reason_tx.send(Some(reason));
+        return;
+    }
+    if matches!(&*finish_reason_tx.borrow(), Some(FinishReason::Error(_))) {
+        return;
+    }
+    if choice_index as usize >= expected_choices {
+        tracing::warn!(
+            choice_index,
+            expected_choices,
+            "ignoring out-of-range choice index"
+        );
+        return;
+    }
+
+    let all_choices_complete =
+        completed_choices.insert(choice_index) && completed_choices.len() == expected_choices;
+    if all_choices_complete {
+        let _ = finish_reason_tx.send(Some(reason));
+    }
+}
+
+/// Keep the TTFT budget active for a batch until every independently-generated
+/// prompt has produced a substantive completion frame.
+fn record_batch_prompt_content(
+    prompt_has_content: &mut bool,
+    prompts_with_content: &std::sync::atomic::AtomicUsize,
+    all_prompts_have_content: &std::sync::atomic::AtomicBool,
+    batch_size: usize,
+) {
+    if *prompt_has_content {
+        return;
+    }
+    *prompt_has_content = true;
+
+    let prompts_seen = prompts_with_content.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    debug_assert!(prompts_seen <= batch_size);
+    if prompts_seen == batch_size {
+        all_prompts_have_content.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(super) fn map_chat_finish_reason(
+    reason: &dynamo_protocols::types::FinishReason,
+) -> crate::protocols::common::FinishReason {
+    use crate::protocols::common::FinishReason as Common;
+    use dynamo_protocols::types::FinishReason as Wire;
+    match reason {
+        Wire::Stop | Wire::ToolCalls | Wire::FunctionCall => Common::Stop,
+        Wire::Length => Common::Length,
+        Wire::ContentFilter => Common::ContentFilter,
+    }
+}
+
+fn map_completion_finish_reason(
+    reason: &dynamo_protocols::types::CompletionFinishReason,
+) -> crate::protocols::common::FinishReason {
+    use crate::protocols::common::FinishReason as Common;
+    use dynamo_protocols::types::CompletionFinishReason as Wire;
+    match reason {
+        Wire::Stop => Common::Stop,
+        Wire::Length => Common::Length,
+        Wire::ContentFilter => Common::ContentFilter,
+    }
+}
+
 /// Empty stream chunk produced by multi-byte token assembly (e.g. emoji).
 /// `role` is excluded; backends set it on every delta.
-fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool {
+pub(crate) fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool {
     if resp.nvext.is_some() {
         return false;
     }
@@ -1801,6 +2118,37 @@ fn accumulate_reasoning_dispatch(
     }
 }
 
+/// Returns whether the request contains an image, video, or audio content part.
+///
+/// Media requests may fail during backend decoding, after `generate` returns a
+/// stream. The streaming handler uses this signal to inspect the first backend
+/// event before committing HTTP 200, while text-only requests keep their
+/// immediate streaming response.
+fn request_contains_media(request: &NvCreateChatCompletionRequest) -> bool {
+    use dynamo_protocols::types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent,
+        ChatCompletionRequestUserMessageContentPart,
+    };
+
+    request.inner.messages.iter().any(|message| {
+        let ChatCompletionRequestMessage::User(message) = message else {
+            return false;
+        };
+        let content = &message.content;
+        let ChatCompletionRequestUserMessageContent::Array(parts) = content else {
+            return false;
+        };
+        parts.iter().any(|part| {
+            matches!(
+                part,
+                ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::AudioUrl(_)
+            )
+        })
+    })
+}
+
 /// OpenAI Chat Completions Request Handler
 ///
 /// This method will handle the incoming request for the /v1/chat/completions endpoint. The endpoint is a "source"
@@ -1926,6 +2274,10 @@ async fn chat_completions(
 
     let annotations = request.annotations();
 
+    // Capture this before `request` moves into `generate`.
+    let request_has_media = request_contains_media(&request);
+    let expected_choices = request.inner.n.unwrap_or(1) as usize;
+
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -1962,10 +2314,28 @@ async fn chat_completions(
     // note - we might do this as part of the post processing set to make it more generic
 
     if streaming {
-        // For streaming responses, we return HTTP 200 immediately without checking for errors.
-        // Once HTTP 200 OK is sent, we cannot change the status code, so any backend errors
-        // must be delivered as SSE events with `event: error` in the stream (handled by
-        // EventConverter and monitor_for_disconnects). This is standard SSE behavior.
+        // Media validation can fail in the worker after `generate` returns. Inspect
+        // the first substantive event before committing HTTP 200 so those failures
+        // retain their 4xx status. Text-only streams keep immediate-200 behavior.
+        let stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+        > = if request_has_media {
+            match check_for_backend_error(stream).await {
+                Ok(stream) => Box::pin(stream),
+                Err(error_response) => {
+                    tracing::error!(
+                        request_id,
+                        "Backend error detected before streaming start: {:?}",
+                        error_response
+                    );
+                    inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                    return Err(error_response);
+                }
+            }
+        } else {
+            Box::pin(stream)
+        };
+
         stream_handle.arm(); // allows the system to detect client disconnects and cancel the LLM generation
 
         let mut http_queue_guard = Some(http_queue_guard);
@@ -1973,6 +2343,10 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
+        let (finish_reason_tx, finish_reason_rx) =
+            tokio::sync::watch::channel::<Option<crate::protocols::common::FinishReason>>(None);
+        let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_token_flag = first_token_seen.clone();
 
         // Optionally prepend extra SSE events before each regular chunk:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
@@ -1980,13 +2354,31 @@ async fn chat_completions(
         let stream = async_stream::stream! {
             let mut stream = Box::pin(stream);
             let mut events: Vec<Result<Event, axum::Error>> = Vec::with_capacity(4);
+            let mut completed_choices = HashSet::new();
 
-            while let Some(response) = stream.next().await {
+            while let Some(mut response) = stream.next().await {
                 events.clear();
 
                 // Drop empty chunks from multi-byte token assembly.
                 if response.data.as_ref().is_some_and(is_empty_stream_response) {
                     continue;
+                }
+                intercept_backend_error_event(&mut response, &finish_reason_tx);
+                if response.data.is_some() {
+                    first_token_flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(data) = response.data.as_ref() {
+                    for choice in &data.inner.choices {
+                        if let Some(reason) = choice.finish_reason.as_ref() {
+                            record_terminal_choice(
+                                &finish_reason_tx,
+                                &mut completed_choices,
+                                expected_choices,
+                                choice.index,
+                                map_chat_finish_reason(reason),
+                            );
+                        }
+                    }
                 }
                 if tool_dispatch_enabled {
                     streaming_tool_dispatch_events(
@@ -2024,7 +2416,14 @@ async fn chat_completions(
                 }
             }
         };
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects_tracking_first_token(
+            stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            finish_reason_rx,
+            first_token_seen,
+        );
 
         let mut sse_stream = Sse::new(stream);
 
@@ -2044,8 +2443,11 @@ async fn chat_completions(
                     error_response
                 })?;
 
+        let timeout_message = Arc::new(Mutex::new(None));
+        let timeout_tap = timeout_message.clone();
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream_with_check.inspect(move |response| {
+            note_stream_timeout(response, &timeout_tap);
             // Calls observe_response() on each token - drops http_queue_guard on first token
             process_chat_response_and_observe_metrics(
                 response,
@@ -2058,14 +2460,19 @@ async fn chat_completions(
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
-                    tracing::error!(
-                        request_id,
-                        "Failed to parse chat completion response: {:?}",
-                        e
-                    );
-                    let err_response = ErrorMessage::internal_server_error(
-                        "Failed to parse chat completion response",
-                    );
+                    let err_response = if let Some(message) = timeout_message.lock().take() {
+                        tracing::warn!(request_id, "non-streaming request timed out");
+                        ErrorMessage::gateway_timeout(&message)
+                    } else {
+                        tracing::error!(
+                            request_id,
+                            "Failed to parse chat completion response: {:?}",
+                            e
+                        );
+                        ErrorMessage::internal_server_error(
+                            "Failed to parse chat completion response",
+                        )
+                    };
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
@@ -2418,6 +2825,7 @@ async fn responses(
             request.inner.tool_choice.as_ref(),
         ),
     );
+    let expected_choices = request.inner.n.unwrap_or(1) as usize;
 
     let mut response_collector = state
         .metrics_clone()
@@ -2457,10 +2865,15 @@ async fn responses(
         };
 
         let mut http_queue_guard = Some(http_queue_guard);
+        let (finish_reason_tx, finish_reason_rx) =
+            tokio::sync::watch::channel::<Option<crate::protocols::common::FinishReason>>(None);
+        let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_token_flag = first_token_seen.clone();
 
         let mut engine_stream = Box::pin(engine_stream);
         let full_stream = async_stream::stream! {
             let mut events = Vec::with_capacity(4);
+            let mut completed_choices = HashSet::new();
             converter.append_start_events(&mut events);
             for event in events.drain(..) {
                 yield event.map_err(axum::Error::new);
@@ -2469,7 +2882,8 @@ async fn responses(
             // Track whether the backend sent an error event during the stream.
             let mut saw_error = false;
 
-            while let Some(annotated_chunk) = engine_stream.next().await {
+            while let Some(mut annotated_chunk) = engine_stream.next().await {
+                intercept_backend_error_event(&mut annotated_chunk, &finish_reason_tx);
                 process_chat_response_and_observe_metrics(
                     &annotated_chunk,
                     &mut response_collector,
@@ -2484,6 +2898,20 @@ async fn responses(
                 let Some(stream_resp) = annotated_chunk.data else {
                     continue;
                 };
+                if !is_empty_stream_response(&stream_resp) {
+                    first_token_flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                for choice in &stream_resp.inner.choices {
+                    if let Some(reason) = choice.finish_reason.as_ref() {
+                        record_terminal_choice(
+                            &finish_reason_tx,
+                            &mut completed_choices,
+                            expected_choices,
+                            choice.index,
+                            map_chat_finish_reason(reason),
+                        );
+                    }
+                }
 
                 converter.append_chunk_events(&stream_resp, &mut events);
                 for event in events.drain(..) {
@@ -2503,7 +2931,14 @@ async fn responses(
 
         // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
         // and defers inflight_guard.mark_ok() until the stream completes.
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects_tracking_first_token(
+            full_stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            finish_reason_rx,
+            first_token_seen,
+        );
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {
@@ -2524,8 +2959,11 @@ async fn responses(
                     error_response
                 })?;
 
+        let timeout_message = Arc::new(Mutex::new(None));
+        let timeout_tap = timeout_message.clone();
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream_with_check.inspect(move |response| {
+            note_stream_timeout(response, &timeout_tap);
             process_chat_response_and_observe_metrics(
                 response,
                 &mut response_collector,
@@ -2537,9 +2975,13 @@ async fn responses(
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
-                    tracing::error!(request_id, "Failed to fold responses stream: {:?}", e);
-                    let err_response =
-                        ErrorMessage::internal_server_error("Failed to fold responses stream");
+                    let err_response = if let Some(message) = timeout_message.lock().take() {
+                        tracing::warn!(request_id, "non-streaming request timed out");
+                        ErrorMessage::gateway_timeout(&message)
+                    } else {
+                        tracing::error!(request_id, "Failed to fold responses stream: {:?}", e);
+                        ErrorMessage::internal_server_error("Failed to fold responses stream")
+                    };
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
@@ -3527,6 +3969,113 @@ mod tests {
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
 
     #[test]
+    fn terminal_choice_tracking_waits_for_every_choice() {
+        use crate::protocols::common::FinishReason as CommonFinishReason;
+
+        let (finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(None);
+        let mut completed_choices = HashSet::new();
+
+        record_terminal_choice(
+            &finish_reason_tx,
+            &mut completed_choices,
+            2,
+            0,
+            CommonFinishReason::Stop,
+        );
+        assert!(finish_reason_rx.borrow().is_none());
+
+        // A repeated terminal frame for one choice must not stand in for the
+        // other choice.
+        record_terminal_choice(
+            &finish_reason_tx,
+            &mut completed_choices,
+            2,
+            0,
+            CommonFinishReason::Length,
+        );
+        assert!(finish_reason_rx.borrow().is_none());
+
+        record_terminal_choice(
+            &finish_reason_tx,
+            &mut completed_choices,
+            2,
+            1,
+            CommonFinishReason::Length,
+        );
+        assert!(matches!(
+            &*finish_reason_rx.borrow(),
+            Some(CommonFinishReason::Length)
+        ));
+    }
+
+    #[test]
+    fn terminal_choice_tracking_does_not_overwrite_backend_error() {
+        use crate::protocols::common::FinishReason as CommonFinishReason;
+
+        let (finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(None);
+        let mut completed_choices = HashSet::new();
+
+        record_terminal_choice(
+            &finish_reason_tx,
+            &mut completed_choices,
+            1,
+            0,
+            CommonFinishReason::Error("worker failed".to_string()),
+        );
+        record_terminal_choice(
+            &finish_reason_tx,
+            &mut completed_choices,
+            1,
+            0,
+            CommonFinishReason::Stop,
+        );
+
+        assert!(matches!(
+            &*finish_reason_rx.borrow(),
+            Some(CommonFinishReason::Error(message)) if message == "worker failed"
+        ));
+    }
+
+    #[test]
+    fn batch_ttft_tracking_waits_for_every_prompt() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let prompts_with_content = AtomicUsize::new(0);
+        let all_prompts_have_content = AtomicBool::new(false);
+        let mut first_prompt = false;
+        let mut second_prompt = false;
+        let mut third_prompt = false;
+
+        record_batch_prompt_content(
+            &mut first_prompt,
+            &prompts_with_content,
+            &all_prompts_have_content,
+            3,
+        );
+        record_batch_prompt_content(
+            &mut first_prompt,
+            &prompts_with_content,
+            &all_prompts_have_content,
+            3,
+        );
+        record_batch_prompt_content(
+            &mut third_prompt,
+            &prompts_with_content,
+            &all_prompts_have_content,
+            3,
+        );
+        assert!(!all_prompts_have_content.load(Ordering::Acquire));
+
+        record_batch_prompt_content(
+            &mut second_prompt,
+            &prompts_with_content,
+            &all_prompts_have_content,
+            3,
+        );
+        assert!(all_prompts_have_content.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn test_is_json_content_type() {
         assert!(is_json_content_type("application/json"));
         assert!(is_json_content_type("application/json; charset=utf-8"));
@@ -3751,6 +4300,40 @@ mod tests {
     }
 
     #[test]
+    fn test_error_message_serializes_as_openai_envelope() {
+        let error = ErrorMessage {
+            message: "invalid request".to_string(),
+            error_type: "invalid_request_error".to_string(),
+            code: StatusCode::BAD_REQUEST.as_u16(),
+            details: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(error).expect("serialize OpenAI error response"),
+            serde_json::json!({
+                "error": {
+                    "message": "invalid request",
+                    "type": "invalid_request_error",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_nested_http_error_response_from_anyhow() {
+        let err = anyhow::Error::new(HttpError {
+            code: 422,
+            message: "nested validation error".to_string(),
+        })
+        .context("outer routing error");
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.1.message, "nested validation error");
+        assert_eq!(response.1.error_type, "invalid_request_error");
+    }
+
+    #[test]
     fn test_check_ready_rejects_draining_service() {
         let service = service_v2::HttpService::builder().build().unwrap();
         let state = service.state_clone();
@@ -3826,7 +4409,7 @@ mod tests {
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
         assert_eq!(response.0.as_u16(), 529);
         assert_eq!(response.1.code, 529);
-        assert_eq!(response.1.error_type, "Overloaded");
+        assert_eq!(response.1.error_type, "api_error");
         assert_eq!(response.1.message, "Service temporarily overloaded");
         assert!(
             !response.1.message.contains("All workers are busy"),
@@ -3865,7 +4448,7 @@ mod tests {
 
         assert_eq!(response.0.as_u16(), 529);
         assert_eq!(response.1.code, 529);
-        assert_eq!(response.1.error_type, "Overloaded");
+        assert_eq!(response.1.error_type, "api_error");
         assert_eq!(
             response.1.details.as_deref(),
             Some(&serde_json::json!({
@@ -3875,6 +4458,17 @@ mod tests {
                 "limit": 1024,
             }))
         );
+        let body = serde_json::to_value(&response.1.0).expect("serialize rejection");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({
+                "policy_class": "latency",
+                "limit_kind": "cached_tokens",
+                "current": 2048,
+                "limit": 1024,
+            })
+        );
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     #[test]
@@ -3951,7 +4545,7 @@ mod tests {
             "Cancelled errors should return HTTP 499"
         );
         assert_eq!(response.1.code, 499);
-        assert_eq!(response.1.error_type, "Client Closed Request");
+        assert_eq!(response.1.error_type, "api_error");
         // The client gets a static message; the backend detail (context id,
         // cancellation internals) must not leak into the 499 body.
         assert_eq!(response.1.message, "Request cancelled");
@@ -4177,6 +4771,39 @@ mod tests {
         };
         let result = validate_chat_completion_required_fields(&request);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_request_contains_media_is_gated_by_content_parts() {
+        let text_only: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert!(!request_contains_media(&text_only));
+
+        for media_part in [
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"}
+            }),
+            serde_json::json!({
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,AAAA"}
+            }),
+            serde_json::json!({
+                "type": "audio_url",
+                "audio_url": {"url": "data:audio/wav;base64,AAAA"}
+            }),
+        ] {
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": [media_part]}]
+                }))
+                .unwrap();
+            assert!(request_contains_media(&request));
+        }
     }
 
     #[test]
@@ -4692,6 +5319,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_check_for_backend_error_with_preprocessor_marker_preserves_400() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use dynamo_runtime::error::DynamoError;
+        use futures::stream;
+
+        let marker = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some(crate::preprocessor::ANNOTATION_BACKEND_ERROR.to_string()),
+            comment: None,
+            error: Some(DynamoError::msg(
+                r#"{"message":"invalid image data","code":400}"#,
+            )),
+        };
+
+        let response = check_for_backend_error(stream::iter([marker]))
+            .await
+            .err()
+            .expect("preprocessor backend-error marker must fail the request");
+
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(response.1.code, 400);
+        assert_eq!(response.1.error_type, "invalid_request_error");
+        assert_eq!(response.1.message, "invalid image data");
+    }
+
+    #[tokio::test]
     async fn test_check_for_backend_error_with_typed_invalid_argument() {
         use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
         use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
@@ -4722,7 +5376,7 @@ mod tests {
             };
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
             assert_eq!(error_response.1.code, StatusCode::BAD_REQUEST.as_u16());
-            assert_eq!(error_response.1.error_type, "Bad Request");
+            assert_eq!(error_response.1.error_type, "invalid_request_error");
             assert_eq!(error_response.1.message, "unsupported JSON schema keyword");
         }
     }
@@ -5021,6 +5675,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_check_for_backend_error_with_timeout_returns_504() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
+        use futures::stream;
+
+        for timeout_type in [
+            DynamoErrorType::FirstTokenTimeout,
+            DynamoErrorType::IntraTokenTimeout,
+            DynamoErrorType::ResponseTimeout,
+        ] {
+            let event = Annotated::<NvCreateChatCompletionStreamResponse> {
+                data: None,
+                id: None,
+                event: Some("error".to_string()),
+                comment: None,
+                error: Some(
+                    DynamoError::builder()
+                        .error_type(timeout_type.clone())
+                        .message("request-plane timeout")
+                        .build(),
+                ),
+            };
+            let response = check_for_backend_error(stream::iter([event]))
+                .await
+                .err()
+                .expect("typed timeout must fail the request");
+
+            assert_eq!(response.0, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(response.1.code, 504);
+            assert_eq!(response.1.error_type, "api_error");
+            assert_eq!(response.1.message, "request-plane timeout");
+        }
+    }
+
+    #[test]
+    fn test_note_stream_timeout_captures_only_the_first_timeout() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
+
+        let event = |error: Option<DynamoError>| Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: error.as_ref().map(|_| "error".to_string()),
+            comment: None,
+            error,
+        };
+        let slot = Mutex::new(None);
+
+        note_stream_timeout(
+            &event(Some(
+                DynamoError::builder()
+                    .error_type(DynamoErrorType::IntraTokenTimeout)
+                    .message("inter-token timeout")
+                    .build(),
+            )),
+            &slot,
+        );
+        note_stream_timeout(
+            &event(Some(
+                DynamoError::builder()
+                    .error_type(DynamoErrorType::FirstTokenTimeout)
+                    .message("later TTFT timeout")
+                    .build(),
+            )),
+            &slot,
+        );
+        assert_eq!(slot.lock().as_deref(), Some("inter-token timeout"));
+
+        let non_timeout_slot = Mutex::new(None);
+        note_stream_timeout(
+            &event(Some(
+                DynamoError::builder()
+                    .error_type(DynamoErrorType::Unknown)
+                    .message("not a timeout")
+                    .build(),
+            )),
+            &non_timeout_slot,
+        );
+        note_stream_timeout(&event(None), &non_timeout_slot);
+        assert_eq!(non_timeout_slot.lock().as_deref(), None);
+    }
+
     #[test]
     fn test_classify_error_for_metrics_validation() {
         // 400 with "Validation:" prefix to validation
@@ -5058,6 +5795,10 @@ mod tests {
         assert_eq!(
             classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR, "Panic"),
             ErrorType::Internal
+        );
+        assert_eq!(
+            classify_error_for_metrics(StatusCode::GATEWAY_TIMEOUT, "request-plane timeout"),
+            ErrorType::ResponseTimeout
         );
     }
 

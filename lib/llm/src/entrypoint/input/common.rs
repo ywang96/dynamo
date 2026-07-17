@@ -287,7 +287,8 @@ pub async fn build_preprocessed_routing(
         embedding_cache_indexer,
         cache_key_extractor,
     )
-    .await?;
+    .await?
+    .with_first_token_detector(crate::protocols::common::llm_backend::is_first_token);
 
     // Eagerly register router request metrics so they appear as zeros even in
     // non-KV modes (Direct, Random, RoundRobin) where KvPushRouter is never created.

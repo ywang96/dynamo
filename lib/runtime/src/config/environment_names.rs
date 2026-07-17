@@ -363,6 +363,23 @@ pub mod llm {
     /// Set to `0` or leave unset to disable the timeout (default: disabled).
     pub const DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS: &str = "DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS";
 
+    /// Backend time-to-first-token (TTFT) timeout in seconds.
+    ///
+    /// When set to a positive integer, applies only until the first generated
+    /// token arrives. Afterwards, [`DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS`]
+    /// governs inter-token inactivity. When unset or zero, the stream timeout
+    /// also governs the pre-first-token window.
+    pub const DYN_HTTP_BACKEND_TTFT_STREAM_TIMEOUT_SECS: &str =
+        "DYN_HTTP_BACKEND_TTFT_STREAM_TIMEOUT_SECS";
+
+    /// HTTP-layer SSE inactivity timeout in seconds.
+    ///
+    /// This overrides the derived `2 *` safety-net timeout for both TTFT and
+    /// inter-token phases. It must be strictly greater than each configured
+    /// request-plane timeout so worker quarantine fires before the HTTP safety
+    /// net. Set to `0` or leave unset to use the derived defaults.
+    pub const DYN_HTTP_SSE_INACTIVITY_TIMEOUT_SECS: &str = "DYN_HTTP_SSE_INACTIVITY_TIMEOUT_SECS";
+
     /// Enable the LoRA allocation controller (set to "true" to enable)
     pub const DYN_LORA_ALLOCATION_ENABLED: &str = "DYN_LORA_ALLOCATION_ENABLED";
 
@@ -789,6 +806,8 @@ mod tests {
             llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
             llm::DYN_HTTP_OVERLOAD_STATUS_CODE,
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
+            llm::DYN_HTTP_BACKEND_TTFT_STREAM_TIMEOUT_SECS,
+            llm::DYN_HTTP_SSE_INACTIVITY_TIMEOUT_SECS,
             llm::DYN_LORA_ENABLED,
             llm::DYN_LORA_PATH,
             llm::DYN_ENABLE_ANTHROPIC_API,

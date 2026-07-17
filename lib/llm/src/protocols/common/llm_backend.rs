@@ -9,6 +9,7 @@ use crate::protocols::TokenIdType;
 use dynamo_protocols::types::CompletionUsage;
 use dynamo_protocols::types::StopReason;
 use dynamo_runtime::error::DynamoError;
+use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_runtime::protocols::maybe_error::MaybeError;
 
 pub type TokenType = Option<String>;
@@ -390,6 +391,16 @@ impl MaybeError for LLMEngineOutput {
     }
 }
 
+/// Return true only when an LLM response item carries generated tokens.
+///
+/// The request-plane timeout uses this to keep the TTFT window open across
+/// disaggregation handshakes, empty chunks, and annotation-only events.
+pub fn is_first_token(item: &Annotated<LLMEngineOutput>) -> bool {
+    item.data
+        .as_ref()
+        .is_some_and(|output| !output.token_ids.is_empty())
+}
+
 /// Raw output from embedding engines containing embedding vectors
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct EmbeddingsEngineOutput {
@@ -416,6 +427,24 @@ mod tests {
         assert!(format!("{}", output.err().unwrap()).contains("Test error"));
         assert!(!output.is_ok());
         assert!(output.is_err());
+    }
+
+    #[test]
+    fn test_is_first_token() {
+        let mut with_tokens = LLMEngineOutput::default();
+        with_tokens.token_ids = vec![1, 2];
+        assert!(is_first_token(&Annotated::from_data(with_tokens)));
+
+        assert!(!is_first_token(&Annotated::from_data(
+            LLMEngineOutput::default()
+        )));
+        assert!(!is_first_token(&Annotated::from_data(
+            LLMEngineOutput::stop()
+        )));
+
+        let annotation: Annotated<LLMEngineOutput> =
+            Annotated::from_annotation("request_id", &"abc").unwrap();
+        assert!(!is_first_token(&annotation));
     }
 
     /// `encode_terminal` produces an Encode-mode terminal chunk with the

@@ -165,6 +165,9 @@ async def _register_model_with_runtime_config(
             custom_template_path=dynamo_args.custom_jinja_template,
             media_decoder=media_decoder,
             media_fetcher=media_fetcher,
+            # SGLang consumes media from `multi_modal_data`; retaining inline
+            # data URLs in forwarded messages would duplicate the payload.
+            forward_inline_media_in_messages=False,
             worker_type=worker_type,
             needs=needs,
             ignore_weights=use_modelexpress_remote_instance(server_args),

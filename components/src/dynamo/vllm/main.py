@@ -753,6 +753,9 @@ async def register_vllm_model(
         custom_template_path=config.custom_jinja_template,
         media_decoder=media_decoder,
         media_fetcher=media_fetcher,
+        # vLLM consumes media from `multi_modal_data`; retaining inline data
+        # URLs in the forwarded messages would serialize the same bytes twice.
+        forward_inline_media_in_messages=False,
         worker_type=worker_type,
         needs=needs,
         ignore_weights=should_register_model_ignore_weights(config),

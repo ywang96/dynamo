@@ -113,6 +113,9 @@ fn encode_floats_to_base64(floats: &[f32]) -> String {
 
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
+/// Marker emitted when a worker reports `FinishReason::Error` before the
+/// response-type postprocessor can erase or stringify the typed signal.
+pub const ANNOTATION_BACKEND_ERROR: &str = "backend_error";
 
 /// Drain a standalone router's forwarded `routing_data` onto this request's tracker so the
 /// frontend's timing/worker/token surfaces populate, then drop the field to keep it off the
@@ -279,6 +282,10 @@ pub struct OpenAIPreprocessor {
     kv_cache_block_size: usize,
     tool_call_parser: Option<String>,
     media_loader: Option<MediaLoader>,
+    /// Whether the backend still reads inline media from the original
+    /// messages. Backends that consume `multi_modal_data` set this false so
+    /// forwarded requests do not carry the same bytes twice.
+    forward_inline_media_in_messages: bool,
     /// Max context length (in tokens) this model can handle, from ModelDeploymentCard
     context_length: u32,
     /// Per-image token-count engine. `None` when the feature is disabled, the
@@ -651,6 +658,7 @@ impl OpenAIPreprocessor {
         };
 
         let context_length = mdc.effective_context_length();
+        let forward_inline_media_in_messages = mdc.forwards_inline_media_in_messages();
 
         let media_loader = match mdc.media_decoder {
             Some(media_decoder) => Some(MediaLoader::new(media_decoder, mdc.media_fetcher)?),
@@ -795,6 +803,7 @@ impl OpenAIPreprocessor {
             kv_cache_block_size,
             tool_call_parser,
             media_loader,
+            forward_inline_media_in_messages,
             context_length,
             #[cfg(feature = "mm-routing")]
             image_token_counter,
@@ -1218,6 +1227,16 @@ impl OpenAIPreprocessor {
         }
     }
 
+    /// Decide whether the preserved message copy of inline media is redundant.
+    /// Frontend decoding always makes it redundant; URL-passthrough backends
+    /// opt in by declaring that they consume `multi_modal_data` instead.
+    fn should_strip_inline_media(
+        media_loader_active: bool,
+        forward_inline_media_in_messages: bool,
+    ) -> bool {
+        media_loader_active || !forward_inline_media_in_messages
+    }
+
     /// Replace inline `data:` URLs with empty strings in message content parts.
     /// Preserves HTTP(S) URLs, text content, and overall message structure.
     fn strip_inline_data_urls(messages: &mut serde_json::Value) {
@@ -1477,10 +1496,12 @@ impl OpenAIPreprocessor {
                 "messages": messages_json
             });
 
-            // Strip redundant inline data: URLs only when frontend decoding is active
-            // (media_loader decoded the images into RDMA descriptors). TRT-LLM and
-            // other backends that pass URLs through still need the original data: URIs.
-            if self.media_loader.is_some() {
+            // Strip redundant inline data URLs when the frontend decoded them
+            // or the worker consumes the separate `multi_modal_data` channel.
+            if Self::should_strip_inline_media(
+                self.media_loader.is_some(),
+                self.forward_inline_media_in_messages,
+            ) {
                 Self::strip_inline_data_urls(&mut extra_args["messages"]);
             }
 
@@ -2360,6 +2381,32 @@ impl OpenAIPreprocessor {
                         .as_ref()
                         .map(|d| d.finish_reason.is_some())
                         .unwrap_or(false);
+
+                    let backend_error_message = response.data.as_ref().and_then(|data| match &data
+                        .finish_reason
+                    {
+                        Some(crate::protocols::common::FinishReason::Error(message)) => {
+                            Some(message.clone())
+                        }
+                        _ => None,
+                    });
+                    if let Some(message) = backend_error_message {
+                        tracing::warn!(
+                            request_id = inner.context.id(),
+                            "Worker emitted terminal backend error finish_reason"
+                        );
+                        inner.cancelled = true;
+                        inner.context.stop_generating();
+                        inner.finished = true;
+                        let annotated = Annotated::<Resp> {
+                            id: response.id.clone(),
+                            data: None,
+                            event: Some(ANNOTATION_BACKEND_ERROR.to_string()),
+                            comment: Some(vec![message.clone()]),
+                            error: Some(DynamoError::msg(message)),
+                        };
+                        return Some((annotated, inner));
+                    }
 
                     let (chunk_tokens, isl) = if let Some(ref backend_output) = response.data {
                         let chunk_tokens = backend_output.token_ids.len();
@@ -3716,6 +3763,22 @@ mod strip_tests {
         let mut messages = serde_json::json!([]);
         OpenAIPreprocessor::strip_inline_data_urls(&mut messages);
         assert_eq!(messages, serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_strip_inline_media_for_multi_modal_data_backend() {
+        assert!(OpenAIPreprocessor::should_strip_inline_media(false, false));
+    }
+
+    #[test]
+    fn test_preserve_inline_media_for_messages_backend() {
+        assert!(!OpenAIPreprocessor::should_strip_inline_media(false, true));
+    }
+
+    #[test]
+    fn test_frontend_media_decoding_always_strips_inline_copy() {
+        assert!(OpenAIPreprocessor::should_strip_inline_media(true, true));
+        assert!(OpenAIPreprocessor::should_strip_inline_media(true, false));
     }
 }
 

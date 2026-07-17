@@ -158,7 +158,8 @@ impl PrefillRouter {
                 RouterMode::KV,
                 None, // worker_monitor
             )
-            .await?;
+            .await?
+            .with_first_token_detector(crate::protocols::common::llm_backend::is_first_token);
 
             // Wrap it in KvPushRouter
             InnerPrefillRouter::KvRouter(Arc::new(KvPushRouter::new_with_coordinator(
@@ -181,7 +182,8 @@ impl PrefillRouter {
                 self.router_mode,
                 None, // worker_monitor
             )
-            .await?;
+            .await?
+            .with_first_token_detector(crate::protocols::common::llm_backend::is_first_token);
 
             InnerPrefillRouter::SimpleRouter(Arc::new(
                 crate::session_affinity::SessionAffinityPushRouter::new_with_coordinator(

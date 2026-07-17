@@ -672,6 +672,8 @@ impl HttpService {
         let protocol = if self.enable_tls { "HTTPS" } else { "HTTP" };
         tracing::info!(protocol, address, "Starting HTTP(S) service");
 
+        super::disconnect::validate_backend_stream_timeouts()?;
+
         let router = self.router.clone();
         let observer = cancel_token.child_token();
 

@@ -899,6 +899,16 @@ pub struct ModelDeploymentCard {
     #[serde(default)]
     pub media_fetcher: Option<MediaFetcher>,
 
+    /// Whether the backend reads inline media from the original chat messages.
+    ///
+    /// `None` is the backward-compatible default and means `true`: preserve
+    /// inline `data:` URLs for backends that have not declared their behavior.
+    /// Backends such as vLLM and SGLang consume the structured
+    /// `multi_modal_data` channel instead and publish `Some(false)`, allowing
+    /// the frontend to strip the redundant copy from forwarded messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_inline_media_in_messages: Option<bool>,
+
     /// Per-worker-set router configuration override.
     /// When set, the frontend watcher uses this instead of the global frontend router config.
     /// Falls back to the frontend-level config when absent.
@@ -946,6 +956,14 @@ impl ModelDeploymentCard {
             slug: Slug::from_string(name),
             ..Default::default()
         }
+    }
+
+    /// Whether inline media must remain in the forwarded chat messages.
+    ///
+    /// Older cards do not carry the capability flag, so absence preserves the
+    /// historical behavior.
+    pub fn forwards_inline_media_in_messages(&self) -> bool {
+        self.forward_inline_media_in_messages.unwrap_or(true)
     }
 
     /// Load a model deployment card from a JSON file
@@ -1662,6 +1680,7 @@ impl ModelDeploymentCard {
             tensor_model_config: None,
             media_decoder: None,
             media_fetcher: None,
+            forward_inline_media_in_messages: None,
             router_config: None,
             extra_files: Vec::new(),
             checksum: OnceLock::new(),
@@ -2932,6 +2951,28 @@ mod ownership_tests {
                 .map(|config| config.name.as_str()),
             Some("tensor")
         );
+    }
+
+    #[test]
+    fn missing_inline_media_capability_preserves_messages() {
+        let value = serde_json::to_value(ModelDeploymentCard::with_name_only("legacy")).unwrap();
+        assert!(value.get("forward_inline_media_in_messages").is_none());
+
+        let card: ModelDeploymentCard = serde_json::from_value(value).unwrap();
+
+        assert!(card.forwards_inline_media_in_messages());
+    }
+
+    #[test]
+    fn inline_media_capability_round_trips_backend_opt_out() {
+        let mut card = ModelDeploymentCard::with_name_only("vllm");
+        card.forward_inline_media_in_messages = Some(false);
+
+        let value = serde_json::to_value(&card).unwrap();
+        assert_eq!(value["forward_inline_media_in_messages"], false);
+
+        let parsed: ModelDeploymentCard = serde_json::from_value(value).unwrap();
+        assert!(!parsed.forwards_inline_media_in_messages());
     }
 }
 

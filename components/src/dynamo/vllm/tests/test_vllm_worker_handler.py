@@ -21,6 +21,8 @@ import dynamo.vllm.handlers as mod
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
 )
+from dynamo.common.multimodal.image_loader import ImageValidationError
+from dynamo.common.multimodal.video_loader import VideoValidationError
 from dynamo.vllm.multimodal_utils.protocol import (
     PatchedTokensPrompt,
     vLLMMultimodalRequest,
@@ -801,6 +803,56 @@ class TestDecodeWorkerMultimodalBranching:
         assert chunks[0]["status"] == "error"
 
     @pytest.mark.parametrize(
+        ("media_key", "media_url", "validation_error"),
+        [
+            (
+                "image_url",
+                "data:image/png;base64,NOT_VALID!!!",
+                ImageValidationError("Invalid base64 encoding"),
+            ),
+            (
+                "video_url",
+                "https://example.com/big.mp4",
+                VideoValidationError(
+                    "Video payload exceeds maximum size: 60 bytes > 50 bytes (url)"
+                ),
+            ),
+        ],
+        ids=["image", "video"],
+    )
+    async def test_aggregated_media_validation_error_yields_400(
+        self,
+        media_key,
+        media_url,
+        validation_error,
+    ):
+        """Aggregated media validation failures carry a structured HTTP 400."""
+        handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+        handler._multimodal_request_processor.prepare_input = AsyncMock(
+            side_effect=validation_error
+        )
+        request = {
+            "token_ids": [1, 2, 3],
+            "multi_modal_data": {media_key: [{"Url": media_url}]},
+            "sampling_options": {},
+            "stop_conditions": {},
+            "output_options": {},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in handler._generate_token_mode(
+                request, MagicMock(), "req-1"
+            )
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0]["token_ids"] == []
+        payload = json.loads(chunks[0]["finish_reason"]["error"])
+        assert payload["code"] == 400
+        assert payload["message"] == str(validation_error)
+
+    @pytest.mark.parametrize(
         "mm_processor_kwargs",
         [None, {"use_audio_in_video": True}],
     )
@@ -869,6 +921,39 @@ async def test_prefill_delegates_mode_policy_to_shared_processor():
         log_prefix="Prefill ",
         mm_processor_kwargs=mm_processor_kwargs,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "validation_error",
+    [
+        ImageValidationError("Invalid image data"),
+        VideoValidationError(
+            "Video payload exceeds maximum size: 60 bytes > 50 bytes (url)"
+        ),
+    ],
+    ids=["image", "video"],
+)
+async def test_prefill_media_validation_error_yields_400(validation_error):
+    """Prefill media validation failures carry a structured HTTP 400."""
+    handler = mod.PrefillWorkerHandler.__new__(mod.PrefillWorkerHandler)
+    handler._multimodal_request_processor = SimpleNamespace(
+        prepare_input=AsyncMock(side_effect=validation_error)
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler._generate_token_mode(
+            {"token_ids": [1, 2]}, MagicMock(), "request-prefill"
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0]["token_ids"] == []
+    assert chunks[0]["disaggregated_params"] is None
+    payload = json.loads(chunks[0]["finish_reason"]["error"])
+    assert payload["code"] == 400
+    assert payload["message"] == str(validation_error)
 
 
 @pytest.mark.asyncio

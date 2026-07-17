@@ -123,7 +123,8 @@ impl EncoderRouter {
         let client = endpoint.client().await?;
         let router =
             EncodePushRouter::from_client_with_monitor(client, RouterMode::RoundRobin, None)
-                .await?;
+                .await?
+                .with_first_token_detector(crate::protocols::common::llm_backend::is_first_token);
         let _ = self.router.set(Arc::new(router));
         if self.mark_active_if_pending() {
             tracing::info!(

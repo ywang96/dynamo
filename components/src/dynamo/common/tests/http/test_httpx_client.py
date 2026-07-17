@@ -57,6 +57,21 @@ def _make_client_with_inner(inner) -> HttpxClient:
 _PERMISSIVE = UrlValidationPolicy(allow_http=True, allow_private_ips=True)
 
 
+class _TrackingByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks) -> None:
+        self._chunks = chunks
+        self.chunks_read = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 async def test_fetch_bytes_returns_body_on_200() -> None:
     response = MagicMock(spec=httpx.Response)
     response.content = b"hello"
@@ -67,6 +82,25 @@ async def test_fetch_bytes_returns_body_on_200() -> None:
     client = _make_client_with_inner(inner)
     result = await client.fetch_bytes("https://h/x", 30.0)
     assert result == b"hello"
+
+
+async def test_fetch_bytes_stops_stream_over_max_bytes() -> None:
+    stream = _TrackingByteStream([b"1234", b"5678", b"ignored"])
+
+    async def _handle(request):
+        return httpx.Response(200, stream=stream)
+
+    inner = httpx.AsyncClient(transport=httpx.MockTransport(_handle))
+    client = _make_client_with_inner(inner)
+    try:
+        with pytest.raises(mm_http.HttpBodyTooLargeError) as exc:
+            await client.fetch_bytes("https://h/x", 30.0, max_bytes=5)
+    finally:
+        await client.close()
+
+    assert exc.value.max_bytes == 5
+    assert stream.chunks_read == 2
+    assert stream.closed
 
 
 async def test_fetch_bytes_maps_timeout() -> None:

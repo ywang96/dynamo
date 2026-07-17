@@ -15,13 +15,46 @@ use dynamo_runtime::{
 
 use super::{PrefillCompletion, PrefillError, PrefillRouter};
 use crate::{
+    http::service::error::HttpError,
     kv_router::KvPushRouter,
     protocols::common::{
+        FinishReason,
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
         timing::RequestTracker,
     },
     session_affinity::{AffinityTarget, SessionAffinityPushRouter},
 };
+
+/// Extract a status-bearing rejection from a prefill worker data frame.
+///
+/// The vLLM worker uses `finish_reason: Error({"message", "code"})` for
+/// request validation failures. Since that error is carried by the data frame
+/// instead of the annotated SSE envelope, `Annotated::err()` cannot see it.
+fn prefill_worker_error(output: &LLMEngineOutput) -> Option<HttpError> {
+    let Some(FinishReason::Error(raw_message)) = output.finish_reason.as_ref() else {
+        return None;
+    };
+
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw_message) else {
+        return Some(HttpError {
+            code: 500,
+            message: raw_message.clone(),
+        });
+    };
+
+    let message = payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(raw_message)
+        .to_string();
+    let code = payload
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .unwrap_or(500);
+
+    Some(HttpError { code, message })
+}
 
 pub(super) enum InnerPrefillRouter {
     KvRouter(Arc<KvPushRouter>),
@@ -67,6 +100,10 @@ impl PrefillRouter {
             ));
         }
 
+        if let Some(error) = first_output.data.as_ref().and_then(prefill_worker_error) {
+            return Err(PrefillError::WorkerError(error));
+        }
+
         if let Some(ref tracker) = tracker {
             tracker.record_prefill_complete();
         }
@@ -97,13 +134,16 @@ impl PrefillRouter {
                         Some(Box::new(error)),
                     ));
                 }
-                if let Some(output) = next.data.as_ref()
-                    && prompt_tokens_details.is_none()
-                {
-                    prompt_tokens_details = output
-                        .completion_usage
-                        .as_ref()
-                        .and_then(|usage| usage.prompt_tokens_details.clone());
+                if let Some(output) = next.data.as_ref() {
+                    if let Some(error) = prefill_worker_error(output) {
+                        return Err(PrefillError::WorkerError(error));
+                    }
+                    if prompt_tokens_details.is_none() {
+                        prompt_tokens_details = output
+                            .completion_usage
+                            .as_ref()
+                            .and_then(|usage| usage.prompt_tokens_details.clone());
+                    }
                 }
             }
         } else {
@@ -175,6 +215,12 @@ mod tests {
         })
     }
 
+    fn rejected_prefill_output(message: &str, code: u16) -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput::error(
+            json!({"message": message, "code": code}).to_string(),
+        ))
+    }
+
     #[tokio::test]
     async fn first_output_error_does_not_record_prefill_complete() {
         let tracker = Arc::new(RequestTracker::new());
@@ -202,5 +248,40 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!tracker.record_prefill_complete());
+    }
+
+    #[tokio::test]
+    async fn first_output_worker_rejection_preserves_status_and_message() {
+        let result = PrefillRouter::consume_prefill_stream(
+            prefill_stream(vec![rejected_prefill_output("invalid image", 400)]),
+            None,
+        )
+        .await;
+
+        let error = match result {
+            Err(PrefillError::WorkerError(error)) => error,
+            _ => panic!("expected worker error"),
+        };
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "invalid image");
+    }
+
+    #[tokio::test]
+    async fn later_worker_rejection_preserves_status_and_message() {
+        let result = PrefillRouter::consume_prefill_stream(
+            prefill_stream(vec![
+                valid_prefill_output(),
+                rejected_prefill_output("image too large", 413),
+            ]),
+            None,
+        )
+        .await;
+
+        let error = match result {
+            Err(PrefillError::WorkerError(error)) => error,
+            _ => panic!("expected worker error"),
+        };
+        assert_eq!(error.code, 413);
+        assert_eq!(error.message, "image too large");
     }
 }

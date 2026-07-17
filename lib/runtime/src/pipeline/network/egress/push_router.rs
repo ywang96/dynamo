@@ -44,6 +44,8 @@ fn is_inhibited(err: &(dyn std::error::Error + 'static)) -> bool {
         ErrorType::Disconnected,
         ErrorType::ConnectionTimeout,
         ErrorType::ResponseTimeout,
+        ErrorType::FirstTokenTimeout,
+        ErrorType::IntraTokenTimeout,
         ErrorType::Backend(BackendError::EngineShutdown),
     ];
     match_error_chain(err, INHIBITED, &[])
@@ -55,6 +57,19 @@ fn is_inhibited(err: &(dyn std::error::Error + 'static)) -> bool {
 fn response_inactivity_timeout() -> Option<std::time::Duration> {
     use crate::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS;
     std::env::var(DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+/// Read the request-plane time-to-first-token inactivity timeout.
+///
+/// This governs the window before the first generated token. If it is unset,
+/// the regular response timeout remains the fallback for that window.
+fn ttft_inactivity_timeout() -> Option<std::time::Duration> {
+    use crate::config::environment_names::llm::DYN_HTTP_BACKEND_TTFT_STREAM_TIMEOUT_SECS;
+    std::env::var(DYN_HTTP_BACKEND_TTFT_STREAM_TIMEOUT_SECS)
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
@@ -162,6 +177,14 @@ where
     /// Cached response inactivity timeout. Read once at construction from
     /// [`environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS`](crate::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS) to avoid a syscall per request.
     response_timeout: Option<std::time::Duration>,
+
+    /// Cached time-to-first-token inactivity timeout.
+    ttft_timeout: Option<std::time::Duration>,
+
+    /// Predicate deciding whether a response item closes the TTFT window.
+    /// Generic routers count every item; LLM routers install a token-aware
+    /// detector so bootstrap and annotation-only items do not count.
+    first_token_detector: fn(&U) -> bool,
 
     /// Shared request occupancy state for tracked routing modes.
     occupancy_state: Option<Arc<RoutingOccupancyState>>,
@@ -572,6 +595,8 @@ where
             round_robin_counter: Arc::new(AtomicU64::new(0)),
             fault_detection_enabled: false,
             response_timeout: response_inactivity_timeout(),
+            ttft_timeout: ttft_inactivity_timeout(),
+            first_token_detector: |_| true,
             occupancy_state,
             multimodal_cache_indexer: None,
             multimodal_cache_key_extractor: None,
@@ -642,6 +667,8 @@ where
             round_robin_counter: Arc::new(AtomicU64::new(0)),
             fault_detection_enabled: true,
             response_timeout: response_inactivity_timeout(),
+            ttft_timeout: ttft_inactivity_timeout(),
+            first_token_detector: |_| true,
             occupancy_state,
             multimodal_cache_indexer,
             multimodal_cache_key_extractor,
@@ -649,6 +676,12 @@ where
         };
 
         Ok(router)
+    }
+
+    /// Install a token-aware detector for the TTFT-to-inter-token transition.
+    pub fn with_first_token_detector(mut self, detector: fn(&U) -> bool) -> Self {
+        self.first_token_detector = detector;
+        self
     }
 
     /// `ResourceExhausted` when workers are routable but all overloaded;
@@ -1478,9 +1511,9 @@ where
     }
 
     /// Wrap a dispatched stream with fault detection + inactivity timeout.
-    /// `is_inhibited` errors trigger `report_instance_down`; the timeout
-    /// (driven by `DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS`) yields a synthetic
-    /// `ResponseTimeout` and quarantines the worker.
+    /// `is_inhibited` errors trigger `report_instance_down`; the phase-specific
+    /// inactivity timers yield a typed timeout, cancel the worker request, and
+    /// quarantine the worker.
     fn wrap_with_fault_detection(
         &self,
         stream: anyhow::Result<ManyOut<U>>,
@@ -1532,49 +1565,70 @@ where
             res
         });
 
-        let stream: Pin<Box<dyn Stream<Item = U> + Send>> = if let Some(timeout) =
-            self.response_timeout
-        {
+        let response_timeout = self.response_timeout;
+        let pre_first_timeout = self.ttft_timeout.or(response_timeout);
+        let first_token_detector = self.first_token_detector;
+        let stream: Pin<Box<dyn Stream<Item = U> + Send>> = if pre_first_timeout.is_some() {
             Box::pin(async_stream::stream! {
                 let mut inner = Box::pin(stream);
+                let mut first_received = false;
                 loop {
+                    let current_timeout = if first_received {
+                        response_timeout
+                    } else {
+                        pre_first_timeout
+                    };
                     tokio::select! {
                         biased;
                         item = inner.next() => {
                             match item {
-                                Some(item) => yield item,
+                                Some(item) => {
+                                    if !first_received && first_token_detector(&item) {
+                                        first_received = true;
+                                    }
+                                    yield item;
+                                }
                                 None => break,
                             }
                         }
-                        _ = tokio::time::sleep(timeout) => {
+                        _ = async {
+                            match current_timeout {
+                                Some(timeout) => tokio::time::sleep(timeout).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {
+                            let phase = if first_received { "stream" } else { "ttft" };
                             tracing::warn!(
                                 instance_id,
-                                timeout_secs = timeout.as_secs(),
+                                timeout_secs = ?current_timeout.map(|d| d.as_secs()),
+                                phase,
                                 "backend response inactivity timeout — quarantining worker"
                             );
                             client_for_timeout.report_instance_down(instance_id);
-                            // Propagate the cancellation to the worker — same signal
-                            // the client-disconnect path issues (disconnect.rs). The
-                            // kill flips the context registered with the response-plane
-                            // TCP server, whose receive handler sends
-                            // ControlMessage::Kill to the worker; the worker-side
-                            // handler kills its request context and the engine abort
-                            // monitor drops the request even while it is still queued.
-                            // Without this the worker only learns when its next
-                            // publish fails, leaving a zombie that wastes GPU compute
-                            // and skews least-loaded occupancy. Must run BEFORE the
-                            // yield: once downstream consumes the error item it stops
-                            // polling, so code after the yield never executes.
+                            // Propagate cancellation before yielding the terminal
+                            // error: downstream stops polling after the error, and
+                            // code placed after `yield` may never run.
                             tracing::info!(
                                 instance_id,
                                 request_id = engine_ctx_for_timeout.id(),
-                                "issuing cancellation to instance {instance_id} after inactivity timeout"
+                                "issuing cancellation to instance {instance_id} after {phase} timeout"
                             );
                             engine_ctx_for_timeout.kill();
+                            let (error_type, message) = if first_received {
+                                (
+                                    crate::error::ErrorType::IntraTokenTimeout,
+                                    "backend response inactivity timeout",
+                                )
+                            } else {
+                                (
+                                    crate::error::ErrorType::FirstTokenTimeout,
+                                    "backend time-to-first-token timeout",
+                                )
+                            };
                             yield U::from_err(
                                 crate::error::DynamoError::builder()
-                                    .error_type(crate::error::ErrorType::ResponseTimeout)
-                                    .message("backend response inactivity timeout")
+                                    .error_type(error_type)
+                                    .message(message)
                                     .build()
                             );
                             break;

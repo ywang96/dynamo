@@ -2325,6 +2325,7 @@ async def register_model(
     custom_template_path: Optional[str] = None,
     media_decoder: Optional[MediaDecoder] = None,
     media_fetcher: Optional[MediaFetcher] = None,
+    forward_inline_media_in_messages: Optional[bool] = None,
     lora_name: Optional[str] = None,
     base_model_path: Optional[str] = None,
     needs: Optional[List[List[WorkerType]]] = None,

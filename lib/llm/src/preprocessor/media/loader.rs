@@ -13,6 +13,7 @@ use reqwest::redirect::Policy;
 
 use dynamo_memory::nixl::NixlAgent;
 use dynamo_protocols::types::ChatCompletionRequestUserMessageContentPart;
+use dynamo_runtime::error::{DynamoError, ErrorType};
 
 use super::common::EncodedMediaData;
 use super::decoders::{Decoder, MediaDecoder};
@@ -21,6 +22,47 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+/// Classify client-controlled media failures as invalid arguments so the HTTP
+/// frontend returns 400 instead of treating malformed media as an internal
+/// server error. The validation prefix also keeps metrics classification in
+/// sync with the other request-validation paths.
+fn invalid_media_error(err: anyhow::Error) -> anyhow::Error {
+    DynamoError::builder()
+        .error_type(ErrorType::InvalidArgument)
+        .message(format!("Validation: {err:#}"))
+        .build()
+        .into()
+}
+
+fn classify_media_fetch_error(err: anyhow::Error) -> anyhow::Error {
+    let Some(http_error) = err.downcast_ref::<reqwest::Error>() else {
+        return invalid_media_error(err);
+    };
+    if http_error.is_redirect()
+        || http_error
+            .status()
+            .is_some_and(|status| status.is_client_error())
+    {
+        invalid_media_error(err)
+    } else {
+        err
+    }
+}
+
+async fn fetch_encoded_media_data(
+    media_fetcher: &MediaFetcher,
+    http_client: &reqwest::Client,
+    url: &url::Url,
+) -> Result<EncodedMediaData> {
+    media_fetcher
+        .check_if_url_allowed_with_dns(url)
+        .await
+        .map_err(invalid_media_error)?;
+    EncodedMediaData::from_url(url, http_client)
+        .await
+        .map_err(classify_media_fetch_error)
+}
 
 const DEFAULT_HTTP_USER_AGENT: &str = "dynamo-ai/dynamo";
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -491,15 +533,16 @@ impl MediaLoader {
                     .ok_or_else(|| anyhow::anyhow!("Model does not support image inputs"))?;
 
                 let url = &image_part.image_url.url;
-                self.media_fetcher
-                    .check_if_url_allowed_with_dns(url)
-                    .await?;
-                let data = EncodedMediaData::from_url(url, &self.http_client).await?;
+                let data =
+                    fetch_encoded_media_data(&self.media_fetcher, &self.http_client, url).await?;
 
                 // Use runtime decoder if provided, with MDC limits enforced
                 let decoder =
                     mdc_decoder.with_runtime(media_io_kwargs.and_then(|k| k.image.as_ref()));
-                decoder.decode_async(data).await?
+                decoder
+                    .decode_async(data)
+                    .await
+                    .map_err(invalid_media_error)?
             }
             #[allow(unused_variables)]
             ChatCompletionRequestUserMessageContentPart::VideoUrl(video_part) => {
@@ -514,15 +557,17 @@ impl MediaLoader {
                         })?;
 
                     let url = &video_part.video_url.url;
-                    self.media_fetcher
-                        .check_if_url_allowed_with_dns(url)
-                        .await?;
-                    let data = EncodedMediaData::from_url(url, &self.http_client).await?;
+                    let data =
+                        fetch_encoded_media_data(&self.media_fetcher, &self.http_client, url)
+                            .await?;
 
                     // Use runtime decoder if provided, with MDC limits enforced
                     let decoder =
                         mdc_decoder.with_runtime(media_io_kwargs.and_then(|k| k.video.as_ref()));
-                    decoder.decode_async(data).await?
+                    decoder
+                        .decode_async(data)
+                        .await
+                        .map_err(invalid_media_error)?
                 }
             }
             ChatCompletionRequestUserMessageContentPart::AudioUrl(_) => {
@@ -550,6 +595,106 @@ impl MediaLoader {
         }
 
         Ok(rdma_descriptor)
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fetch_media_404_is_invalid_argument() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/missing.png")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let fetcher = MediaFetcher {
+            allow_direct_ip: true,
+            allow_direct_port: true,
+            allow_private_ips: true,
+            ..Default::default()
+        };
+        let client = fetcher.build_http_client().unwrap();
+        let url = url::Url::parse(&format!("{}/missing.png", server.url())).unwrap();
+
+        let err = fetch_encoded_media_data(&fetcher, &client, &url)
+            .await
+            .expect_err("404 media fetches should be classified as invalid media");
+
+        let dynamo_err = err
+            .downcast_ref::<DynamoError>()
+            .expect("invalid media errors should downcast to DynamoError");
+        assert_eq!(dynamo_err.error_type(), ErrorType::InvalidArgument);
+        assert!(dynamo_err.message().starts_with("Validation:"));
+        assert!(dynamo_err.message().contains("404"));
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_media_503_remains_server_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/unavailable.png")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let fetcher = MediaFetcher {
+            allow_direct_ip: true,
+            allow_direct_port: true,
+            allow_private_ips: true,
+            ..Default::default()
+        };
+        let client = fetcher.build_http_client().unwrap();
+        let url = url::Url::parse(&format!("{}/unavailable.png", server.url())).unwrap();
+
+        let err = fetch_encoded_media_data(&fetcher, &client, &url)
+            .await
+            .expect_err("503 media fetches must remain server errors");
+
+        assert!(err.downcast_ref::<DynamoError>().is_none());
+        assert_eq!(
+            err.downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_disallowed_redirect_is_invalid_argument() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/redirect.png")
+            .with_status(302)
+            .with_header("location", "ftp://example.com/image.png")
+            .create_async()
+            .await;
+
+        let fetcher = MediaFetcher {
+            allow_direct_ip: true,
+            allow_direct_port: true,
+            allow_private_ips: true,
+            ..Default::default()
+        };
+        let client = fetcher.build_http_client().unwrap();
+        let url = url::Url::parse(&format!("{}/redirect.png", server.url())).unwrap();
+
+        let err = fetch_encoded_media_data(&fetcher, &client, &url)
+            .await
+            .expect_err("a redirect rejected by media policy should be invalid media");
+
+        let dynamo_err = err
+            .downcast_ref::<DynamoError>()
+            .expect("redirect policy failures should downcast to DynamoError");
+        assert_eq!(dynamo_err.error_type(), ErrorType::InvalidArgument);
+
+        mock.assert_async().await;
     }
 }
 

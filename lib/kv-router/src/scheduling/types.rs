@@ -24,6 +24,20 @@ use crate::sequences::WorkerLoadProjection;
 pub type OverloadedWorkerProvider =
     Arc<dyn Fn() -> Option<HashSet<WorkerId>> + Send + Sync + 'static>;
 
+/// Provider of the set of workers currently routable (i.e. present in the
+/// downstream `routing_instances.routable_ids` view that `push_router::direct`
+/// gates dispatch on).
+///
+/// Returning `Some(set)` narrows selection to that set; returning `None`
+/// disables the gate (every worker known to `workers_with_configs` is
+/// considered routable). The selector skips any worker known to
+/// `workers_with_configs` but *not* in the returned set — this closes the
+/// race between `workers_with_configs` (eventual, derived via the join task)
+/// and `routable_ids` (synchronous, updated by `report_instance_down` and
+/// discovery reconciliation).
+pub type RoutableWorkerProvider =
+    Arc<dyn Fn() -> Option<HashSet<WorkerId>> + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TierOverlapBlocks {
     #[serde(default)]
@@ -262,9 +276,24 @@ impl SchedulingRequest {
         &'a self,
         overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
     ) -> RoutingEligibility<'a> {
-        RoutingEligibility::new(
+        self.eligibility_with_overloaded_and_routable(overloaded_worker_ids, None)
+    }
+
+    /// Build an `RoutingEligibility` that respects both the overloaded set
+    /// (steered around by the worker-load monitor) and the routable set
+    /// (the `routing_instances.routable_ids` view that `push_router::direct`
+    /// gates on). Use this in the admission path so the selector never
+    /// returns a worker that `direct()` is about to reject.
+    #[inline]
+    pub fn eligibility_with_overloaded_and_routable<'a>(
+        &'a self,
+        overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
+        routable_worker_ids: Option<&'a HashSet<WorkerId>>,
+    ) -> RoutingEligibility<'a> {
+        RoutingEligibility::with_routable(
             self.allowed_worker_ids.as_ref(),
             overloaded_worker_ids,
+            routable_worker_ids,
             self.pinned_worker,
             &self.routing_constraints,
         )

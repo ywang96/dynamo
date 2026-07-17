@@ -408,6 +408,64 @@ class DynamoVllmArgGroup(ArgGroup):
             ),
         )
 
+        # Worker-side warmup: drive curated requests through the engine before
+        # registering in discovery, so JIT-compiled kernels are warm before the
+        # worker becomes routable.
+        add_negatable_bool_argument(
+            g,
+            flag_name="--warmup",
+            env_var="DYN_WARMUP",
+            dest="warmup_enabled",
+            default=False,
+            help="Drive curated warmup requests through the engine before "
+            "registering in discovery (worker not routable until warm).",
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-input-lens",
+            env_var="DYN_WARMUP_INPUT_LENS",
+            default="128,2048,8192",
+            arg_type=str,
+            help="Comma-separated prompt token lengths for warmup "
+            "(default: 128,2048,8192).",
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-output-tokens",
+            env_var="DYN_WARMUP_OUTPUT_TOKENS",
+            default=16,
+            arg_type=int,
+            help="max_tokens per warmup request; >= a few to exercise "
+            "spec-decode (default: 16).",
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-concurrency",
+            env_var="DYN_WARMUP_CONCURRENCY",
+            default=12,
+            arg_type=int,
+            help="Concurrent warmup requests. Must be >=8 so the decode batch "
+            "trips vLLM's Triton topk/topp sampler gate (default: 12).",
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-iterations",
+            env_var="DYN_WARMUP_ITERATIONS",
+            default=1,
+            arg_type=int,
+            help="Warmup rounds over the shape set (default: 1).",
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-timeout",
+            env_var="DYN_WARMUP_TIMEOUT",
+            default=300,
+            arg_type=int,
+            help="Max seconds for warmup; on timeout the worker registers "
+            "anyway (fail-open) (default: 300; the in-place prefill+decode "
+            "warmup on disaggregated decode workers is slower than aggregated).",
+        )
+
 
 # @dataclass()
 class DynamoVllmConfig(ConfigBase):
@@ -467,6 +525,14 @@ class DynamoVllmConfig(ConfigBase):
     benchmark_prefill_batch_granularity: Optional[int] = None
     benchmark_decode_length_granularity: Optional[int] = None
     benchmark_decode_batch_granularity: Optional[int] = None
+
+    # Worker-side warmup (pre-registration). See warmup.py.
+    warmup_enabled: bool = False
+    warmup_input_lens: str = "128,2048,8192"
+    warmup_output_tokens: int = 16
+    warmup_concurrency: int = 12
+    warmup_iterations: int = 1
+    warmup_timeout: int = 300
 
     def validate(self) -> None:
         """Validate vLLM wrapper configuration."""

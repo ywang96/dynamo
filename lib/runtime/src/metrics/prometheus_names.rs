@@ -389,14 +389,27 @@ pub mod frontend_service {
         /// Request cancelled by client or timeout
         pub const CANCELLED: &str = "cancelled";
 
-        /// Backend accepted the request but stopped responding (response inactivity timeout)
+        /// Backend accepted the request but stopped responding. Phase-agnostic;
+        /// emitted by the HTTP-layer safety-net timer.
         pub const RESPONSE_TIMEOUT: &str = "response_timeout";
+
+        /// Request-plane timer fired before the first generated token arrived.
+        pub const FIRST_TOKEN_TIMEOUT: &str = "first_token_timeout";
+
+        /// Request-plane timer fired between generated tokens.
+        pub const INTRA_TOKEN_TIMEOUT: &str = "intra_token_timeout";
 
         /// Internal server error (500 and other unexpected errors)
         pub const INTERNAL: &str = "internal";
 
         /// Feature not implemented (501)
         pub const NOT_IMPLEMENTED: &str = "not_implemented";
+
+        /// Backend reported an explicit error finish reason.
+        pub const BACKEND_ERROR: &str = "backend_error";
+
+        /// Stream closed without a terminal finish reason.
+        pub const TRUNCATED_STREAM: &str = "truncated_stream";
     }
 }
 

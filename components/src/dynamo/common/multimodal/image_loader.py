@@ -16,7 +16,13 @@ from PIL import Image
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.runtime import run_async
 
-from ..http import HttpError, HttpStatusError, HttpTimeoutError, fetch_bytes
+from ..http import (
+    HttpBodyTooLargeError,
+    HttpError,
+    HttpStatusError,
+    HttpTimeoutError,
+    fetch_bytes,
+)
 from ..http.url_validator import (
     UrlValidationError,
     UrlValidationPolicy,
@@ -28,6 +34,17 @@ logger = logging.getLogger(__name__)
 # Constants for multimodal data variants
 URL_VARIANT_KEY: Final = "Url"
 DECODED_VARIANT_KEY: Final = "Decoded"
+DEFAULT_MAX_IMAGE_BYTES: Final = int(
+    os.environ.get("DYN_MM_IMAGE_MAX_BYTES", str(10 * 1024 * 1024))
+)
+
+
+class ImageValidationError(ValueError):
+    """Client-provided image media is malformed or exceeds a configured limit."""
+
+
+class _UnsupportedImageFormatError(ValueError):
+    """Image media is well-formed enough to identify, but uses a blocked format."""
 
 
 def _create_nixl_connector() -> Any:
@@ -64,6 +81,7 @@ class ImageLoader:
         http_timeout: float = 30.0,
         enable_frontend_decoding: bool = False,
         url_policy: UrlValidationPolicy | None = None,
+        max_image_bytes: int | None = DEFAULT_MAX_IMAGE_BYTES,
     ):
         """
         Initialize the ImageLoader with caching, HTTP settings, and optional NIXL config for
@@ -78,6 +96,9 @@ class ImageLoader:
                 decoded images directly from frontend memory, bypassing standard
                 network transport. Defaults to False.
             url_policy: Policy for validating URLs. Defaults to UrlValidationPolicy.from_env().
+            max_image_bytes: Maximum encoded image payload size. ``None`` or a
+                non-positive value disables the limit. Defaults to
+                DYN_MM_IMAGE_MAX_BYTES or 10 MiB.
         """
         self._http_timeout = http_timeout
         self._cache_size = cache_size
@@ -85,6 +106,7 @@ class ImageLoader:
         self._inflight: dict[str, asyncio.Task[Image.Image]] = {}
         self._enable_frontend_decoding = enable_frontend_decoding
         self._url_policy = url_policy or UrlValidationPolicy.from_env()
+        self._max_image_bytes = max_image_bytes
         # Lazy-init NIXL connector only when frontend decoding is enabled
         self._nixl_connector = None
         if self._enable_frontend_decoding:
@@ -96,17 +118,46 @@ class ImageLoader:
     @staticmethod
     def _open_image_sync(image_data: BytesIO) -> Image.Image:
         """Open, validate, and decode an image from raw bytes. Runs in a thread."""
-        image = Image.open(image_data, formats=["JPEG", "PNG", "WEBP", "GIF"])
-        if image.format not in ("JPEG", "PNG", "WEBP", "GIF"):
-            raise ValueError(f"Unsupported image format: {image.format}")
-        # Image.open() is lazy — convert() forces the actual pixel decode
-        return image.convert("RGB")
+        try:
+            # Pillow does not identify SVG, so preserve the existing 415
+            # contract for that known unsupported image type before asking the
+            # raster decoders to inspect the payload.
+            prefix = image_data.getbuffer()[:1024].tobytes().lstrip().lower()
+            if b"<svg" in prefix:
+                raise _UnsupportedImageFormatError("Unsupported image format: SVG")
+
+            image = Image.open(image_data)
+            if image.format not in ("JPEG", "PNG", "WEBP", "GIF"):
+                raise _UnsupportedImageFormatError(
+                    f"Unsupported image format: {image.format}"
+                )
+            # Image.open() is lazy — convert() forces the actual pixel decode.
+            return image.convert("RGB")
+        except _UnsupportedImageFormatError:
+            raise
+        except (
+            Image.DecompressionBombError,
+            Image.UnidentifiedImageError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise ImageValidationError("Invalid image data") from exc
 
     @staticmethod
     async def _open_image(image_data: BytesIO) -> Image.Image:
         """Open and validate an image from raw bytes, converting to RGB."""
         with _nvtx.annotate("mm:img:pil_open_convert", color="lime"):
             return await asyncio.to_thread(ImageLoader._open_image_sync, image_data)
+
+    def _validate_image_size(self, size_bytes: int, source: str) -> None:
+        """Reject image payloads that exceed the encoded-byte size limit."""
+        if self._max_image_bytes is None or self._max_image_bytes <= 0:
+            return
+        if size_bytes > self._max_image_bytes:
+            raise ImageValidationError(
+                "Image payload exceeds maximum size: "
+                f"{size_bytes} bytes > {self._max_image_bytes} bytes ({source})"
+            )
 
     def _cache_put(self, key: str, image: Image.Image) -> None:
         """Insert into cache if not already present. Sync — no awaits."""
@@ -124,14 +175,27 @@ class ImageLoader:
         try:
             with _nvtx.annotate("mm:img:http_fetch", color="lime"):
                 content = await fetch_bytes(
-                    image_url, self._http_timeout, policy=self._url_policy
+                    image_url,
+                    self._http_timeout,
+                    policy=self._url_policy,
+                    max_bytes=self._max_image_bytes,
                 )
                 if not content:
-                    raise ValueError("Empty response content from image URL")
+                    raise ImageValidationError("Empty response content from image URL")
+                self._validate_image_size(len(content), "url")
                 image_data = BytesIO(content)
 
             return await self._open_image(image_data)
 
+        except _UnsupportedImageFormatError as exc:
+            logger.error("Unsupported image format loading: '%s'", image_url)
+            raise HttpStatusError(415, "Unsupported Media Type", image_url) from exc
+        except ImageValidationError:
+            raise
+        except HttpBodyTooLargeError as exc:
+            raise ImageValidationError(
+                f"Image payload exceeds maximum size of {exc.max_bytes} bytes (url)"
+            ) from exc
         except HttpStatusError as e:
             logger.error(f"HTTP {e.status} loading image: '{image_url}'")
             raise
@@ -144,9 +208,6 @@ class ImageLoader:
         except HttpError as e:
             logger.error(f"{type(e).__name__} loading image: '{image_url}': {e}")
             raise
-        except Image.UnidentifiedImageError as e:
-            logger.error(f"Unsupported image format loading: '{image_url}'")
-            raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
         except UrlValidationError as e:
             # Keep the type (must precede ValueError, its base) so the batch
             # caller can still map this client error to a 4xx, not a 500.
@@ -186,7 +247,7 @@ class ImageLoader:
     async def load_image(self, image_url: str) -> Image.Image:
         parsed_url = urlparse(image_url)
         if parsed_url.scheme in ("", "file"):
-            raise ValueError(
+            raise ImageValidationError(
                 "Invalid image source scheme: local file access is not allowed"
             )
         normalized_url = await validate_media_url(image_url, self._url_policy)
@@ -214,32 +275,34 @@ class ImageLoader:
             try:
                 with _nvtx.annotate("mm:img:base64_decode", color="lime"):
                     if not parsed_url.path.startswith("image/"):
-                        raise ValueError("Data URL must be an image type")
+                        raise ImageValidationError("Data URL must be an image type")
 
                     media_type, data = parsed_url.path.split(",", 1)
                     if ";base64" not in media_type:
-                        raise ValueError("Data URL must be base64 encoded")
+                        raise ImageValidationError("Data URL must be base64 encoded")
+
+                    if self._max_image_bytes is not None and self._max_image_bytes > 0:
+                        padding = min(len(data) - len(data.rstrip("=")), 2)
+                        decoded_size = (len(data) * 3) // 4 - padding
+                        self._validate_image_size(decoded_size, "data URL")
 
                     try:
                         image_bytes = base64.b64decode(data, validate=True)
                     except binascii.Error as e:
-                        raise ValueError(f"Invalid base64 encoding: {e}") from e
+                        raise ImageValidationError(
+                            f"Invalid base64 encoding: {e}"
+                        ) from e
+                    self._validate_image_size(len(image_bytes), "data URL")
                     image_data = BytesIO(image_bytes)
                 return await self._open_image(image_data)
-            except Image.UnidentifiedImageError as e:
-                logger.error(f"Unsupported image format decoding: '{image_url}'")
-                raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
-            except Exception as e:
-                if "Unsupported image format" in str(e):
-                    logger.error(f"Unsupported image format decoding: '{image_url}'")
-                    raise HttpStatusError(
-                        415, "Unsupported Media Type", image_url
-                    ) from e
-                logger.error(f"{type(e).__name__} decoding image: '{image_url}': {e}")
-                raise ValueError(f"Failed to decoding image: '{image_url}': {e}") from e
+            except _UnsupportedImageFormatError as exc:
+                logger.error("Unsupported image format decoding: '%s'", image_url)
+                raise HttpStatusError(415, "Unsupported Media Type", image_url) from exc
+            except ImageValidationError:
+                raise
 
         # It's not file:, http:, https:, or data:
-        raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
+        raise ImageValidationError(f"Invalid image source scheme: {parsed_url.scheme}")
 
     async def load_image_batch(
         self,
@@ -264,6 +327,8 @@ class ImageLoader:
                 frontend returns the correct client-error code instead of 500.
             UrlValidationError: If a media URL is rejected by the SSRF policy;
                 preserved as a ValueError so the frontend returns a 4xx, not 500.
+            ImageValidationError: If client-provided image data is malformed or
+                exceeds the configured encoded-byte limit.
             Exception: If any image fails to load for any other reason
             ValueError: If enable_frontend_decoding=True but nixl_connector is None
         """
@@ -294,8 +359,11 @@ class ImageLoader:
         collective_exceptions = ""
         status_error: HttpStatusError | None = None
         url_error: UrlValidationError | None = None
+        validation_error: ImageValidationError | None = None
         for media_item, result in zip(image_mm_items, results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    raise result
                 source = media_item.get(URL_VARIANT_KEY, "decoded")
                 logger.error(f"Failed to load image from {source[:80]}...: {result}")
                 collective_exceptions += (
@@ -311,6 +379,10 @@ class ImageLoader:
                 # preserve it so the frontend still gets a 4xx, not a 500.
                 elif url_error is None and isinstance(result, UrlValidationError):
                     url_error = result
+                elif validation_error is None and isinstance(
+                    result, ImageValidationError
+                ):
+                    validation_error = result
                 continue
             loaded_images.append(result)
 
@@ -319,6 +391,9 @@ class ImageLoader:
 
         if url_error is not None:
             raise url_error
+
+        if validation_error is not None:
+            raise validation_error
 
         if collective_exceptions:
             raise Exception(collective_exceptions)

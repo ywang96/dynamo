@@ -25,7 +25,11 @@ from PIL import Image
 
 from dynamo.common.http import HttpStatusError, HttpTimeoutError
 from dynamo.common.http.url_validator import UrlValidationError, UrlValidationPolicy
-from dynamo.common.multimodal.image_loader import URL_VARIANT_KEY, ImageLoader
+from dynamo.common.multimodal.image_loader import (
+    URL_VARIANT_KEY,
+    ImageLoader,
+    ImageValidationError,
+)
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -72,7 +76,7 @@ def _mock_fetch_bytes(
         side_effect: If set, the mock raises this exception instead of returning.
     """
 
-    async def _fetch(url, timeout, *, policy=None):
+    async def _fetch(url, timeout, *, policy=None, max_bytes=None):
         if delay > 0:
             await asyncio.sleep(delay)
         if side_effect is not None:
@@ -180,15 +184,72 @@ async def test_http_rejected_by_default() -> None:
 
 
 async def test_data_url_invalid_base64_normalized(loader: ImageLoader) -> None:
-    """Malformed base64 data URL should raise ValueError."""
-    with pytest.raises(ValueError, match="Invalid base64"):
+    """Malformed base64 data URL should raise ImageValidationError."""
+    with pytest.raises(ImageValidationError, match="Invalid base64"):
         await loader.load_image("data:image/png;base64,NOT_VALID!!!")
 
 
 async def test_data_url_non_image_rejected(loader: ImageLoader) -> None:
-    """data: URL with non-image media type should raise ValueError."""
-    with pytest.raises(ValueError, match="Data URL must be an image type"):
+    """data: URL with non-image media type should raise ImageValidationError."""
+    with pytest.raises(ImageValidationError, match="Data URL must be an image type"):
         await loader.load_image("data:text/plain;base64,aGVsbG8=")
+
+
+async def test_http_corrupt_image_raises_validation_error(
+    loader: ImageLoader,
+) -> None:
+    """HTTP bytes that cannot decode as an image are a client validation error."""
+    mock_fetch = _mock_fetch_bytes(content=b"not an image")
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(ImageValidationError, match="Invalid image data"):
+            await loader.load_image("https://example.com/img.png")
+
+
+async def test_http_image_over_size_limit_raises_validation_error() -> None:
+    """HTTP image payloads over the encoded-byte cap should be rejected."""
+    capped_loader = ImageLoader(
+        cache_size=4,
+        http_timeout=30.0,
+        url_policy=_permissive_policy(),
+        max_image_bytes=len(PNG_BYTES) - 1,
+    )
+    mock_fetch = _mock_fetch_bytes(content=PNG_BYTES)
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(ImageValidationError, match="exceeds maximum size"):
+            await capped_loader.load_image("https://example.com/img.png")
+
+
+async def test_data_url_image_over_size_limit_raises_validation_error() -> None:
+    """Decoded data URL payloads over the encoded-byte cap should be rejected."""
+    capped_loader = ImageLoader(
+        cache_size=4,
+        http_timeout=30.0,
+        url_policy=_permissive_policy(),
+        max_image_bytes=len(PNG_BYTES) - 1,
+    )
+    data_url = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode()
+    with pytest.raises(ImageValidationError, match="exceeds maximum size"):
+        await capped_loader.load_image(data_url)
+
+
+async def test_batch_preserves_image_validation_error(loader: ImageLoader) -> None:
+    """Batch aggregation must retain the typed client validation error."""
+    mock_fetch = _mock_fetch_bytes(content=b"not an image")
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(ImageValidationError, match="Invalid image data"):
+            await loader.load_image_batch(
+                [{URL_VARIANT_KEY: "https://example.com/img.png"}]
+            )
+
+
+async def test_batch_preserves_cancellation(loader: ImageLoader) -> None:
+    loader.load_image = AsyncMock(  # type: ignore[method-assign]
+        side_effect=asyncio.CancelledError
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await loader.load_image_batch(
+            [{URL_VARIANT_KEY: "https://example.com/img.png"}]
+        )
 
 
 # --- HTTP error contract ---
@@ -229,6 +290,13 @@ def _make_svg_bytes() -> bytes:
     return b"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>"
 
 
+def _make_image_bytes(image_format: str) -> bytes:
+    image = Image.new("RGB", (2, 2), color="red")
+    buffer = BytesIO()
+    image.save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
 async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
     """Fetching a URL that returns an unsupported image format (e.g. SVG) should raise
     HttpStatusError with status 415, not 500."""
@@ -237,6 +305,18 @@ async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
         with pytest.raises(HttpStatusError) as exc_info:
             await loader.load_image("https://example.com/image.svg")
         assert exc_info.value.status == 415
+
+
+@pytest.mark.parametrize("image_format", ["GIF", "BMP", "TIFF"])
+async def test_identifiable_blocked_format_raises_415(
+    loader: ImageLoader, image_format: str
+) -> None:
+    """Known but unsupported raster formats are 415, unlike corrupt bytes (400)."""
+    mock_fetch = _mock_fetch_bytes(content=_make_image_bytes(image_format))
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(HttpStatusError) as exc_info:
+            await loader.load_image(f"https://example.com/image.{image_format.lower()}")
+    assert exc_info.value.status == 415
 
 
 async def test_unsupported_format_data_url_raises_415(loader: ImageLoader) -> None:

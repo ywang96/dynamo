@@ -360,7 +360,7 @@ fn resolve_routing_image_token_id(model_id: &str, model_dir: &str) -> Option<u32
 /// For LoRA mode, both `lora_name` and `base_model_path` must be provided together.
 /// Providing only one of them will result in an error.
 #[pyfunction]
-#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, kv_cache_block_size=None, router_config=None, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None, worker_type=None, needs=None, self_host_metadata=None, *, tensor_model_config=None, ignore_weights=false, max_gpu_lora_count=None, model_aliases=None))]
+#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, kv_cache_block_size=None, router_config=None, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, forward_inline_media_in_messages=None, lora_name=None, base_model_path=None, worker_type=None, needs=None, self_host_metadata=None, *, tensor_model_config=None, ignore_weights=false, max_gpu_lora_count=None, model_aliases=None))]
 #[allow(clippy::too_many_arguments)]
 fn register_model<'p>(
     py: Python<'p>,
@@ -376,6 +376,7 @@ fn register_model<'p>(
     custom_template_path: Option<&str>,
     media_decoder: Option<MediaDecoder>,
     media_fetcher: Option<MediaFetcher>,
+    forward_inline_media_in_messages: Option<bool>,
     lora_name: Option<&str>,
     base_model_path: Option<&str>,
     worker_type: Option<WorkerType>,
@@ -562,6 +563,7 @@ fn register_model<'p>(
             card.runtime_config = runtime_config.inner;
             card.tensor_model_config = tensor_model_config;
             card.router_config = explicit_router_config.clone();
+            card.forward_inline_media_in_messages = forward_inline_media_in_messages;
 
             // Register the Model Deployment Card via discovery interface
             let discovery = endpoint.inner.drt().discovery();
@@ -615,6 +617,9 @@ fn register_model<'p>(
             .custom_template_path(custom_template_path_owned)
             .media_decoder(media_decoder.map(|m| m.inner))
             .media_fetcher(media_fetcher.map(|m| m.inner));
+        if let Some(forward) = forward_inline_media_in_messages {
+            builder.forward_inline_media_in_messages(forward);
+        }
         // Absence falls through to the DYN_SELF_HOST_METADATA env var default.
         if let Some(enabled) = self_host_metadata {
             builder.self_host_metadata(enabled);

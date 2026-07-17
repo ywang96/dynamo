@@ -33,6 +33,14 @@ pub enum WorkerEligibilityError {
 pub struct RoutingEligibility<'a> {
     allowed_worker_ids: Option<&'a HashSet<WorkerId>>,
     overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
+    /// Workers currently routable per `routing_instances.routable_ids`.
+    /// `None` means "the gate is not configured" — every worker known to
+    /// `workers_with_configs` is treated as routable (legacy behavior).
+    /// `Some(set)` restricts selection to that set; this closes the race
+    /// where `workers_with_configs` still lists a worker that
+    /// `push_router::direct` will reject because `report_instance_down`
+    /// has just quarantined it.
+    routable_worker_ids: Option<&'a HashSet<WorkerId>>,
     pinned_worker: Option<WorkerWithDpRank>,
     routing_constraints: &'a RoutingConstraints,
 }
@@ -45,9 +53,27 @@ impl<'a> RoutingEligibility<'a> {
         pinned_worker: Option<WorkerWithDpRank>,
         routing_constraints: &'a RoutingConstraints,
     ) -> Self {
+        Self::with_routable(
+            allowed_worker_ids,
+            overloaded_worker_ids,
+            None,
+            pinned_worker,
+            routing_constraints,
+        )
+    }
+
+    #[inline]
+    pub fn with_routable(
+        allowed_worker_ids: Option<&'a HashSet<WorkerId>>,
+        overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
+        routable_worker_ids: Option<&'a HashSet<WorkerId>>,
+        pinned_worker: Option<WorkerWithDpRank>,
+        routing_constraints: &'a RoutingConstraints,
+    ) -> Self {
         Self {
             allowed_worker_ids,
             overloaded_worker_ids,
+            routable_worker_ids,
             pinned_worker,
             routing_constraints,
         }
@@ -70,9 +96,20 @@ impl<'a> RoutingEligibility<'a> {
             .is_some_and(|worker_ids| worker_ids.contains(&worker_id))
     }
 
+    /// True if the worker is currently routable per `routing_instances.routable_ids`.
+    /// When no routable provider is configured this returns `true` for all
+    /// workers (legacy behavior).
+    #[inline]
+    pub fn is_worker_routable(&self, worker_id: WorkerId) -> bool {
+        self.routable_worker_ids
+            .is_none_or(|worker_ids| worker_ids.contains(&worker_id))
+    }
+
     #[inline]
     pub fn allows_worker_id(&self, worker_id: WorkerId) -> bool {
-        self.caller_allows_worker_id(worker_id) && !self.is_worker_overloaded(worker_id)
+        self.caller_allows_worker_id(worker_id)
+            && self.is_worker_routable(worker_id)
+            && !self.is_worker_overloaded(worker_id)
     }
 
     #[inline]
@@ -81,7 +118,14 @@ impl<'a> RoutingEligibility<'a> {
         worker_id: WorkerId,
         config: &C,
     ) -> bool {
+        // Routable is a HARDER gate than overloaded — push_router will reject
+        // a quarantined worker regardless, so the fallback path
+        // (`has_eligible_worker_ignoring_overload` → `AllEligibleWorkersOverloaded`)
+        // must also skip unroutable workers. Otherwise we'd downgrade a clean
+        // `NoEndpoints` to `AllEligibleWorkersOverloaded` while still picking a
+        // worker that `direct()` is about to reject.
         self.caller_allows_worker_id(worker_id)
+            && self.is_worker_routable(worker_id)
             && self
                 .routing_constraints
                 .is_compatible_with_worker_taints(config.taints())
@@ -137,6 +181,11 @@ impl<'a> RoutingEligibility<'a> {
     ) -> Result<&'w C, WorkerEligibilityError> {
         if !self.caller_allows_worker_id(worker.worker_id) {
             return Err(WorkerEligibilityError::WorkerNotAllowed {
+                worker_id: worker.worker_id,
+            });
+        }
+        if !self.is_worker_routable(worker.worker_id) {
+            return Err(WorkerEligibilityError::WorkerUnavailable {
                 worker_id: worker.worker_id,
             });
         }
@@ -532,5 +581,68 @@ mod tests {
         eligibility.for_each_eligible_worker_rank(&workers, |worker, _| ranks.push(worker));
 
         assert!(ranks.is_empty());
+    }
+
+    #[test]
+    fn routing_eligibility_excludes_unroutable_workers() {
+        let routable_worker_ids = HashSet::from([1, 3]);
+        let constraints = RoutingConstraints::default();
+        let eligibility = RoutingEligibility::with_routable(
+            None,
+            None,
+            Some(&routable_worker_ids),
+            None,
+            &constraints,
+        );
+        let config = TestWorkerConfig::default();
+
+        assert!(eligibility.is_worker_routable(1));
+        assert!(!eligibility.is_worker_routable(2));
+        assert!(eligibility.allows_worker(1, &config));
+        assert!(!eligibility.allows_worker(2, &config));
+        assert!(eligibility.allows_worker_ignoring_overload(1, &config));
+        assert!(!eligibility.allows_worker_ignoring_overload(2, &config));
+        assert!(eligibility.has_eligible_worker([(1, &config), (2, &config)]));
+        assert!(!eligibility.has_eligible_worker([(2, &config)]));
+        assert!(!eligibility.has_eligible_worker_ignoring_overload([(2, &config)]));
+
+        let workers = HashMap::from([(2, config)]);
+        assert_eq!(
+            eligibility
+                .validate_worker_rank(&workers, WorkerWithDpRank::new(2, 0))
+                .err(),
+            Some(WorkerEligibilityError::WorkerUnavailable { worker_id: 2 })
+        );
+    }
+
+    #[test]
+    fn routing_eligibility_routable_defaults_to_open_when_unset() {
+        let constraints = RoutingConstraints::default();
+        let eligibility = RoutingEligibility::new(None, None, None, &constraints);
+
+        assert!(eligibility.is_worker_routable(42));
+        assert!(eligibility.is_worker_routable(u64::MAX));
+    }
+
+    #[test]
+    fn routing_eligibility_routable_is_stricter_than_overload() {
+        let routable_worker_ids = HashSet::from([1]);
+        let overloaded_worker_ids = HashSet::from([1, 2]);
+        let constraints = RoutingConstraints::default();
+        let eligibility = RoutingEligibility::with_routable(
+            None,
+            Some(&overloaded_worker_ids),
+            Some(&routable_worker_ids),
+            None,
+            &constraints,
+        );
+        let config = TestWorkerConfig::default();
+
+        assert!(!eligibility.allows_worker(1, &config));
+        assert!(eligibility.allows_worker_ignoring_overload(1, &config));
+        assert!(!eligibility.allows_worker(2, &config));
+        assert!(!eligibility.allows_worker_ignoring_overload(2, &config));
+        assert!(!eligibility.allows_worker(3, &config));
+        assert!(!eligibility.allows_worker_ignoring_overload(3, &config));
     }
 }

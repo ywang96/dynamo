@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from dynamo.common.http import fetch_bytes
+from dynamo.common.http import HttpBodyTooLargeError, fetch_bytes
 from dynamo.common.http.url_validator import UrlValidationPolicy, validate_media_url
 from dynamo.common.utils.runtime import run_async
 
@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 URL_VARIANT_KEY: Final = "Url"
 DECODED_VARIANT_KEY: Final = "Decoded"
+DEFAULT_MAX_VIDEO_BYTES: Final = int(
+    os.environ.get("DYN_MM_VIDEO_MAX_BYTES", str(50 * 1024 * 1024))
+)
+
+
+class VideoValidationError(ValueError):
+    """Client-provided video media is malformed, unsupported, or too large."""
 
 
 def _create_nixl_connector() -> Any:
@@ -78,11 +85,15 @@ class VideoLoader:
         num_frames: int = NUM_FRAMES_DEFAULT,
         enable_frontend_decoding: bool = False,
         url_policy: UrlValidationPolicy | None = None,
+        max_video_bytes: int | None = DEFAULT_MAX_VIDEO_BYTES,
     ) -> None:
         self._http_timeout = int(http_timeout)
         self._num_frames = num_frames
         self._enable_frontend_decoding = enable_frontend_decoding
         self._url_policy = url_policy or UrlValidationPolicy.from_env()
+        self._max_video_bytes = (
+            int(max_video_bytes) if max_video_bytes is not None else None
+        )
         self._nixl_connector = None
         self._vllm_media_connector = None
         if self._enable_frontend_decoding:
@@ -108,6 +119,16 @@ class VideoLoader:
             num_frames=self._num_frames,
         )
 
+    def _validate_video_size(self, size_bytes: int, source: str) -> None:
+        """Reject video payloads that exceed the encoded-byte size limit."""
+        if self._max_video_bytes is None or self._max_video_bytes <= 0:
+            return
+        if size_bytes > self._max_video_bytes:
+            raise VideoValidationError(
+                "Video payload exceeds maximum size: "
+                f"{size_bytes} bytes > {self._max_video_bytes} bytes ({source})"
+            )
+
     async def _load_video_with_vllm(
         self, video_url: str
     ) -> tuple[np.ndarray, Dict[str, Any]]:
@@ -119,8 +140,12 @@ class VideoLoader:
         # data: and file:// never touch the network, so vLLM can handle them.
         if urlparse(normalized_url).scheme in ("http", "https"):
             content = await fetch_bytes(
-                normalized_url, self._http_timeout, policy=self._url_policy
+                normalized_url,
+                self._http_timeout,
+                policy=self._url_policy,
+                max_bytes=self._max_video_bytes,
             )
+            self._validate_video_size(len(content), "url")
             return await asyncio.to_thread(media_io.load_bytes, content)
 
         connector = self._get_vllm_media_connector()
@@ -136,6 +161,12 @@ class VideoLoader:
                     f"Failed to extract video frames from {video_url}. Decoded clip is empty."
                 )
             return np.ascontiguousarray(frames), metadata
+        except HttpBodyTooLargeError as exc:
+            raise VideoValidationError(
+                f"Video payload exceeds maximum size of {exc.max_bytes} bytes (url)"
+            ) from exc
+        except VideoValidationError:
+            raise
         except FileNotFoundError:
             raise
         except Exception as exc:
@@ -182,18 +213,24 @@ class VideoLoader:
         results = await asyncio.gather(*video_futures, return_exceptions=True)
         loaded_videos: list[tuple[np.ndarray, Dict[str, Any]]] = []
         collective_exceptions: list[str] = []
+        validation_exceptions: list[str] = []
         for media_item, result in zip(video_mm_items, results):
             if isinstance(result, BaseException):
-                if isinstance(result, asyncio.CancelledError):
+                if not isinstance(result, Exception):
                     raise result
                 source = media_item.get(URL_VARIANT_KEY, "decoded")
                 logger.error("Failed to load video from %s...: %s", source[:80], result)
-                collective_exceptions.append(
-                    f"Failed to load video from {source[:80]}...: {result}\n"
-                )
+                message = f"Failed to load video from {source[:80]}...: {result}\n"
+                if isinstance(result, VideoValidationError):
+                    validation_exceptions.append(message)
+                else:
+                    collective_exceptions.append(message)
                 continue
             frames, metadata = result
             loaded_videos.append((np.ascontiguousarray(frames), metadata))
+
+        if validation_exceptions:
+            raise VideoValidationError("".join(validation_exceptions).strip())
 
         if collective_exceptions:
             raise Exception("".join(collective_exceptions))

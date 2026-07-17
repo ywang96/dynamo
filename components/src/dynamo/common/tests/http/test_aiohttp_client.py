@@ -37,17 +37,39 @@ pytestmark = [
 class _FakeResponse:
     """Minimal aiohttp response stand-in for ``async with session.get(...) as r``."""
 
-    def __init__(self, *, status=200, headers=None, url=None, body=b"") -> None:
+    def __init__(
+        self,
+        *,
+        status=200,
+        headers=None,
+        url=None,
+        body=b"",
+        chunks=None,
+        content_length=None,
+    ) -> None:
         self.status = status
         self.headers = headers or {}
         self.url = url
         self._body = body
+        self.content_length = content_length
+        self.content = _FakeContent(chunks if chunks is not None else [body])
 
     def raise_for_status(self) -> None:
         return None
 
     async def read(self) -> bytes:
         return self._body
+
+
+class _FakeContent:
+    def __init__(self, chunks) -> None:
+        self._chunks = chunks
+        self.chunks_read = 0
+
+    async def iter_chunked(self, size):
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
 
 
 def _cm_returning(response):
@@ -121,6 +143,20 @@ async def test_fetch_bytes_returns_body_on_200() -> None:
     client = _make_client_with_session(session)
     result = await client.fetch_bytes("https://h/x", 30.0)
     assert result == b"hello"
+
+
+async def test_fetch_bytes_stops_stream_over_max_bytes() -> None:
+    response = _FakeResponse(chunks=[b"1234", b"5678", b"ignored"])
+    session = MagicMock(spec=aiohttp.ClientSession)
+    session.closed = False
+    session.get = _cm_returning(response)
+    client = _make_client_with_session(session)
+
+    with pytest.raises(mm_http.HttpBodyTooLargeError) as exc:
+        await client.fetch_bytes("https://h/x", 30.0, max_bytes=5)
+
+    assert exc.value.max_bytes == 5
+    assert response.content.chunks_read == 2
 
 
 async def test_fetch_bytes_maps_timeout() -> None:

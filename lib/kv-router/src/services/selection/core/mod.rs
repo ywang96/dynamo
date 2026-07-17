@@ -480,6 +480,7 @@ impl SelectionCore {
             None,
             Some(overlap_refresh),
             None,
+            None,
             self.kv_router_config.router_queue_recheck_interval(),
             self.kv_router_config.router_track_prefill_tokens,
             self.cancel_token.child_token(),

@@ -25,7 +25,7 @@ pub(crate) fn overload_status_code() -> StatusCode {
 /// Implementation of the Completion Engines served by the HTTP service should
 /// map their custom errors to to this error type if they wish to return error
 /// codes besides 500.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 #[error("HTTP Error {code}: {message}")]
 pub struct HttpError {
     pub code: u16,

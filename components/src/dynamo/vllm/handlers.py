@@ -5,6 +5,7 @@ import asyncio
 import base64
 import importlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -54,6 +55,8 @@ from dynamo.common.multimodal.embedding_transfer import (
     NixlReadEmbeddingReceiver,
     NixlWriteEmbeddingReceiver,
 )
+from dynamo.common.multimodal.image_loader import ImageValidationError
+from dynamo.common.multimodal.video_loader import VideoValidationError
 from dynamo.common.rl import (
     RLAdminValidationError,
     RLRouteRegistry,
@@ -2474,6 +2477,18 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         return prompt, sequence_length, embeddings_tensor
 
+    @staticmethod
+    def _bad_request_error_chunk(message: str) -> Dict[str, Any]:
+        """Build a frontend-compatible terminal error carrying HTTP status 400."""
+        payload = json.dumps({"message": message, "code": 400})
+        return {
+            # FinishReason::Error is a serde newtype variant on the Rust side,
+            # so emit its object representation directly.
+            "finish_reason": {"error": payload},
+            "index": 0,
+            "token_ids": [],
+        }
+
     def _build_prompt_from_request(
         self,
         request: Dict[str, Any],
@@ -3048,6 +3063,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     "token_ids": [],
                 }
                 return
+            except (ImageValidationError, VideoValidationError) as exc:
+                yield self._bad_request_error_chunk(str(exc))
+                return
 
             request = prepared_input.request
             multi_modal_data = prepared_input.multi_modal_data
@@ -3364,12 +3382,18 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
-        prepared_input = await self._multimodal_request_processor.prepare_input(
-            request,
-            request_id,
-            context,
-            DisaggregationMode.PREFILL,
-        )
+        try:
+            prepared_input = await self._multimodal_request_processor.prepare_input(
+                request,
+                request_id,
+                context,
+                DisaggregationMode.PREFILL,
+            )
+        except (ImageValidationError, VideoValidationError) as exc:
+            error_chunk = self._bad_request_error_chunk(str(exc))
+            error_chunk["disaggregated_params"] = None
+            yield error_chunk
+            return
         request = prepared_input.request
         multi_modal_data = prepared_input.multi_modal_data
         mm_processor_kwargs = prepared_input.mm_processor_kwargs

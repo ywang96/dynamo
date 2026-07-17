@@ -36,8 +36,22 @@ use std::time::Duration;
 
 use crate::http::service::error::SanitizedError;
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
+use crate::protocols::common::FinishReason;
+use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
 
-use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
+use dynamo_runtime::config::environment_names::llm::{
+    DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV,
+    DYN_HTTP_BACKEND_TTFT_STREAM_TIMEOUT_SECS as BACKEND_TTFT_TIMEOUT_ENV,
+    DYN_HTTP_SSE_INACTIVITY_TIMEOUT_SECS as SSE_INACTIVITY_TIMEOUT_ENV,
+};
+
+fn read_positive_secs(env_var: &str) -> Option<Duration> {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+}
 
 /// Read the backend stream inactivity timeout from the environment.
 /// Returns `None` if unset or zero (timeout disabled).
@@ -47,11 +61,81 @@ use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIME
 /// fires first and triggers `report_instance_down()` for worker quarantine.
 /// This layer is strictly a safety net for gauge cleanup.
 pub fn backend_stream_timeout() -> Option<Duration> {
-    std::env::var(BACKEND_STREAM_TIMEOUT_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .map(|secs| Duration::from_secs(secs.saturating_mul(2)))
+    if let Some(timeout) = read_positive_secs(SSE_INACTIVITY_TIMEOUT_ENV) {
+        return Some(timeout);
+    }
+    read_positive_secs(BACKEND_STREAM_TIMEOUT_ENV)
+        .map(|d| Duration::from_secs(d.as_secs().saturating_mul(2)))
+}
+
+/// HTTP-layer TTFT safety-net timeout. The explicit SSE override wins;
+/// otherwise this is twice the request-plane TTFT timeout.
+pub fn backend_ttft_timeout() -> Option<Duration> {
+    if let Some(timeout) = read_positive_secs(SSE_INACTIVITY_TIMEOUT_ENV) {
+        return Some(timeout);
+    }
+    read_positive_secs(BACKEND_TTFT_TIMEOUT_ENV)
+        .map(|d| Duration::from_secs(d.as_secs().saturating_mul(2)))
+}
+
+/// Reject a safety-net override that would fire before either request-plane
+/// timer and therefore bypass worker quarantine.
+pub fn validate_backend_stream_timeouts() -> anyhow::Result<()> {
+    let Some(safety) = read_positive_secs(SSE_INACTIVITY_TIMEOUT_ENV) else {
+        return Ok(());
+    };
+
+    for (primary_env, phase) in [
+        (BACKEND_STREAM_TIMEOUT_ENV, "inter-token"),
+        (BACKEND_TTFT_TIMEOUT_ENV, "TTFT"),
+    ] {
+        if let Some(primary) = read_positive_secs(primary_env)
+            && safety <= primary
+        {
+            anyhow::bail!(
+                "{SSE_INACTIVITY_TIMEOUT_ENV}={}s must be > {primary_env}={}s \
+                 (HTTP safety net would beat the request-plane {phase} timer)",
+                safety.as_secs(),
+                primary.as_secs(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn downcast_dynamo_error(err: &axum::Error) -> Option<&DynamoError> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(error) = source {
+        if let Some(dynamo_error) = error.downcast_ref::<DynamoError>() {
+            return Some(dynamo_error);
+        }
+        source = error.source();
+    }
+    None
+}
+
+/// Convert a typed request-plane timeout into its metrics and protocol labels.
+pub(super) fn timeout_classification(
+    error: &DynamoError,
+) -> Option<(ErrorType, &'static str, String)> {
+    match error.error_type() {
+        DynamoErrorType::FirstTokenTimeout => Some((
+            ErrorType::FirstTokenTimeout,
+            "first_token_timeout",
+            error.message().to_string(),
+        )),
+        DynamoErrorType::IntraTokenTimeout => Some((
+            ErrorType::IntraTokenTimeout,
+            "intra_token_timeout",
+            error.message().to_string(),
+        )),
+        DynamoErrorType::ResponseTimeout => Some((
+            ErrorType::ResponseTimeout,
+            "timeout",
+            error.message().to_string(),
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -199,21 +283,95 @@ pub fn monitor_for_disconnects(
     inflight_guard: InflightGuard,
     stream_handle: ConnectionHandle,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
-    monitor_for_disconnects_with_timeout(
+    let (_finish_reason_tx, finish_reason_rx) =
+        tokio::sync::watch::channel(Some(FinishReason::Stop));
+    monitor_for_disconnects_inner(
         stream,
         context,
         inflight_guard,
         stream_handle,
+        finish_reason_rx,
+        None,
         backend_stream_timeout(),
+        backend_ttft_timeout(),
     )
 }
 
+/// Monitor an LLM stream and classify a clean close from its terminal finish
+/// reason. `None` means the stream was truncated; `Error` is a backend error.
+pub fn monitor_for_disconnects_with_finish_reason(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    finish_reason_rx: tokio::sync::watch::Receiver<Option<FinishReason>>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_for_disconnects_inner(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        finish_reason_rx,
+        None,
+        backend_stream_timeout(),
+        backend_ttft_timeout(),
+    )
+}
+
+/// Token-aware LLM monitor. The TTFT window remains active across leading
+/// annotation or handshake events until the producer sets `first_token_seen`.
+pub fn monitor_for_disconnects_tracking_first_token(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    finish_reason_rx: tokio::sync::watch::Receiver<Option<FinishReason>>,
+    first_token_seen: Arc<std::sync::atomic::AtomicBool>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_for_disconnects_inner(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        finish_reason_rx,
+        Some(first_token_seen),
+        backend_stream_timeout(),
+        backend_ttft_timeout(),
+    )
+}
+
+#[cfg(test)]
 fn monitor_for_disconnects_with_timeout(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    inactivity_timeout: Option<Duration>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    let (_finish_reason_tx, finish_reason_rx) =
+        tokio::sync::watch::channel(Some(FinishReason::Stop));
+    monitor_for_disconnects_inner(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        finish_reason_rx,
+        None,
+        inactivity_timeout,
+        inactivity_timeout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_for_disconnects_inner(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
     context: Arc<dyn AsyncEngineContext>,
     mut inflight_guard: InflightGuard,
     mut stream_handle: ConnectionHandle,
-    inactivity_timeout: Option<Duration>,
+    finish_reason_rx: tokio::sync::watch::Receiver<Option<FinishReason>>,
+    first_token_seen: Option<Arc<std::sync::atomic::AtomicBool>>,
+    stream_timeout: Option<Duration>,
+    ttft_timeout: Option<Duration>,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     stream_handle.arm();
 
@@ -222,38 +380,74 @@ fn monitor_for_disconnects_with_timeout(
     // "cancelled" instead of "internal". The happy path overrides this via mark_ok().
     inflight_guard.mark_error(ErrorType::Cancelled);
 
+    let pre_first_timeout = ttft_timeout.or(stream_timeout);
+
     async_stream::try_stream! {
         tokio::pin!(stream);
+        let mut first_received = false;
         // Keep the context's watch-backed cancellation future alive across body frames.
         // Recreating it for every token repeatedly clones a receiver and churns Notify state.
         let stopped = context.stopped();
         tokio::pin!(stopped);
         loop {
+            let content_seen = match &first_token_seen {
+                Some(flag) => flag.load(std::sync::atomic::Ordering::Acquire),
+                None => first_received,
+            };
+            let inactivity_timeout = if content_seen {
+                stream_timeout
+            } else {
+                pre_first_timeout
+            };
             tokio::select! {
+                // Prefer a response that became ready in the same poll as the timer.
+                biased;
                 event = stream.next() => {
                     match event {
                         Some(Ok(event)) => {
+                            first_received = true;
                             yield event;
                         }
                         Some(Err(err)) => {
-                            // Mark error as internal since it's a streaming error
-                            inflight_guard.mark_error(ErrorType::Internal);
+                            let typed_timeout =
+                                downcast_dynamo_error(&err).and_then(timeout_classification);
+                            let backend_error = matches!(
+                                &*finish_reason_rx.borrow(),
+                                Some(FinishReason::Error(_))
+                            );
+                            let (error_type, envelope_type, envelope_code, envelope_message) =
+                                if let Some((metric, error_type, message)) = typed_timeout {
+                                    (metric, error_type, 504u16, message)
+                                } else {
+                                    let metric = if backend_error {
+                                        ErrorType::BackendError
+                                    } else {
+                                        ErrorType::Internal
+                                    };
+                                    tracing::error!(details = %err, "Streaming error");
+                                    let sanitized = SanitizedError::Internal;
+                                    (
+                                        metric,
+                                        sanitized.openai_type_slug(),
+                                        sanitized.status().as_u16(),
+                                        sanitized.to_string(),
+                                    )
+                                };
+                            inflight_guard.mark_error(error_type);
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
                             // doesn't later record this as ClosedUnexpectedly (which
                             // would mis-attribute the fault as a client disconnect).
                             stream_handle.disarm();
-                            tracing::error!("Streaming error: {err}");
-                            // Emit a structured OpenAI-style error frame + `data: [DONE]`
-                            // so naive `data:`-line parsers see both the error and a
-                            // stream terminator. Body derived from SanitizedError so
-                            // the sanitized message + status live in one place.
-                            let sanitized = SanitizedError::Internal;
+                            // A merged batch stream uses one parent context linked to
+                            // every prompt. Terminating on any substream error must fan
+                            // cancellation out to the still-running siblings.
+                            context.kill();
                             let err_json = serde_json::json!({
                                 "error": {
-                                    "message": sanitized.to_string(),
-                                    "type": sanitized.openai_type_slug(),
-                                    "code": sanitized.status().as_u16(),
+                                    "message": envelope_message,
+                                    "type": envelope_type,
+                                    "code": envelope_code,
                                 }
                             });
                             yield Event::default().data(err_json.to_string());
@@ -262,8 +456,13 @@ fn monitor_for_disconnects_with_timeout(
                             break;
                         }
                         None => {
-                            // Stream ended normally
-                            inflight_guard.mark_ok();
+                            match &*finish_reason_rx.borrow() {
+                                Some(FinishReason::Error(_)) => {
+                                    inflight_guard.mark_error(ErrorType::BackendError);
+                                }
+                                Some(_) => inflight_guard.mark_ok(),
+                                None => inflight_guard.mark_error(ErrorType::TruncatedStream),
+                            }
                             stream_handle.disarm();
 
                             // todo: if we yield a dynamo sentinel event, we need to do it before the done or the
@@ -303,17 +502,28 @@ fn monitor_for_disconnects_with_timeout(
                 } => {
                     inflight_guard.mark_error(ErrorType::ResponseTimeout);
                     stream_handle.disarm();
+                    let phase = if content_seen { "stream" } else { "ttft" };
                     tracing::warn!(
                         request_id = %inflight_guard.request_id(),
                         model = %inflight_guard.model(),
                         endpoint = %inflight_guard.endpoint(),
                         request_type = %inflight_guard.request_type(),
+                        phase,
                         error_type = "response_timeout",
                         elapsed_ms = %inflight_guard.elapsed_ms(),
                         timeout_secs = ?inactivity_timeout.map(|d| d.as_secs()),
                         "backend stream inactivity timeout; killing engine context to release inflight gauge"
                     );
                     context.kill();
+                    let err_json = serde_json::json!({
+                        "error": {
+                            "message": "backend stream inactivity timeout",
+                            "type": "timeout",
+                            "code": 504,
+                        }
+                    });
+                    yield Event::default().data(err_json.to_string());
+                    yield Event::default().data("[DONE]");
                     break;
                 }
             }
@@ -326,6 +536,7 @@ mod tests {
     use super::*;
     use crate::http::service::metrics::{Endpoint, ErrorType, RequestType, Status};
     use futures::StreamExt;
+    use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug, Default)]
@@ -774,5 +985,306 @@ mod tests {
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    struct TimeoutEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl TimeoutEnvGuard {
+        fn cleared() -> Self {
+            let vars = [
+                BACKEND_STREAM_TIMEOUT_ENV,
+                BACKEND_TTFT_TIMEOUT_ENV,
+                SSE_INACTIVITY_TIMEOUT_ENV,
+            ];
+            let saved = vars
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            for name in vars {
+                // SAFETY: timeout env tests are serialized and the original
+                // process values are restored by this guard.
+                unsafe { std::env::remove_var(name) };
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for TimeoutEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                // SAFETY: timeout env tests are serialized and this restores
+                // the exact process state captured at test entry.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_timeout_env(name: &str, value: &str) {
+        // SAFETY: callers hold the serial timeout-env test lock.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    #[test]
+    #[serial]
+    fn test_sse_timeout_precedence_and_zero_fallback() {
+        let _env = TimeoutEnvGuard::cleared();
+        assert_eq!(backend_stream_timeout(), None);
+
+        set_timeout_env(BACKEND_STREAM_TIMEOUT_ENV, "5");
+        assert_eq!(backend_stream_timeout(), Some(Duration::from_secs(10)));
+
+        set_timeout_env(SSE_INACTIVITY_TIMEOUT_ENV, "45");
+        assert_eq!(backend_stream_timeout(), Some(Duration::from_secs(45)));
+
+        set_timeout_env(SSE_INACTIVITY_TIMEOUT_ENV, "0");
+        assert_eq!(backend_stream_timeout(), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    #[serial]
+    fn test_sse_timeout_override_governs_both_phases() {
+        let _env = TimeoutEnvGuard::cleared();
+        set_timeout_env(BACKEND_STREAM_TIMEOUT_ENV, "10");
+        set_timeout_env(BACKEND_TTFT_TIMEOUT_ENV, "5");
+        set_timeout_env(SSE_INACTIVITY_TIMEOUT_ENV, "60");
+
+        assert_eq!(backend_stream_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(backend_ttft_timeout(), Some(Duration::from_secs(60)));
+        assert!(validate_backend_stream_timeouts().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_sse_timeout_validation_rejects_primary_timer_races() {
+        let _env = TimeoutEnvGuard::cleared();
+        set_timeout_env(BACKEND_STREAM_TIMEOUT_ENV, "30");
+        set_timeout_env(SSE_INACTIVITY_TIMEOUT_ENV, "30");
+        let err = validate_backend_stream_timeouts().expect_err("equal timers must be rejected");
+        assert!(err.to_string().contains(BACKEND_STREAM_TIMEOUT_ENV));
+
+        set_timeout_env(BACKEND_STREAM_TIMEOUT_ENV, "4");
+        set_timeout_env(BACKEND_TTFT_TIMEOUT_ENV, "10");
+        set_timeout_env(SSE_INACTIVITY_TIMEOUT_ENV, "5");
+        let err = validate_backend_stream_timeouts().expect_err("TTFT inversion must be rejected");
+        assert!(err.to_string().contains(BACKEND_TTFT_TIMEOUT_ENV));
+    }
+
+    #[tokio::test]
+    async fn test_clean_close_metrics_distinguish_backend_error_and_truncation() {
+        for (case, finish_reason, expected) in [
+            (
+                "backend-error",
+                Some(FinishReason::Error("worker failed".to_string())),
+                ErrorType::BackendError,
+            ),
+            ("truncated", None, ErrorType::TruncatedStream),
+        ] {
+            let (metrics, guard, context, handle) = setup_test(case, case);
+            let (_finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(finish_reason);
+            let stream = futures::stream::empty::<Result<Event, axum::Error>>();
+            let monitored = monitor_for_disconnects_inner(
+                stream,
+                context,
+                guard,
+                handle,
+                finish_reason_rx,
+                None,
+                None,
+                None,
+            );
+            let body = collect_sse_body(monitored).await;
+
+            assert!(body.contains("data: [DONE]"));
+            assert_eq!(
+                metrics.get_request_counter(
+                    case,
+                    &Endpoint::ChatCompletions,
+                    &RequestType::Stream,
+                    &Status::Error,
+                    &expected,
+                ),
+                1,
+                "{case} metric was not recorded",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_timeout_errors_emit_specific_sse_envelopes_and_metrics() {
+        for (case, dynamo_type, metric, wire_type, message) in [
+            (
+                "first-token",
+                DynamoErrorType::FirstTokenTimeout,
+                ErrorType::FirstTokenTimeout,
+                "first_token_timeout",
+                "backend time-to-first-token timeout",
+            ),
+            (
+                "intra-token",
+                DynamoErrorType::IntraTokenTimeout,
+                ErrorType::IntraTokenTimeout,
+                "intra_token_timeout",
+                "backend response inactivity timeout",
+            ),
+        ] {
+            let (metrics, guard, context, handle) = setup_test(case, case);
+            let error = DynamoError::builder()
+                .error_type(dynamo_type)
+                .message(message)
+                .build();
+            let stream = futures::stream::iter([Err::<Event, _>(axum::Error::new(error))]);
+            let (_finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(None);
+            let monitored = monitor_for_disconnects_inner(
+                stream,
+                context,
+                guard,
+                handle,
+                finish_reason_rx,
+                None,
+                None,
+                None,
+            );
+            let body = collect_sse_body(monitored).await;
+            let error_payload = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .find_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+                .expect("structured timeout payload");
+
+            assert_eq!(error_payload["error"]["type"], wire_type);
+            assert_eq!(error_payload["error"]["code"], 504);
+            assert_eq!(error_payload["error"]["message"], message);
+            assert!(body.contains("data: [DONE]"));
+            assert_eq!(
+                metrics.get_request_counter(
+                    case,
+                    &Endpoint::ChatCompletions,
+                    &RequestType::Stream,
+                    &Status::Error,
+                    &metric,
+                ),
+                1,
+                "{case} timeout metric was not recorded",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_stream_error_kills_context() {
+        let model = "stream-error-cancellation";
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            model,
+            Endpoint::ChatCompletions,
+            true,
+            "stream-error-cancellation",
+        );
+        let context = Arc::new(MockContext::with_kill_tracking());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+        let error = DynamoError::builder()
+            .error_type(DynamoErrorType::IntraTokenTimeout)
+            .message("one batch prompt timed out")
+            .build();
+        let stream = futures::stream::iter([Err::<Event, _>(axum::Error::new(error))]);
+        let (_finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(None);
+        let monitored = monitor_for_disconnects_inner(
+            stream,
+            engine_context,
+            guard,
+            handle,
+            finish_reason_rx,
+            None,
+            None,
+            None,
+        );
+
+        let _body = collect_sse_body(monitored).await;
+
+        assert!(
+            context.is_killed(),
+            "terminal stream errors must cancel linked sibling requests"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ttft_window_survives_leading_non_content_event() {
+        let (metrics, guard, context, handle) = setup_test("ttft-leading", "ttft-leading");
+        let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = async_stream::try_stream! {
+            yield Event::default().data("annotation");
+            std::future::pending::<()>().await;
+        };
+        let (_finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(None);
+        let monitored = monitor_for_disconnects_inner(
+            stream,
+            context,
+            guard,
+            handle,
+            finish_reason_rx,
+            Some(first_token_seen),
+            None,
+            Some(Duration::from_secs(2)),
+        );
+        tokio::pin!(monitored);
+
+        assert!(monitored.next().await.is_some(), "leading event missing");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while monitored.next().await.is_some() {}
+        })
+        .await
+        .expect("TTFT safety net did not fire after a non-content event");
+
+        assert_eq!(
+            metrics.get_request_counter(
+                "ttft-leading",
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::ResponseTimeout,
+            ),
+            1,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ttft_window_releases_after_first_real_token() {
+        let (_metrics, guard, context, handle) = setup_test("ttft-release", "ttft-release");
+        let first_token_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer_flag = first_token_seen.clone();
+        let stream = async_stream::try_stream! {
+            yield Event::default().data("annotation");
+            producer_flag.store(true, std::sync::atomic::Ordering::Release);
+            yield Event::default().data("real-token");
+            std::future::pending::<()>().await;
+        };
+        let (_finish_reason_tx, finish_reason_rx) = tokio::sync::watch::channel(None);
+        let monitored = monitor_for_disconnects_inner(
+            stream,
+            context,
+            guard,
+            handle,
+            finish_reason_rx,
+            Some(first_token_seen),
+            None,
+            Some(Duration::from_secs(2)),
+        );
+        tokio::pin!(monitored);
+
+        assert!(monitored.next().await.is_some(), "leading event missing");
+        assert!(monitored.next().await.is_some(), "real token missing");
+        let next = tokio::time::timeout(Duration::from_secs(3), monitored.next()).await;
+        assert!(
+            next.is_err(),
+            "TTFT timer remained armed after real content"
+        );
     }
 }
