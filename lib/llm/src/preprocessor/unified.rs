@@ -103,7 +103,6 @@ impl vllm_tokenizer::Tokenizer for VllmTokenizerAdapter {
 struct ChoiceState {
     choice_index: u32,
     parser_name: &'static str,
-    reasoning_split: bool,
     parser: Box<dyn UnifiedParser>,
     parser_failed: bool,
     emitted_tool_calls: bool,
@@ -112,16 +111,10 @@ struct ChoiceState {
 }
 
 impl ChoiceState {
-    fn new(
-        parser: Box<dyn UnifiedParser>,
-        choice_index: u32,
-        parser_name: &'static str,
-        reasoning_split: bool,
-    ) -> Self {
+    fn new(parser: Box<dyn UnifiedParser>, choice_index: u32, parser_name: &'static str) -> Self {
         Self {
             choice_index,
             parser_name,
-            reasoning_split,
             parser,
             parser_failed: false,
             emitted_tool_calls: false,
@@ -200,11 +193,8 @@ impl ChoiceState {
             UnifiedParserEvent::Text(text) => {
                 choice.delta.content = Some(ChatCompletionMessageContent::Text(text));
             }
-            UnifiedParserEvent::Reasoning(reasoning) if self.reasoning_split => {
-                choice.delta.reasoning_content = Some(reasoning);
-            }
             UnifiedParserEvent::Reasoning(reasoning) => {
-                choice.delta.content = Some(ChatCompletionMessageContent::Text(reasoning));
+                choice.delta.reasoning_content = Some(reasoning);
             }
             UnifiedParserEvent::ToolCall(call) => {
                 let chunk = self.tool_call_chunk(call)?;
@@ -257,8 +247,6 @@ struct UnifiedOutputProcessor {
     tools: Arc<Vec<Tool>>,
     tokenizer: DynTokenizer,
     prompt_token_ids: Arc<Vec<u32>>,
-    reasoning_split: bool,
-    request_id: String,
     choices: HashMap<u32, ChoiceState>,
     spare_parser: Option<Box<dyn UnifiedParser>>,
     last_response: Option<Annotated<NvCreateChatCompletionStreamResponse>>,
@@ -270,8 +258,6 @@ impl UnifiedOutputProcessor {
         tools: Vec<Tool>,
         tokenizer: DynTokenizer,
         prompt_token_ids: Vec<u32>,
-        reasoning_split: bool,
-        request_id: String,
     ) -> anyhow::Result<Self> {
         let parser =
             parser_spec.create_initialized(&tools, tokenizer.clone(), &prompt_token_ids)?;
@@ -280,8 +266,6 @@ impl UnifiedOutputProcessor {
             tools: Arc::new(tools),
             tokenizer,
             prompt_token_ids: Arc::new(prompt_token_ids),
-            reasoning_split,
-            request_id,
             choices: HashMap::new(),
             spare_parser: Some(parser),
             last_response: None,
@@ -300,7 +284,6 @@ impl UnifiedOutputProcessor {
                 Ok(parser) => parser,
                 Err(error) => {
                     tracing::warn!(
-                        request_id = %self.request_id,
                         choice_index,
                         parser = self.parser_spec.name,
                         error = %error,
@@ -314,7 +297,6 @@ impl UnifiedOutputProcessor {
             parser,
             choice_index,
             self.parser_spec.name,
-            self.reasoning_split,
         ))
     }
 
@@ -490,6 +472,7 @@ fn emit_choices(
             if position != last {
                 data.inner.usage = None;
                 data.nvext = None;
+                data.llm_metrics = None;
             }
             emitted
         })
@@ -519,8 +502,6 @@ fn unified_output_stream<S>(
     tools: &[ChatCompletionTool],
     tokenizer: Arc<dyn DynamoTokenizer>,
     prompt_token_ids: &[u32],
-    reasoning_split: bool,
-    request_id: String,
 ) -> anyhow::Result<UnifiedOutputStream>
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -531,8 +512,6 @@ where
         convert_tools(tools),
         tokenizer,
         prompt_token_ids.to_vec(),
-        reasoning_split,
-        request_id,
     )?;
 
     Ok(Box::pin(stream! {

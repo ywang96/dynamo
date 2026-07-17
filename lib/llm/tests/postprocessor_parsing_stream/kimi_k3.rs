@@ -127,7 +127,6 @@ async fn preserves_unified_event_order() {
             &request,
             true,
             false,
-            "kimi-k3-order".to_string(),
             &[1, 3, 2],
         )
         .unwrap()
@@ -200,7 +199,6 @@ async fn keeps_choice_state_isolated() {
             &request,
             false,
             false,
-            "kimi-k3-choices".to_string(),
             &[1, 4, 2],
         )
         .unwrap()
@@ -256,7 +254,6 @@ async fn does_not_emit_incomplete_tool_call() {
             &request,
             false,
             false,
-            "kimi-k3-incomplete".to_string(),
             &[1, 4, 2],
         )
         .unwrap()

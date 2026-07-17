@@ -32,8 +32,6 @@ pub(in crate::preprocessor) fn output_stream<S>(
     tools: &[ChatCompletionTool],
     tokenizer: Arc<dyn DynamoTokenizer>,
     prompt_token_ids: &[u32],
-    reasoning_split: bool,
-    request_id: String,
 ) -> anyhow::Result<UnifiedOutputStream>
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -47,7 +45,5 @@ where
         tools,
         tokenizer,
         prompt_token_ids,
-        reasoning_split,
-        request_id,
     )
 }

@@ -2131,7 +2131,6 @@ impl OpenAIPreprocessor {
             request,
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
-            String::new(),
             &[],
         )
     }
@@ -2143,7 +2142,6 @@ impl OpenAIPreprocessor {
         request: &NvCreateChatCompletionRequest,
         prompt_injected_reasoning: bool,
         uses_tool_call_structural_tag: bool,
-        request_id: String,
         prompt_token_ids: &[u32],
     ) -> anyhow::Result<
         impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -2151,7 +2149,6 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
-        let reasoning_split = request.reasoning_split().unwrap_or(true);
         if unified::kimi_k3::is_selected(
             self.runtime_config.reasoning_parser.as_deref(),
             self.tool_call_parser.as_deref(),
@@ -2162,8 +2159,6 @@ impl OpenAIPreprocessor {
                     request.inner.tools.as_deref().unwrap_or_default(),
                     self.tokenizer.clone(),
                     prompt_token_ids,
-                    reasoning_split,
-                    request_id,
                 )?;
             return Ok(transformed_stream);
         }
@@ -3515,7 +3510,6 @@ impl
             &request,
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
-            request_id.clone(),
             &prompt_token_ids,
         )?;
 
