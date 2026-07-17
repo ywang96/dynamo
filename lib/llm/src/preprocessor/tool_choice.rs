@@ -3,7 +3,7 @@
 
 //! Tool-choice guided decoding policy for OpenAI chat requests.
 
-use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest};
+use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest, unified};
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 use crate::protocols::openai::tools::get_json_schema_from_tools;
 
@@ -30,6 +30,16 @@ impl OpenAIPreprocessor {
         common_request: &mut PreprocessedRequest,
         prompt_injected_reasoning: bool,
     ) -> Result<bool, DynamoError> {
+        if unified::kimi_k3::is_selected(
+            self.runtime_config.reasoning_parser.as_deref(),
+            self.tool_call_parser.as_deref(),
+        ) {
+            // TODO: Add Kimi K3-native tool-choice constraints once guided decoding can
+            // express its XTML tools/call/argument grammar. The available generic JSON
+            // schema and structural-tag formats do not match the unified K3 parser.
+            return Ok(false);
+        }
+
         let tool_choice = request
             .inner
             .tool_choice
