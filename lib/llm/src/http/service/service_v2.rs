@@ -60,6 +60,31 @@ async fn echo_request_id_header(
     response
 }
 
+/// Env var carrying the provider deployment id, surfaced via the
+/// `X-Msh-ProviderDeployId` response header so upstreams (e.g. Moonshot's
+/// verifier) can detect provider version drift — a breaking-change tripwire.
+/// Stamped at rollout; **required** — the service refuses to start unless this
+/// resolves to a valid value, so the header is present on every response.
+const ENV_PROVIDER_DEPLOY_ID: &str = "DYN_PROVIDER_DEPLOY_ID";
+
+/// Pure core of [`provider_deploy_id`]: turn a raw id into a response-header
+/// value. Blank (after trim) or header-invalid input yields `None` (the header
+/// is then omitted). Split out so it is testable without mutating global env.
+fn provider_deploy_id_from(raw: Option<&str>) -> Option<axum::http::HeaderValue> {
+    let v = raw?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    axum::http::HeaderValue::from_str(v).ok()
+}
+
+/// Provider deployment id from [`ENV_PROVIDER_DEPLOY_ID`], as a response-header
+/// value. `None` when unset/blank/invalid; the caller treats that as fatal —
+/// the deploy id is required, so the service refuses to start.
+fn provider_deploy_id() -> Option<axum::http::HeaderValue> {
+    provider_deploy_id_from(std::env::var(ENV_PROVIDER_DEPLOY_ID).ok().as_deref())
+}
+
 async fn track_inflight_inference(
     axum::extract::State(state): axum::extract::State<Arc<State>>,
     request: axum::extract::Request,
@@ -1078,6 +1103,22 @@ impl HttpServiceConfigBuilder {
         // Echo x-request-id from request to response headers for client correlation
         let router = router.layer(axum::middleware::from_fn(echo_request_id_header));
 
+        // `X-Msh-ProviderDeployId` is REQUIRED: refuse to start unless
+        // `DYN_PROVIDER_DEPLOY_ID` resolves to a valid header value, so no
+        // response can ever ship without the provider version-drift tripwire.
+        // Value is read once here (stamped at rollout).
+        let deploy_id = provider_deploy_id().ok_or_else(|| {
+            anyhow::anyhow!(
+                "DYN_PROVIDER_DEPLOY_ID must be set to a non-empty, header-valid \
+                 value: X-Msh-ProviderDeployId is required and it is currently \
+                 unset, blank, or not a valid header value"
+            )
+        })?;
+        let router = router.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-msh-providerdeployid"),
+            deploy_id,
+        ));
+
         let enable_rl_router = config.enable_rl || env_is_truthy("DYN_ENABLE_RL");
         let rl_router = if enable_rl_router {
             let Some(drt) = config.runtime.as_ref() else {
@@ -1248,6 +1289,31 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn provider_deploy_id_none_when_unset() {
+        assert_eq!(provider_deploy_id_from(None), None);
+    }
+
+    #[test]
+    fn provider_deploy_id_none_when_blank() {
+        assert_eq!(provider_deploy_id_from(Some("")), None);
+        assert_eq!(provider_deploy_id_from(Some("   ")), None);
+    }
+
+    #[test]
+    fn provider_deploy_id_reads_and_trims_value() {
+        assert_eq!(
+            provider_deploy_id_from(Some("  inferact-kimi-testing  ")),
+            Some(axum::http::HeaderValue::from_static("inferact-kimi-testing"))
+        );
+    }
+
+    #[test]
+    fn provider_deploy_id_none_when_invalid_header() {
+        // A newline is not a legal header value → omit rather than send garbage.
+        assert_eq!(provider_deploy_id_from(Some("bad\nvalue")), None);
+    }
 
     async fn wait_for_service_stage(state: &State, expected: ServiceStage) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
