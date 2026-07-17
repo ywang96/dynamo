@@ -44,7 +44,6 @@ use dynamo_runtime::metrics::frontend_perf::{
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 use tracing;
 
-#[cfg(feature = "mm-routing")]
 use crate::model_card::ModelInfoType;
 use crate::model_card::{ModelDeploymentCard, ModelInfo};
 use crate::preprocessor::media::MediaLoader;
@@ -221,10 +220,10 @@ impl MultimodalCounts {
 
 /// Derive the model's local directory from the MDC. The directory is the
 /// parent of `config.json` (which lives in `mdc.model_info` as `HfConfigJson`)
-/// and contains the other artifacts MM-aware routing reads at startup
-/// (`tokenizer.json`, `processor_config.json`, `preprocessor_config.json`).
+/// and contains the other startup artifacts (`tokenizer.json`,
+/// `processor_config.json`, `preprocessor_config.json`, `tiktoken.model`).
+/// Used by MM-aware routing and by the Kimi-K3 native renderer.
 /// Returns `None` for cards built from non-disk sources.
-#[cfg(feature = "mm-routing")]
 fn mdc_model_dir(mdc: &ModelDeploymentCard) -> Option<std::path::PathBuf> {
     let ModelInfoType::HfConfigJson(cf) = mdc.model_info.as_ref()?;
     cf.path()?.parent().map(std::path::PathBuf::from)
@@ -313,6 +312,12 @@ pub struct OpenAIPreprocessor {
     /// doesn't round-trip to a single id.
     #[cfg(feature = "mm-routing")]
     routing_prepend_bos: Option<crate::protocols::TokenIdType>,
+    /// Kimi-K3 native XTML renderer. `Some` only when the MDC's
+    /// `model_type` is `kimi_k3`; the preprocess flow then renders prompts
+    /// straight to token IDs (per-segment special-token control) and never
+    /// takes the String-template + re-tokenize path, which would let literal
+    /// marker text in user content forge XTML structure.
+    kimi_k3_renderer: Option<Arc<prompt::kimi_k3::encoder::KimiK3Renderer>>,
 }
 
 impl OpenAIPreprocessor {
@@ -620,6 +625,26 @@ impl OpenAIPreprocessor {
         let model_info = model_info.get_model_info()?;
         let tool_call_parser = mdc.runtime_config.tool_call_parser.clone();
 
+        // Kimi-K3 renders prompts natively to token IDs (segments encoded
+        // with per-segment special-token control). Build the renderer up
+        // front — fail loud at startup on a broken model dir — so the
+        // preprocess flow can bypass the String-template path entirely.
+        let kimi_k3_renderer = if prompt::kimi_k3::is_kimi_k3_model_type(&model_info.model_type()) {
+            let dir = mdc_model_dir(&mdc).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Kimi-K3 requires a local model directory (config.json on disk) \
+                         to build its native renderer"
+                )
+            })?;
+            Some(Arc::new(
+                prompt::kimi_k3::encoder::KimiK3Renderer::from_model_dir(&dir).with_context(
+                    || format!("Failed to build Kimi-K3 renderer from {}", dir.display()),
+                )?,
+            ))
+        } else {
+            None
+        };
+
         if let Some(ref lora_name) = lora_name {
             tracing::info!(model = %mdc.display_name, lora_name, "LoRA adapter detected in MDC");
         }
@@ -813,6 +838,7 @@ impl OpenAIPreprocessor {
             routing_image_token_id,
             #[cfg(feature = "mm-routing")]
             routing_prepend_bos,
+            kimi_k3_renderer,
         }))
     }
 
@@ -864,30 +890,52 @@ impl OpenAIPreprocessor {
         let preprocess_start = Instant::now();
         let mut builder = self.builder(request)?;
 
-        let template_start = Instant::now();
-        let formatted_prompt = {
-            let _nvtx = dynamo_nvtx_range!("preprocess.template");
-            self.apply_template(request)
-                .with_context(|| "Failed to apply prompt template")?
-        };
-        TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
+        // Kimi-K3 bypasses the String-template + re-tokenize path entirely:
+        // its native renderer emits token IDs with per-segment special-token
+        // control, so literal marker text in user content cannot forge XTML
+        // structure. `formatted_prompt` stays `None` (downstream consumers
+        // tolerate it, as with pre-tokenized inputs) and no template/token
+        // annotations are produced for K3.
+        let (token_ids, annotations, formatted_prompt) =
+            if let Some(k3) = self.kimi_k3_renderer.as_ref() {
+                let tokenize_start = Instant::now();
+                let ids = {
+                    let _nvtx = dynamo_nvtx_range!("preprocess.tokenize");
+                    k3.render_to_ids(request)
+                        .with_context(|| "Failed to render Kimi K3 prompt")?
+                };
+                TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
+                (ids, HashMap::new(), None)
+            } else {
+                let template_start = Instant::now();
+                let formatted_prompt = {
+                    let _nvtx = dynamo_nvtx_range!("preprocess.template");
+                    self.apply_template(request)
+                        .with_context(|| "Failed to apply prompt template")?
+                };
+                TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
+
+                let tokenize_start = Instant::now();
+                let (token_ids, annotations) = {
+                    let _nvtx = dynamo_nvtx_range!("preprocess.tokenize");
+                    self.gather_tokens(request, formatted_prompt.as_deref(), tracker)
+                        .await
+                        .with_context(|| "Failed to gather tokens")?
+                };
+                TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
+                (token_ids, annotations, formatted_prompt)
+            };
 
         // Generic reasoning parsers start from `<think>`; MiniMax M3 starts
         // from `<mm:think>`. If the chat template injected that opener at the
         // end of the prompt, the model completion starts mid-reasoning.
+        // Kimi-K3 has no String prompt: its arm keys off the request's
+        // effective thinking flag instead.
         let prompt_injected_reasoning = Self::prompt_injected_reasoning_start(
             self.runtime_config.reasoning_parser.as_deref(),
             formatted_prompt.as_deref(),
+            request.chat_template_args(),
         );
-
-        let tokenize_start = Instant::now();
-        let (token_ids, annotations) = {
-            let _nvtx = dynamo_nvtx_range!("preprocess.tokenize");
-            self.gather_tokens(request, formatted_prompt.as_deref(), tracker)
-                .await
-                .with_context(|| "Failed to gather tokens")?
-        };
-        TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
 
         let _mm_image_entries = self
             .gather_multi_modal_data(
@@ -3025,7 +3073,16 @@ impl OpenAIPreprocessor {
     fn prompt_injected_reasoning_start(
         reasoning_parser: Option<&str>,
         formatted_prompt: Option<&str>,
+        chat_template_args: Option<&HashMap<String, serde_json::Value>>,
     ) -> bool {
+        // Kimi-K3 renders to token IDs, so there is no String prompt to
+        // inspect. Its native renderer ends the prompt inside the think
+        // channel (`<|open|>think<|sep|>` prefill) whenever thinking is
+        // effectively enabled — which is the default when unspecified.
+        if matches!(reasoning_parser, Some("kimi_k3")) {
+            return dynamo_renderer::thinking_bool_from_args(chat_template_args).unwrap_or(true);
+        }
+
         let Some(prompt) = formatted_prompt.map(str::trim_end) else {
             return false;
         };
@@ -3044,8 +3101,11 @@ impl OpenAIPreprocessor {
             reasoning_parser,
             Some("minimax_m2" | "minimax_m3" | "minimax-m3")
         );
+        // The `should_forward` guard excludes kimi_k3, so the K3 arm inside
+        // prompt_injected_reasoning_start is unreachable here and the
+        // template-args parameter is irrelevant (`None`).
         if should_forward
-            && Self::prompt_injected_reasoning_start(reasoning_parser, formatted_prompt)
+            && Self::prompt_injected_reasoning_start(reasoning_parser, formatted_prompt, None)
         {
             Some(false)
         } else {
@@ -4255,11 +4315,54 @@ mod tests {
 
         for (parser, prompt, expected, desc) in cases {
             assert_eq!(
-                OpenAIPreprocessor::prompt_injected_reasoning_start(parser, prompt),
+                OpenAIPreprocessor::prompt_injected_reasoning_start(parser, prompt, None),
                 expected,
                 "FAILED: {desc}",
             );
         }
+    }
+
+    #[test]
+    fn test_prompt_injected_reasoning_start_kimi_k3() {
+        let args_with = |v: serde_json::Value| {
+            let mut m = HashMap::new();
+            m.insert("thinking".to_string(), v);
+            m
+        };
+
+        // No String prompt exists for K3 (token-ID render); thinking default ON.
+        assert!(OpenAIPreprocessor::prompt_injected_reasoning_start(
+            Some("kimi_k3"),
+            None,
+            None
+        ));
+        // Explicitly enabled.
+        let args = args_with(serde_json::Value::Bool(true));
+        assert!(OpenAIPreprocessor::prompt_injected_reasoning_start(
+            Some("kimi_k3"),
+            None,
+            Some(&args)
+        ));
+        // Explicitly disabled: instruct mode, prompt ends in the response channel.
+        let args = args_with(serde_json::Value::Bool(false));
+        assert!(!OpenAIPreprocessor::prompt_injected_reasoning_start(
+            Some("kimi_k3"),
+            None,
+            Some(&args)
+        ));
+        // Non-bool thinking values fall back to default ON.
+        let args = args_with(serde_json::Value::String("disabled".to_string()));
+        assert!(OpenAIPreprocessor::prompt_injected_reasoning_start(
+            Some("kimi_k3"),
+            None,
+            Some(&args)
+        ));
+        // The K3 arm never inspects the prompt string.
+        assert!(OpenAIPreprocessor::prompt_injected_reasoning_start(
+            Some("kimi_k3"),
+            Some("no think marker here"),
+            None
+        ));
     }
 
     #[test]
