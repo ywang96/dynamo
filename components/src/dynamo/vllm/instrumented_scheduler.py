@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -130,6 +131,13 @@ ENV_FPM_BENCHMARK_OUTPUT_PATH = "DYN_FPM_BENCHMARK_OUTPUT_PATH"
 
 def _utc_now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# vLLM's prefill-cadence work added an optional ``throttle_prefills``
+# argument to Scheduler.schedule. Keep this wheel compatible with both that
+# fork and releases which still expose the zero-argument scheduler API.
+_PARENT_SCHEDULE_SUPPORTS_THROTTLE_PREFILLS = (
+    "throttle_prefills" in inspect.signature(AsyncScheduler.schedule).parameters
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1261,7 +1269,10 @@ class InstrumentedScheduler(AsyncScheduler):
     def _schedule_and_record_time(
         self, throttle_prefills: bool = False
     ) -> SchedulerOutput:
-        output = super().schedule(throttle_prefills)
+        if _PARENT_SCHEDULE_SUPPORTS_THROTTLE_PREFILLS:
+            output = super().schedule(throttle_prefills)
+        else:
+            output = super().schedule()
         if output.total_num_scheduled_tokens > 0:
             if self._bench_active:
                 try:

@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 from vllm.config import CUDAGraphMode  # noqa: E402
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler  # noqa: E402
 from vllm.v1.request import RequestStatus  # noqa: E402
 
 # Module-level import: triggers real site-packages ``vllm`` to load before
@@ -114,6 +115,42 @@ def _run_extract_scheduled(
         num_scheduled_tokens=num_scheduled_tokens,
     )
     return InstrumentedScheduler._extract_scheduled(stub, output)
+
+
+@pytest.mark.parametrize("supports_throttle_prefills", [False, True])
+def test_schedule_supports_both_parent_signatures(
+    monkeypatch, supports_throttle_prefills
+):
+    received = []
+
+    if supports_throttle_prefills:
+
+        def parent_schedule(_self, throttle_prefills=False):
+            received.append(throttle_prefills)
+            return SimpleNamespace(total_num_scheduled_tokens=0)
+
+    else:
+
+        def parent_schedule(_self):
+            received.append(None)
+            return SimpleNamespace(total_num_scheduled_tokens=0)
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", parent_schedule)
+    monkeypatch.setattr(
+        instrumented_scheduler_module,
+        "_PARENT_SCHEDULE_SUPPORTS_THROTTLE_PREFILLS",
+        supports_throttle_prefills,
+    )
+
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._schedule_times = []
+
+    output = InstrumentedScheduler._schedule_and_record_time(
+        stub, throttle_prefills=True
+    )
+
+    assert output.total_num_scheduled_tokens == 0
+    assert received == ([True] if supports_throttle_prefills else [None])
 
 
 # ---------------------------------------------------------------------------
