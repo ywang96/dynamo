@@ -38,8 +38,13 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
 
-from .prepost import StreamingPostProcessor, preprocess_chat_request
+from .prepost import (
+    KimiComplianceConfig,
+    StreamingPostProcessor,
+    preprocess_chat_request,
+)
 from .utils import (
+    PreprocessError,
     extract_mm_urls,
     handle_engine_error,
     make_internal_error,
@@ -201,6 +206,7 @@ class VllmProcessor:
         routed_engine: RoutedEngine,
         block_size: int = 16,
         enable_auto_tool_choice: bool = False,
+        kimi_compliance_config: KimiComplianceConfig | None = None,
     ):
         self.tokenizer = tokenizer
         self.input_processor = input_processor
@@ -211,6 +217,7 @@ class VllmProcessor:
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
         self.enable_auto_tool_choice = enable_auto_tool_choice
+        self.kimi_compliance_config = kimi_compliance_config or KimiComplianceConfig()
         # Sender for mm_kwargs transfer — instantiated lazily on first MM request.
         # MmKwargsShmSender for same-node transfers (default), MmKwargsNixlSender
         # for cross-node RDMA. Controlled by DYNAMO_MM_TRANSFER env var.
@@ -273,12 +280,12 @@ class VllmProcessor:
                 dynamo_preproc["extra_args"] = {}
             dynamo_preproc["extra_args"]["mm_hashes"] = mm_hashes_list
             dynamo_preproc["extra_args"]["mm_placeholders"] = mm_placeholders_list
-            dynamo_preproc["extra_args"][
-                "mm_hashes_by_modality"
-            ] = mm_hashes_by_modality
-            dynamo_preproc["extra_args"][
-                "mm_placeholders_by_modality"
-            ] = mm_placeholders_by_modality
+            dynamo_preproc["extra_args"]["mm_hashes_by_modality"] = (
+                mm_hashes_by_modality
+            )
+            dynamo_preproc["extra_args"]["mm_placeholders_by_modality"] = (
+                mm_placeholders_by_modality
+            )
             # Forward the expanded prompt_token_ids (with image placeholders)
             # so the backend can use them in the pre-rendered MultiModalInput.
             dynamo_preproc["extra_args"]["expanded_token_ids"] = list(
@@ -412,6 +419,7 @@ class VllmProcessor:
                 tool_parser_class=self.tool_parser_class,
                 exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
                 enable_auto_tool_choice=self.enable_auto_tool_choice,
+                kimi_compliance_config=self.kimi_compliance_config,
             )
 
         request_for_sampling = pre.request_for_sampling
@@ -481,9 +489,9 @@ class VllmProcessor:
         if request_for_sampling.cache_salt is not None:
             prompt_inputs["cache_salt"] = request_for_sampling.cache_salt
         if request_for_sampling.mm_processor_kwargs is not None:
-            prompt_inputs[
-                "mm_processor_kwargs"
-            ] = request_for_sampling.mm_processor_kwargs
+            prompt_inputs["mm_processor_kwargs"] = (
+                request_for_sampling.mm_processor_kwargs
+            )
 
         with _nvtx.annotate("mm_frontend:process_inputs", color="orange"):
             vllm_preproc: EngineCoreRequest = self.input_processor.process_inputs(
@@ -571,9 +579,9 @@ class VllmProcessor:
 
             # Forward mm_processor_kwargs (e.g. use_audio_in_video) to the backend.
             if request_for_sampling.mm_processor_kwargs is not None:
-                dynamo_preproc[
-                    "mm_processor_kwargs"
-                ] = request_for_sampling.mm_processor_kwargs
+                dynamo_preproc["mm_processor_kwargs"] = (
+                    request_for_sampling.mm_processor_kwargs
+                )
 
             def new_post_processor() -> StreamingPostProcessor:
                 return StreamingPostProcessor(
@@ -814,6 +822,14 @@ class VllmProcessor:
 
                 yield envelope
             _nvtx.end_range(rng_stream)
+        except PreprocessError as e:
+            logger.info("Rejected vLLM preprocessing request %s: %s", request_id, e)
+            yield {
+                "error": {
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                }
+            }
         except Exception as e:
             logger.exception("Error generating response for request %s", request_id)
             yield make_internal_error(request_id, str(e))
@@ -976,6 +992,14 @@ class EngineFactory:
             reasoning_parser_class = None
 
         block_size = self.config.kv_cache_block_size or 16
+        kimi_compliance_config = KimiComplianceConfig(
+            enabled=self.config.kimi_api_compliance,
+            default_max_completion_tokens=self.config.kimi_default_max_completion_tokens,
+            allowed_thinking_types=self.config.kimi_allowed_thinking_types,
+            default_reasoning_effort=self.config.kimi_default_reasoning_effort,
+            allowed_reasoning_efforts=self.config.kimi_allowed_reasoning_efforts,
+            allowed_top_p=self.config.kimi_allowed_top_p,
+        )
 
         gen = VllmProcessor(
             tokenizer,
@@ -986,6 +1010,7 @@ class EngineFactory:
             routed_engine,
             block_size=block_size,
             enable_auto_tool_choice=enable_auto_tool_choice,
+            kimi_compliance_config=kimi_compliance_config,
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none

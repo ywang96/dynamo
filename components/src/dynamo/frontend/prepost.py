@@ -23,14 +23,15 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils.async_utils import make_async
 
+from .utils import PreprocessError
+
 
 class _Renderer(Protocol):
     """Structural type for vLLM's chat-template renderer."""
 
     async def render_messages_async(
         self, messages: Any, params: ChatParams
-    ) -> tuple[Any, dict[str, Any]]:
-        ...
+    ) -> tuple[Any, dict[str, Any]]: ...
 
 
 @dataclass
@@ -44,6 +45,290 @@ class PreprocessResult:
 
 _ASYNC_TOKENIZER_POOL: dict[int, Callable[..., Awaitable[Any]]] = {}
 SKIP_REQUEST_VALIDATION = os.getenv("DYN_VLLM_SKIP_REQUEST_VALIDATION", "1") == "1"
+KIMI_DEFAULT_MAX_COMPLETION_TOKENS = 32768
+KIMI_THINKING_TEMPERATURE = 1.0
+KIMI_NON_THINKING_TEMPERATURE = 0.6
+KIMI_ALLOWED_TOP_P = (0.95, 1.0)
+KIMI_ALLOWED_THINKING_TYPES = ("enabled", "disabled")
+KIMI_ALLOWED_THINKING_KEEP = ("all", "interleaved")
+KIMI_ALLOWED_REASONING_EFFORTS = ("low", "high", "max")
+KIMI_DEFAULT_REASONING_EFFORT = "max"
+
+
+@dataclass(frozen=True)
+class KimiComplianceConfig:
+    enabled: bool = False
+    default_max_completion_tokens: int = KIMI_DEFAULT_MAX_COMPLETION_TOKENS
+    allowed_thinking_types: tuple[str, ...] = KIMI_ALLOWED_THINKING_TYPES
+    default_reasoning_effort: str | None = KIMI_DEFAULT_REASONING_EFFORT
+    allowed_reasoning_efforts: tuple[str, ...] = KIMI_ALLOWED_REASONING_EFFORTS
+    allowed_top_p: tuple[float, ...] = KIMI_ALLOWED_TOP_P
+
+
+def _nearly_equal(value: Any, expected: float) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and abs(float(value) - expected) < 1e-6
+    )
+
+
+def _validate_kimi_float(field: str, value: Any, expected: float) -> None:
+    if value is not None and not _nearly_equal(value, expected):
+        raise PreprocessError(f"Kimi request field {field} must be {expected}")
+
+
+def _validate_kimi_top_p(value: Any, allowed_top_p: tuple[float, ...]) -> None:
+    if value is None:
+        return
+    if not any(_nearly_equal(value, allowed) for allowed in allowed_top_p):
+        allowed = ", ".join(str(v) for v in allowed_top_p)
+        raise PreprocessError(f"Kimi request field top_p must be one of: {allowed}")
+
+
+def _default_kimi_top_p(allowed_top_p: tuple[float, ...]) -> float:
+    if any(_nearly_equal(allowed, 1.0) for allowed in allowed_top_p):
+        return 1.0
+    return allowed_top_p[0]
+
+
+def _validate_kimi_thinking_type(
+    thinking_type: str, config: KimiComplianceConfig
+) -> None:
+    if thinking_type not in config.allowed_thinking_types:
+        allowed = ", ".join(config.allowed_thinking_types)
+        raise PreprocessError(
+            f"Kimi request field thinking.type must be one of: {allowed}"
+        )
+
+
+def _validate_kimi_reasoning_effort(
+    reasoning_effort: Any, config: KimiComplianceConfig
+) -> str:
+    if not isinstance(reasoning_effort, str):
+        raise PreprocessError("Kimi request field reasoning_effort must be a string")
+    if reasoning_effort not in config.allowed_reasoning_efforts:
+        allowed = ", ".join(config.allowed_reasoning_efforts)
+        raise PreprocessError(
+            f"Kimi request field reasoning_effort must be one of: {allowed}"
+        )
+    return reasoning_effort
+
+
+def _raw_request_field(
+    request: dict[str, Any] | ChatCompletionRequest,
+    field: str,
+) -> Any:
+    if isinstance(request, dict):
+        return request.get(field)
+    value = getattr(request, field, None)
+    if value is not None:
+        return value
+    extra = getattr(request, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(field)
+    return None
+
+
+def _normalize_thinking_payload(thinking: Any) -> dict[str, Any] | None:
+    if thinking is None:
+        return None
+    if hasattr(thinking, "model_dump"):
+        thinking = thinking.model_dump(exclude_none=True)
+    if not isinstance(thinking, dict):
+        raise PreprocessError("Kimi request field thinking must be an object")
+    return thinking
+
+
+def _resolve_kimi_thinking_type(
+    request: dict[str, Any] | ChatCompletionRequest,
+    chat_template_kwargs: dict[str, Any],
+    config: KimiComplianceConfig,
+) -> str:
+    thinking = _normalize_thinking_payload(_raw_request_field(request, "thinking"))
+    if thinking is not None:
+        thinking_type = thinking.get("type") or "enabled"
+        _validate_kimi_thinking_type(thinking_type, config)
+        return thinking_type
+
+    # The Rust OpenAI ingress normalizes top-level `thinking` into
+    # `chat_template_args` / `chat_template_kwargs` before this Python frontend
+    # runs, so the raw field may already be gone by the time we get here.
+    thinking_mode = chat_template_kwargs.get("thinking_mode")
+    if thinking_mode is not None:
+        _validate_kimi_thinking_type(thinking_mode, config)
+        return thinking_mode
+
+    for key in ("thinking", "enable_thinking"):
+        value = chat_template_kwargs.get(key)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise PreprocessError(f"Kimi request field {key} must be a boolean")
+            thinking_type = "enabled" if value else "disabled"
+            _validate_kimi_thinking_type(thinking_type, config)
+            return thinking_type
+
+    _validate_kimi_thinking_type("enabled", config)
+    return "enabled"
+
+
+def _resolve_kimi_thinking_keep(
+    original_request: dict[str, Any] | ChatCompletionRequest,
+    chat_template_kwargs: dict[str, Any],
+    thinking_enabled: bool,
+) -> str | None:
+    if not thinking_enabled:
+        return None
+
+    thinking = _normalize_thinking_payload(
+        _raw_request_field(original_request, "thinking")
+    )
+    keep = thinking.get("keep") if thinking else None
+    if keep is None:
+        keep = chat_template_kwargs.get("thinking_keep")
+    if keep is None:
+        return "all"
+    if keep not in KIMI_ALLOWED_THINKING_KEEP:
+        allowed = ", ".join(KIMI_ALLOWED_THINKING_KEEP)
+        raise PreprocessError(
+            f"Kimi request field thinking.keep must be one of: {allowed}"
+        )
+    return keep
+
+
+def _resolve_kimi_reasoning_effort(
+    request_for_sampling: ChatCompletionRequest,
+    original_request: dict[str, Any] | ChatCompletionRequest,
+    chat_template_kwargs: dict[str, Any],
+    thinking_enabled: bool,
+    config: KimiComplianceConfig,
+) -> str | None:
+    thinking = _normalize_thinking_payload(
+        _raw_request_field(original_request, "thinking")
+    )
+    nested_effort = thinking.get("effort") if thinking else None
+
+    explicit_effort = getattr(request_for_sampling, "reasoning_effort", None)
+    if explicit_effort is None:
+        explicit_effort = _raw_request_field(original_request, "reasoning_effort")
+    if explicit_effort is None:
+        explicit_effort = chat_template_kwargs.get("reasoning_effort")
+    if explicit_effort is None:
+        explicit_effort = nested_effort
+
+    if not thinking_enabled:
+        if explicit_effort is not None and explicit_effort != nested_effort:
+            raise PreprocessError(
+                "Kimi request field reasoning_effort requires thinking.type=enabled"
+            )
+        return None
+
+    if explicit_effort is None:
+        explicit_effort = config.default_reasoning_effort
+    if explicit_effort is None:
+        return None
+    return _validate_kimi_reasoning_effort(explicit_effort, config)
+
+
+def _copy_request_with_updates(
+    request_for_sampling: ChatCompletionRequest,
+    updates: dict[str, Any],
+) -> ChatCompletionRequest:
+    if not updates:
+        return request_for_sampling
+    if hasattr(request_for_sampling, "model_copy"):
+        return request_for_sampling.model_copy(update=updates)
+    for field, value in updates.items():
+        setattr(request_for_sampling, field, value)
+    return request_for_sampling
+
+
+def _apply_kimi_compliance(
+    request_for_sampling: ChatCompletionRequest,
+    original_request: dict[str, Any] | ChatCompletionRequest,
+    chat_template_kwargs: dict[str, Any],
+    config: KimiComplianceConfig,
+) -> tuple[ChatCompletionRequest, dict[str, Any]]:
+    if not config.enabled:
+        return request_for_sampling, chat_template_kwargs
+
+    thinking_type = _resolve_kimi_thinking_type(
+        original_request, chat_template_kwargs, config
+    )
+    thinking_enabled = thinking_type == "enabled"
+    expected_temperature = (
+        KIMI_THINKING_TEMPERATURE if thinking_enabled else KIMI_NON_THINKING_TEMPERATURE
+    )
+    reasoning_effort = _resolve_kimi_reasoning_effort(
+        request_for_sampling,
+        original_request,
+        chat_template_kwargs,
+        thinking_enabled,
+        config,
+    )
+    thinking_keep = _resolve_kimi_thinking_keep(
+        original_request, chat_template_kwargs, thinking_enabled
+    )
+
+    _validate_kimi_float(
+        "temperature",
+        getattr(request_for_sampling, "temperature", None),
+        expected_temperature,
+    )
+    _validate_kimi_top_p(
+        getattr(request_for_sampling, "top_p", None), config.allowed_top_p
+    )
+    _validate_kimi_float(
+        "presence_penalty",
+        getattr(request_for_sampling, "presence_penalty", None),
+        0.0,
+    )
+    _validate_kimi_float(
+        "frequency_penalty",
+        getattr(request_for_sampling, "frequency_penalty", None),
+        0.0,
+    )
+    n = getattr(request_for_sampling, "n", None)
+    if n is not None and n != 1:
+        raise PreprocessError("Kimi request field n must be 1")
+
+    updates: dict[str, Any] = {
+        "temperature": expected_temperature,
+        "top_p": getattr(request_for_sampling, "top_p", None)
+        or _default_kimi_top_p(config.allowed_top_p),
+        "presence_penalty": (
+            getattr(request_for_sampling, "presence_penalty", None) or 0.0
+        ),
+        "frequency_penalty": (
+            getattr(request_for_sampling, "frequency_penalty", None) or 0.0
+        ),
+        "n": n or 1,
+        "reasoning_effort": reasoning_effort,
+    }
+    if (
+        getattr(request_for_sampling, "max_completion_tokens", None) is None
+        and getattr(request_for_sampling, "max_tokens", None) is None
+    ):
+        updates["max_completion_tokens"] = config.default_max_completion_tokens
+
+    chat_template_kwargs = dict(chat_template_kwargs)
+    chat_template_kwargs.update(
+        {
+            "thinking": thinking_enabled,
+            "enable_thinking": thinking_enabled,
+            "thinking_mode": thinking_type,
+            "reasoning_effort": reasoning_effort,
+        }
+    )
+    if thinking_keep == "all":
+        chat_template_kwargs["thinking_keep"] = "all"
+        chat_template_kwargs["preserve_thinking"] = True
+    else:
+        chat_template_kwargs.pop("thinking_keep", None)
+        chat_template_kwargs.pop("preserve_thinking", None)
+    return _copy_request_with_updates(
+        request_for_sampling, updates
+    ), chat_template_kwargs
 
 
 def _get_async_tokenizer(tokenizer: TokenizerLike) -> Callable[..., Awaitable[Any]]:
@@ -93,6 +378,7 @@ def _prepare_request(
     tool_parser_class: type[ToolParser] | None,
     exclude_tools_when_tool_choice_none: bool = True,
     enable_auto_tool_choice: bool = False,
+    kimi_compliance_config: KimiComplianceConfig | None = None,
 ) -> tuple[ChatCompletionRequest, ToolParser | None, dict[str, Any], Any, ChatParams]:
     """Validate request and build arguments for template rendering.
 
@@ -144,6 +430,12 @@ def _prepare_request(
     chat_template_kwargs = dict(
         request_for_sampling.chat_template_kwargs or raw_template_args or {}
     )
+    request_for_sampling, chat_template_kwargs = _apply_kimi_compliance(
+        request_for_sampling,
+        request,
+        chat_template_kwargs,
+        kimi_compliance_config or KimiComplianceConfig(),
+    )
     # Don't let an absent top-level field clobber a nested reasoning_effort.
     if request_for_sampling.reasoning_effort is not None:
         chat_template_kwargs["reasoning_effort"] = request_for_sampling.reasoning_effort
@@ -193,6 +485,7 @@ async def preprocess_chat_request(
     tool_parser_class: type[ToolParser] | None,
     exclude_tools_when_tool_choice_none: bool = True,
     enable_auto_tool_choice: bool = False,
+    kimi_compliance_config: KimiComplianceConfig | None = None,
 ) -> PreprocessResult:
     (
         request_for_sampling,
@@ -206,6 +499,7 @@ async def preprocess_chat_request(
         tool_parser_class=tool_parser_class,
         exclude_tools_when_tool_choice_none=exclude_tools_when_tool_choice_none,
         enable_auto_tool_choice=enable_auto_tool_choice,
+        kimi_compliance_config=kimi_compliance_config,
     )
 
     _, engine_prompt = await renderer.render_messages_async(messages, chat_params)

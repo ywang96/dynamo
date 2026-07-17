@@ -674,3 +674,46 @@ def test_session_affinity_ttl_rejects_out_of_range(ttl: int) -> None:
     )
     with pytest.raises(ValueError, match="router-session-affinity-ttl-secs"):
         config.validate()
+
+
+def test_frontend_kimi_compliance_flags_parse_and_validate() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    config = FrontendConfig.from_cli_args(
+        parser.parse_args(
+            [
+                "--kimi-api-compliance",
+                "--kimi-default-max-completion-tokens",
+                "1024",
+                "--kimi-allowed-thinking-types",
+                "enabled,disabled",
+                "--kimi-default-reasoning-effort",
+                "high",
+                "--kimi-allowed-reasoning-efforts",
+                "low,high,max",
+                "--kimi-allowed-top-p",
+                "0.95,1.0",
+            ]
+        )
+    )
+    config.validate()
+
+    assert config.kimi_api_compliance is True
+    assert config.kimi_default_max_completion_tokens == 1024
+    assert config.kimi_allowed_thinking_types == ("enabled", "disabled")
+    assert config.kimi_default_reasoning_effort == "high"
+    assert config.kimi_allowed_reasoning_efforts == ("low", "high", "max")
+    assert config.kimi_allowed_top_p == (0.95, 1.0)
+
+
+def test_frontend_kimi_compliance_rejects_medium_reasoning_effort() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    config = FrontendConfig.from_cli_args(
+        parser.parse_args(["--kimi-allowed-reasoning-efforts", "low,medium,high,max"])
+    )
+
+    with pytest.raises(ValueError, match="medium"):
+        config.validate()

@@ -137,13 +137,30 @@ impl NvCreateChatCompletionRequest {
             .map(openai_thinking_mode)
             .transpose()?
             .flatten();
+        let thinking_effort = self
+            .thinking
+            .as_ref()
+            .map(openai_thinking_effort)
+            .transpose()?
+            .flatten();
+        let thinking_keep = self
+            .thinking
+            .as_ref()
+            .map(openai_thinking_keep)
+            .transpose()?
+            .flatten();
+        let (thinking_effort, thinking_keep) = match thinking_mode {
+            Some(OpenAiThinkingMode::Disabled) => (None, None),
+            _ => (thinking_effort, thinking_keep),
+        };
         let reasoning_effort = self
             .inner
             .reasoning_effort
             .as_ref()
-            .and_then(|effort| serde_json::to_value(effort).ok());
+            .and_then(|effort| serde_json::to_value(effort).ok())
+            .or(thinking_effort);
 
-        if thinking_mode.is_none() && reasoning_effort.is_none() {
+        if thinking_mode.is_none() && reasoning_effort.is_none() && thinking_keep.is_none() {
             return Ok(());
         }
 
@@ -164,18 +181,15 @@ impl NvCreateChatCompletionRequest {
                         serde_json::Value::String("disabled".to_string()),
                     );
                 }
-                OpenAiThinkingMode::Adaptive => {
-                    args.insert(
-                        "thinking_mode".to_string(),
-                        serde_json::Value::String("adaptive".to_string()),
-                    );
-                }
             }
         }
         if let Some(effort) = reasoning_effort {
             args.entry("enable_thinking".to_string())
                 .or_insert_with(|| serde_json::Value::Bool(effort.as_str() != Some("none")));
             args.insert("reasoning_effort".to_string(), effort);
+        }
+        if let Some(keep) = thinking_keep {
+            args.insert("thinking_keep".to_string(), keep);
         }
 
         // The raw `thinking` payload has been folded into `chat_template_args`;
@@ -186,10 +200,48 @@ impl NvCreateChatCompletionRequest {
     }
 }
 
+#[derive(Clone, Copy)]
 enum OpenAiThinkingMode {
     Enabled,
     Disabled,
-    Adaptive,
+}
+
+fn openai_thinking_effort(value: &serde_json::Value) -> anyhow::Result<Option<serde_json::Value>> {
+    if value.as_bool().is_some() {
+        return Ok(None);
+    }
+
+    let Some(thinking_object) = value.as_object() else {
+        anyhow::bail!(
+            "`thinking` must be a boolean or an object with `type` set to `enabled` or `disabled`"
+        );
+    };
+    let Some(effort) = thinking_object.get("effort") else {
+        return Ok(None);
+    };
+    if !effort.is_string() {
+        anyhow::bail!("`thinking.effort` must be a string");
+    }
+    Ok(Some(effort.clone()))
+}
+
+fn openai_thinking_keep(value: &serde_json::Value) -> anyhow::Result<Option<serde_json::Value>> {
+    if value.as_bool().is_some() {
+        return Ok(None);
+    }
+
+    let Some(thinking_object) = value.as_object() else {
+        anyhow::bail!(
+            "`thinking` must be a boolean or an object with `type` set to `enabled` or `disabled`"
+        );
+    };
+    let Some(keep) = thinking_object.get("keep") else {
+        return Ok(None);
+    };
+    match keep.as_str() {
+        Some("all" | "interleaved") => Ok(Some(keep.clone())),
+        _ => anyhow::bail!("`thinking.keep` must be `all` or `interleaved`"),
+    }
 }
 
 fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<OpenAiThinkingMode>> {
@@ -203,17 +255,16 @@ fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<Open
 
     let Some(thinking_object) = value.as_object() else {
         anyhow::bail!(
-            "`thinking` must be a boolean or an object with `type` set to `enabled`, `disabled`, or `adaptive`"
+            "`thinking` must be a boolean or an object with `type` set to `enabled` or `disabled`"
         );
     };
     let Some(thinking_type) = thinking_object.get("type").and_then(|v| v.as_str()) else {
-        anyhow::bail!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`");
+        anyhow::bail!("`thinking.type` must be `enabled` or `disabled`");
     };
     match thinking_type {
         "enabled" => Ok(Some(OpenAiThinkingMode::Enabled)),
         "disabled" => Ok(Some(OpenAiThinkingMode::Disabled)),
-        "adaptive" => Ok(Some(OpenAiThinkingMode::Adaptive)),
-        _ => anyhow::bail!("`thinking.type` must be `enabled`, `disabled`, or `adaptive`"),
+        _ => anyhow::bail!("`thinking.type` must be `enabled` or `disabled`"),
     }
 }
 
@@ -1168,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_thinking_adaptive_normalizes_to_template_mode() {
+    fn test_openai_thinking_adaptive_is_rejected() {
         let json_str = json!({
             "model": "MiniMaxAI/MiniMax-M3",
             "messages": [
@@ -1179,17 +1230,10 @@ mod tests {
 
         let mut request: NvCreateChatCompletionRequest =
             serde_json::from_value(json_str).expect("Failed to deserialize request");
-        request
+        let err = request
             .normalize_reasoning_template_args()
-            .expect("adaptive thinking payload should normalize");
-
-        let args = request
-            .chat_template_args
-            .as_ref()
-            .expect("chat_template_args should be populated");
-        assert_eq!(args.get("thinking_mode"), Some(&json!("adaptive")));
-        assert_eq!(args.get("thinking"), None);
-        assert!(request.thinking.is_none());
+            .expect_err("adaptive thinking payload should be rejected");
+        assert!(err.to_string().contains("enabled` or `disabled"));
     }
 
     #[test]
@@ -1214,6 +1258,110 @@ mod tests {
             .expect("chat_template_args should be populated");
         assert_eq!(args.get("thinking"), Some(&json!(false)));
         assert_eq!(args.get("thinking_mode"), Some(&json!("disabled")));
+    }
+
+    #[test]
+    fn test_openai_thinking_effort_normalizes_to_reasoning_effort() {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K2.7-Code",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "thinking": {"type": "enabled", "effort": "high"}
+        });
+
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking effort should normalize");
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking"), Some(&json!(true)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
+        assert_eq!(args.get("reasoning_effort"), Some(&json!("high")));
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn test_openai_thinking_effort_is_ignored_when_thinking_disabled() {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K2.7-Code",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "thinking": {"type": "disabled", "effort": "high"}
+        });
+
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("disabled thinking effort should normalize");
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking"), Some(&json!(false)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("disabled")));
+        assert_eq!(args.get("reasoning_effort"), None);
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn test_openai_thinking_keep_normalizes_to_template_args() {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K2.7-Code",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "thinking": {"type": "enabled", "keep": "interleaved"}
+        });
+
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("thinking keep should normalize");
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking"), Some(&json!(true)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
+        assert_eq!(args.get("thinking_keep"), Some(&json!("interleaved")));
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn test_openai_thinking_keep_is_ignored_when_thinking_disabled() {
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K2.7-Code",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "thinking": {"type": "disabled", "keep": "all"}
+        });
+
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("disabled thinking keep should normalize");
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking"), Some(&json!(false)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("disabled")));
+        assert_eq!(args.get("thinking_keep"), None);
+        assert!(request.thinking.is_none());
     }
 
     #[test]

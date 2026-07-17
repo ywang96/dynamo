@@ -15,7 +15,8 @@ import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
 
-from dynamo.frontend.prepost import _prepare_request
+from dynamo.frontend.prepost import KimiComplianceConfig, _prepare_request
+from dynamo.frontend.utils import PreprocessError
 
 # NOTE: dynamo.frontend.vllm_processor is imported lazily inside the tests that
 # need it (and via the vllm_processor_module fixture). Importing it at module
@@ -99,9 +100,9 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             tool_parser_class=None,
             exclude_tools_when_tool_choice_none=True,
         )
-        assert (
-            chat_params.chat_template_kwargs["tools"] is None
-        ), "tool_choice=none with exclude flag should strip tools from template"
+        assert chat_params.chat_template_kwargs["tools"] is None, (
+            "tool_choice=none with exclude flag should strip tools from template"
+        )
 
     def test_tool_choice_none_keeps_tools_when_flag_off(self, tokenizer):
         """When exclude flag is off, tool_choice=none still includes tools in template kwargs."""
@@ -112,9 +113,9 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             exclude_tools_when_tool_choice_none=False,
         )
         tools = chat_params.chat_template_kwargs["tools"]
-        assert (
-            tools is not None and len(tools) == 1
-        ), "tool_choice=none with flag off should keep tools in template"
+        assert tools is not None and len(tools) == 1, (
+            "tool_choice=none with flag off should keep tools in template"
+        )
 
     def test_tool_choice_auto_keeps_tools(self, tokenizer):
         """tool_choice=auto should always include tools regardless of flag."""
@@ -125,9 +126,9 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             exclude_tools_when_tool_choice_none=True,
         )
         tools = chat_params.chat_template_kwargs["tools"]
-        assert (
-            tools is not None and len(tools) == 1
-        ), "tool_choice=auto should keep tools in template"
+        assert tools is not None and len(tools) == 1, (
+            "tool_choice=auto should keep tools in template"
+        )
 
     def test_tool_choice_required_keeps_tools(self, tokenizer):
         """tool_choice=required should always include tools regardless of flag."""
@@ -138,9 +139,9 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             exclude_tools_when_tool_choice_none=True,
         )
         tools = chat_params.chat_template_kwargs["tools"]
-        assert (
-            tools is not None and len(tools) == 1
-        ), "tool_choice=required should keep tools in template"
+        assert tools is not None and len(tools) == 1, (
+            "tool_choice=required should keep tools in template"
+        )
 
     def test_no_tools_in_request(self, tokenizer):
         """Request without tools should produce None tools in template kwargs."""
@@ -150,9 +151,9 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             tool_parser_class=None,
             exclude_tools_when_tool_choice_none=True,
         )
-        assert (
-            chat_params.chat_template_kwargs["tools"] is None
-        ), "No tools in request should produce None tools in template"
+        assert chat_params.chat_template_kwargs["tools"] is None, (
+            "No tools in request should produce None tools in template"
+        )
 
 
 class TestChatTemplateArgsPassthrough:
@@ -174,9 +175,9 @@ class TestChatTemplateArgsPassthrough:
             tokenizer=tokenizer,
             tool_parser_class=None,
         )
-        assert (
-            chat_params.chat_template_kwargs.get("enable_thinking") is False
-        ), "chat_template_args must be forwarded to the chat template"
+        assert chat_params.chat_template_kwargs.get("enable_thinking") is False, (
+            "chat_template_args must be forwarded to the chat template"
+        )
 
     def test_chat_template_kwargs_native_key_still_works(self, tokenizer):
         """The vLLM-native chat_template_kwargs key keeps working."""
@@ -189,9 +190,9 @@ class TestChatTemplateArgsPassthrough:
             tokenizer=tokenizer,
             tool_parser_class=None,
         )
-        assert (
-            chat_params.chat_template_kwargs.get("enable_thinking") is False
-        ), "native chat_template_kwargs must be forwarded to the chat template"
+        assert chat_params.chat_template_kwargs.get("enable_thinking") is False, (
+            "native chat_template_kwargs must be forwarded to the chat template"
+        )
 
     def test_nested_reasoning_effort_is_not_clobbered(self, tokenizer):
         """A reasoning_effort nested in template kwargs survives the top-level default."""
@@ -204,9 +205,9 @@ class TestChatTemplateArgsPassthrough:
             tokenizer=tokenizer,
             tool_parser_class=None,
         )
-        assert (
-            chat_params.chat_template_kwargs.get("reasoning_effort") == "high"
-        ), "nested reasoning_effort must not be overwritten by an absent top-level field"
+        assert chat_params.chat_template_kwargs.get("reasoning_effort") == "high", (
+            "nested reasoning_effort must not be overwritten by an absent top-level field"
+        )
 
     def test_top_level_reasoning_effort_wins_over_nested(self, tokenizer):
         """An explicit top-level reasoning_effort overrides a nested one."""
@@ -235,6 +236,182 @@ class TestChatTemplateArgsPassthrough:
         )
         # Renderer-managed value wins over the client's nested key (no crash either).
         assert chat_params.chat_template_kwargs["documents"] is None
+
+
+class TestKimiCompliance:
+    def _prepare(self, request, *, config=None):
+        request_for_sampling, _, chat_template_kwargs, _, chat_params = (
+            _prepare_request(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    **request,
+                },
+                tokenizer=object(),
+                tool_parser_class=None,
+                kimi_compliance_config=config or KimiComplianceConfig(enabled=True),
+            )
+        )
+        return request_for_sampling, chat_template_kwargs, chat_params
+
+    def test_kimi_compliance_is_disabled_by_default(self):
+        request_for_sampling, _, chat_template_kwargs, _, _ = _prepare_request(
+            {
+                "model": "moonshotai/Kimi-K2.7-Code",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            tokenizer=object(),
+            tool_parser_class=None,
+        )
+
+        assert request_for_sampling.max_completion_tokens is None
+        assert chat_template_kwargs.get("enable_thinking") is None
+
+    def test_kimi_defaults_to_thinking_enabled(self):
+        request_for_sampling, chat_template_kwargs, chat_params = self._prepare({})
+
+        assert request_for_sampling.temperature == 1.0
+        assert request_for_sampling.top_p == 1.0
+        assert request_for_sampling.max_completion_tokens == 32768
+        assert request_for_sampling.reasoning_effort == "max"
+        assert chat_template_kwargs["thinking"] is True
+        assert chat_template_kwargs["enable_thinking"] is True
+        assert chat_template_kwargs["thinking_mode"] == "enabled"
+        assert chat_template_kwargs["reasoning_effort"] == "max"
+        assert chat_params.chat_template_kwargs["enable_thinking"] is True
+
+    def test_kimi_thinking_type_disabled_sets_non_thinking_defaults(self):
+        request_for_sampling, chat_template_kwargs, _ = self._prepare(
+            {"thinking": {"type": "disabled", "effort": "high"}}
+        )
+
+        assert request_for_sampling.temperature == 0.6
+        assert request_for_sampling.top_p == 1.0
+        assert request_for_sampling.max_completion_tokens == 32768
+        assert request_for_sampling.reasoning_effort is None
+        assert chat_template_kwargs["thinking"] is False
+        assert chat_template_kwargs["enable_thinking"] is False
+        assert chat_template_kwargs["thinking_mode"] == "disabled"
+        assert chat_template_kwargs["reasoning_effort"] is None
+
+    def test_kimi_respects_rust_normalized_disabled_thinking(self):
+        request_for_sampling, chat_template_kwargs, _ = self._prepare(
+            {"chat_template_args": {"thinking": False, "thinking_mode": "disabled"}}
+        )
+
+        assert request_for_sampling.temperature == 0.6
+        assert chat_template_kwargs["thinking"] is False
+        assert chat_template_kwargs["enable_thinking"] is False
+        assert chat_template_kwargs["thinking_mode"] == "disabled"
+
+    def test_kimi_rejects_rust_normalized_adaptive_thinking(self):
+        with pytest.raises(PreprocessError, match="thinking.type"):
+            self._prepare({"chat_template_args": {"thinking_mode": "adaptive"}})
+
+    def test_kimi_rejects_disallowed_thinking_type_from_config(self):
+        with pytest.raises(PreprocessError, match="thinking.type"):
+            self._prepare(
+                {"thinking": {"type": "disabled"}},
+                config=KimiComplianceConfig(
+                    enabled=True,
+                    allowed_thinking_types=("enabled",),
+                ),
+            )
+
+    @pytest.mark.parametrize("effort", ["low", "high", "max"])
+    def test_kimi_accepts_allowed_reasoning_effort_when_thinking_enabled(self, effort):
+        request_for_sampling, chat_template_kwargs, _ = self._prepare(
+            {"thinking": {"type": "enabled", "effort": effort}}
+        )
+
+        assert request_for_sampling.reasoning_effort == effort
+        assert chat_template_kwargs["reasoning_effort"] == effort
+
+    def test_kimi_rejects_medium_reasoning_effort(self):
+        with pytest.raises(PreprocessError, match="reasoning_effort"):
+            self._prepare({"thinking": {"type": "enabled", "effort": "medium"}})
+
+    def test_kimi_rejects_reasoning_effort_when_thinking_disabled(self):
+        with pytest.raises(PreprocessError, match="requires thinking.type=enabled"):
+            self._prepare(
+                {"thinking": {"type": "disabled"}, "reasoning_effort": "high"}
+            )
+
+    @pytest.mark.parametrize(
+        "request",
+        [
+            {},
+            {"thinking": {"type": "enabled"}},
+            {"thinking": {"type": "enabled", "keep": "all"}},
+        ],
+    )
+    def test_kimi_thinking_keep_defaults_to_all_when_thinking_enabled(self, request):
+        _, chat_template_kwargs, chat_params = self._prepare(request)
+
+        assert chat_template_kwargs["thinking_keep"] == "all"
+        assert chat_template_kwargs["preserve_thinking"] is True
+        assert chat_params.chat_template_kwargs["thinking_keep"] == "all"
+        assert chat_params.chat_template_kwargs["preserve_thinking"] is True
+
+    def test_kimi_thinking_keep_interleaved_is_removed_when_thinking_enabled(self):
+        _, chat_template_kwargs, chat_params = self._prepare(
+            {"thinking": {"type": "enabled", "keep": "interleaved"}}
+        )
+
+        assert "thinking_keep" not in chat_template_kwargs
+        assert "preserve_thinking" not in chat_template_kwargs
+        assert "thinking_keep" not in chat_params.chat_template_kwargs
+        assert "preserve_thinking" not in chat_params.chat_template_kwargs
+
+    def test_kimi_thinking_keep_is_ignored_when_thinking_disabled(self):
+        _, chat_template_kwargs, chat_params = self._prepare(
+            {"thinking": {"type": "disabled", "keep": "all"}}
+        )
+
+        assert "thinking_keep" not in chat_template_kwargs
+        assert "preserve_thinking" not in chat_template_kwargs
+        assert "thinking_keep" not in chat_params.chat_template_kwargs
+        assert "preserve_thinking" not in chat_params.chat_template_kwargs
+
+    def test_kimi_rejects_invalid_thinking_keep(self):
+        with pytest.raises(PreprocessError, match="thinking.keep"):
+            self._prepare({"thinking": {"type": "enabled", "keep": "partial"}})
+
+    @pytest.mark.parametrize("top_p", [0.95, 1.0])
+    def test_kimi_accepts_allowed_top_p_values(self, top_p):
+        request_for_sampling, _, _ = self._prepare({"top_p": top_p})
+
+        assert request_for_sampling.top_p == top_p
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("temperature", 0.9),
+            ("top_p", 0.8),
+            ("presence_penalty", 0.1),
+            ("frequency_penalty", 0.1),
+            ("n", 2),
+        ],
+    )
+    def test_kimi_rejects_unsupported_sampling_values(self, field, value):
+        with pytest.raises(PreprocessError, match=field):
+            self._prepare({field: value})
+
+    def test_custom_config_controls_defaults(self):
+        request_for_sampling, chat_template_kwargs, _ = self._prepare(
+            {},
+            config=KimiComplianceConfig(
+                enabled=True,
+                default_max_completion_tokens=1024,
+                default_reasoning_effort="high",
+                allowed_top_p=(0.95,),
+            ),
+        )
+
+        assert request_for_sampling.max_completion_tokens == 1024
+        assert request_for_sampling.top_p == 0.95
+        assert request_for_sampling.reasoning_effort == "high"
+        assert chat_template_kwargs["reasoning_effort"] == "high"
 
 
 class TestMultimodalFeatureMetadata:

@@ -50,6 +50,25 @@ def validate_model_path(value: str) -> str:
     return value
 
 
+def _parse_csv_strings(value: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("value must contain at least one item")
+    return values
+
+
+def _parse_csv_floats(value: str) -> tuple[float, ...]:
+    try:
+        values = tuple(float(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"value must be a comma-separated list of floats, got: {value}"
+        ) from exc
+    if not values:
+        raise argparse.ArgumentTypeError("value must contain at least one item")
+    return values
+
+
 class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
     """Configuration for the Dynamo frontend."""
 
@@ -87,7 +106,16 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
     tokenizer_backend: str
     trust_remote_code: bool
 
+    kimi_api_compliance: bool
+    kimi_default_max_completion_tokens: int
+    kimi_allowed_thinking_types: tuple[str, ...]
+    kimi_default_reasoning_effort: str
+    kimi_allowed_reasoning_efforts: tuple[str, ...]
+    kimi_allowed_top_p: tuple[float, ...]
+
     _VALID_TOKENIZER_BACKENDS = {"default", "fastokens"}
+    _VALID_KIMI_THINKING_TYPES = {"enabled", "disabled"}
+    _VALID_KIMI_REASONING_EFFORTS = {"low", "high", "max"}
 
     def validate(self) -> None:
         if self.load_aware:
@@ -122,6 +150,39 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
                 f"--tokenizer: invalid value '{self.tokenizer_backend}' "
                 f"(choose from {sorted(self._VALID_TOKENIZER_BACKENDS)})"
             )
+        invalid_thinking_types = (
+            set(self.kimi_allowed_thinking_types) - self._VALID_KIMI_THINKING_TYPES
+        )
+        if invalid_thinking_types:
+            raise ValueError(
+                "--kimi-allowed-thinking-types contains invalid values: "
+                + ", ".join(sorted(invalid_thinking_types))
+            )
+        if "enabled" not in self.kimi_allowed_thinking_types:
+            raise ValueError("--kimi-allowed-thinking-types must include enabled")
+        if self.kimi_default_max_completion_tokens < 1:
+            raise ValueError("--kimi-default-max-completion-tokens must be >= 1")
+        invalid_efforts = (
+            set(self.kimi_allowed_reasoning_efforts)
+            - self._VALID_KIMI_REASONING_EFFORTS
+        )
+        if invalid_efforts:
+            raise ValueError(
+                "--kimi-allowed-reasoning-efforts contains invalid values: "
+                + ", ".join(sorted(invalid_efforts))
+            )
+        if (
+            self.kimi_default_reasoning_effort
+            not in self.kimi_allowed_reasoning_efforts
+        ):
+            raise ValueError(
+                "--kimi-default-reasoning-effort must be included in "
+                "--kimi-allowed-reasoning-efforts"
+            )
+        for top_p in self.kimi_allowed_top_p:
+            if top_p < 0.0 or top_p > 1.0:
+                raise ValueError("--kimi-allowed-top-p values must be between 0 and 1")
+
         if self.router_prefill_load_model == "aic":
             if self.router_mode != "kv":
                 raise ValueError(
@@ -438,6 +499,65 @@ class FrontendArgGroup(ArgGroup):
                 "tool calls in the content field."
             ),
         )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--kimi-api-compliance",
+            env_var="DYN_KIMI_API_COMPLIANCE",
+            default=False,
+            help=(
+                "Enable Kimi API compliance defaults and parameter enforcement for "
+                "this frontend. Intended for Kimi-only deployments."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--kimi-default-max-completion-tokens",
+            env_var="DYN_KIMI_DEFAULT_MAX_COMPLETION_TOKENS",
+            default=32768,
+            help="Default max_completion_tokens when omitted under Kimi API compliance.",
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--kimi-allowed-thinking-types",
+            env_var="DYN_KIMI_ALLOWED_THINKING_TYPES",
+            default=("enabled", "disabled"),
+            help=(
+                "Comma-separated allowed Kimi thinking.type values. "
+                "Default: enabled,disabled."
+            ),
+            arg_type=_parse_csv_strings,
+        )
+        add_argument(
+            g,
+            flag_name="--kimi-default-reasoning-effort",
+            env_var="DYN_KIMI_DEFAULT_REASONING_EFFORT",
+            default="max",
+            help=(
+                "Default Kimi reasoning/thinking effort when thinking is enabled "
+                "and the request omits an effort. Default: max."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--kimi-allowed-reasoning-efforts",
+            env_var="DYN_KIMI_ALLOWED_REASONING_EFFORTS",
+            default=("low", "high", "max"),
+            help=(
+                "Comma-separated allowed Kimi reasoning/thinking efforts. "
+                "Default: low,high,max."
+            ),
+            arg_type=_parse_csv_strings,
+        )
+        add_argument(
+            g,
+            flag_name="--kimi-allowed-top-p",
+            env_var="DYN_KIMI_ALLOWED_TOP_P",
+            default=(0.95, 1.0),
+            help="Comma-separated allowed Kimi top_p values. Default: 0.95,1.0.",
+            arg_type=_parse_csv_floats,
+        )
+
         add_argument(
             g,
             flag_name="--dyn-chat-processor",
