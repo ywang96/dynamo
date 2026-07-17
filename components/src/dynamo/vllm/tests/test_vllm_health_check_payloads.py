@@ -5,8 +5,8 @@
 
 Asserts the canary HEALTH_CHECK_KEY marker is layered onto each Vllm probe
 payload via the to_dict() override and survives DYN_HEALTH_CHECK_PAYLOAD env
-overrides. No vllm handler branches on the marker today; this is wire-format
-parity with trtllm/sglang for any future marker-gated behavior.
+overrides. Prefill handlers use the marker to keep canaries local instead of
+arming cross-worker KV transfer state without a decode peer.
 """
 
 import json

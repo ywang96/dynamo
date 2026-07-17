@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def _layer_probe_marker(payload: dict[str, Any]) -> dict[str, Any]:
-    """Layer HEALTH_CHECK_KEY onto a payload dict (reserved for future use)."""
+    """Layer HEALTH_CHECK_KEY onto a payload for handler-side probe routing."""
     payload = dict(payload)
     payload[HEALTH_CHECK_KEY] = True
     return payload

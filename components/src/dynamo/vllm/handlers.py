@@ -46,6 +46,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from dynamo._core import Context
 from dynamo.common.backend import logprobs as _shared_logprobs
+from dynamo.common.backend.health_check import is_probe
 from dynamo.common.lora.manager import LoRAInfo, get_lora_manager
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
@@ -3382,6 +3383,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
+        # Capture this before preprocessing, which may rebuild the request without
+        # preserving internal control-plane metadata such as the probe marker.
+        is_health_check = is_probe(request)
+
         try:
             prepared_input = await self._multimodal_request_processor.prepare_input(
                 request,
@@ -3422,16 +3427,21 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             enable_rl=self.config.enable_rl,
         )
 
-        # One protocol instance per request; carries per-request state
-        # (e.g. Mooncake's transfer_id) into the response loop below.
-        kv_protocol: KvConnectorProtocol = make_kv_connector_protocol(
-            self.engine_client.vllm_config
-        )
-        if sampling_params.extra_args is None:
-            sampling_params.extra_args = {}
-        sampling_params.extra_args[
-            "kv_transfer_params"
-        ] = kv_protocol.prefill_request_kv_transfer_params()
+        kv_protocol: KvConnectorProtocol | None = None
+        if is_health_check:
+            # A prefill canary validates the local engine. It has no decode peer,
+            # so arming a P/D transfer would leave an unconsumed connector lease.
+            if sampling_params.extra_args is not None:
+                sampling_params.extra_args.pop("kv_transfer_params", None)
+        else:
+            # One protocol instance per request; carries per-request state
+            # (e.g. Mooncake's transfer_id) into the response loop below.
+            kv_protocol = make_kv_connector_protocol(self.engine_client.vllm_config)
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args[
+                "kv_transfer_params"
+            ] = kv_protocol.prefill_request_kv_transfer_params()
         # Override for prefill: only generate 1 token
         sampling_params.max_tokens = 1
         sampling_params.min_tokens = 1
@@ -3492,11 +3502,16 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         mm_processor_kwargs=mm_processor_kwargs,
                     )
                 )
+                kv_transfer_params = (
+                    kv_protocol.decode_request_kv_transfer_params(res)
+                    if kv_protocol is not None
+                    else None
+                )
 
                 output: Dict[str, Any] = {
                     "token_ids": list(token_ids),
                     "disaggregated_params": self._build_disaggregated_params(
-                        kv_protocol.decode_request_kv_transfer_params(res),
+                        kv_transfer_params,
                         embedding_params,
                     ),
                     "completion_usage": BaseWorkerHandler._build_completion_usage(
@@ -3513,7 +3528,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     lora_request,
                     level="info" if lora_request else "debug",
                     token_count=len(token_ids),
-                    has_kv_params=res.kv_transfer_params is not None,
+                    has_kv_params=kv_transfer_params is not None,
                 )
 
                 yield output
