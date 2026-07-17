@@ -27,6 +27,9 @@ pub mod tool_parser_v2;
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;
 
+/// Top-level extension controlling whether reasoning is emitted separately.
+const REASONING_SPLIT_FIELD: &str = "reasoning_split";
+
 use dynamo_parsers::tool_calling::{ToolCallResponse, ToolCallResponseChunk};
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
@@ -128,6 +131,13 @@ pub struct NvCreateChatCompletionRequest {
 }
 
 impl NvCreateChatCompletionRequest {
+    /// Return the non-standard top-level `reasoning_split` value when boolean.
+    pub fn reasoning_split(&self) -> Option<bool> {
+        self.unsupported_fields
+            .get(REASONING_SPLIT_FIELD)
+            .and_then(serde_json::Value::as_bool)
+    }
+
     /// Normalize OpenAI-style DS-V4 reasoning controls into the template kwargs
     /// consumed by the SGLang/DeepSeek-V4 prompt formatter.
     pub fn normalize_reasoning_template_args(&mut self) -> anyhow::Result<()> {
@@ -533,7 +543,13 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
     // `get_max_tokens` (max_completion_tokens.or(max_tokens)), so it must be validated.
     #[allow(deprecated)]
     fn validate(&self) -> Result<(), anyhow::Error> {
-        validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        let mut unsupported_fields = self.unsupported_fields.clone();
+        if let Some(value) = unsupported_fields.remove(REASONING_SPLIT_FIELD)
+            && !value.is_boolean()
+        {
+            anyhow::bail!("`reasoning_split` must be a boolean");
+        }
+        validate::validate_no_unsupported_fields(&unsupported_fields)?;
         validate::validate_chat_template_args(self.chat_template_args.as_ref())?;
         validate::validate_messages(&self.inner.messages)?;
         validate::validate_model(&self.inner.model)?;
@@ -751,6 +767,34 @@ mod tests {
             Some(&serde_json::json!([[12, 13]]))
         );
         assert!(ValidateRequest::validate(&request).is_ok());
+    }
+
+    #[test]
+    fn test_reasoning_split_validation() {
+        for value in [true, false] {
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_split": value
+            }))
+            .expect("reasoning_split should deserialize");
+            ValidateRequest::validate(&request).expect("boolean reasoning_split should validate");
+            assert_eq!(request.reasoning_split(), Some(value));
+        }
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_split": "yes"
+        }))
+        .expect("reasoning_split should deserialize into extension fields");
+        let error = ValidateRequest::validate(&request)
+            .expect_err("non-boolean reasoning_split should fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("`reasoning_split` must be a boolean")
+        );
     }
 
     #[test]

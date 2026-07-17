@@ -62,7 +62,9 @@ dynamo-parsers = { version = "5.0.0" }
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
 dynamo-parsers-v2 = { version = "0.1.19" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.3.0" }
-fastokens = { version = "0.2.0" }
+fastokens = { version = "0.2.1" }
+vllm-parser = { git = "https://github.com/Inferact/mke.git", rev = "2eff80907c21062d882b1c2b3bd352739c0073b5" }
+vllm-tokenizer = { git = "https://github.com/Inferact/mke.git", rev = "2eff80907c21062d882b1c2b3bd352739c0073b5" }
 
 
 # kvbm

@@ -19,6 +19,7 @@ pub mod speculative_prefill;
 mod structural_tag;
 mod tool_choice;
 pub mod tools;
+mod unified;
 use anyhow::Context;
 use anyhow::{Result, bail};
 
@@ -2125,6 +2126,48 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
+        self.postprocessor_parsing_stream_with_prompt_tokens(
+            stream,
+            request,
+            prompt_injected_reasoning,
+            uses_tool_call_structural_tag,
+            String::new(),
+            &[],
+        )
+    }
+
+    /// Apply output parsers with access to the tokenized prompt.
+    pub fn postprocessor_parsing_stream_with_prompt_tokens<S>(
+        &self,
+        stream: S,
+        request: &NvCreateChatCompletionRequest,
+        prompt_injected_reasoning: bool,
+        uses_tool_call_structural_tag: bool,
+        request_id: String,
+        prompt_token_ids: &[u32],
+    ) -> anyhow::Result<
+        impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    >
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        let reasoning_split = request.reasoning_split().unwrap_or(true);
+        if unified::kimi_k3::is_selected(
+            self.runtime_config.reasoning_parser.as_deref(),
+            self.tool_call_parser.as_deref(),
+        ) {
+            let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+                unified::kimi_k3::output_stream(
+                    stream,
+                    request.inner.tools.as_deref().unwrap_or_default(),
+                    self.tokenizer.clone(),
+                    prompt_token_ids,
+                    reasoning_split,
+                    request_id,
+                )?;
+            return Ok(transformed_stream);
+        }
+
         // Guided output may be bare JSON or `reasoning</think>JSON`. Supported
         // parsers inspect the stream shape before deciding whether to parse it.
         let is_guided_tool_choice = matches!(
@@ -2863,6 +2906,8 @@ impl OpenAIPreprocessor {
                 | Some("minimax-m3")
                 | Some("minimax_m3_nom")
                 | Some("minimax-m3-nom")
+                | Some("kimi_k3")
+                | Some("kimi-k3")
         ) || matches!(
             reasoning_parser,
             Some("gemma4")
@@ -2872,6 +2917,8 @@ impl OpenAIPreprocessor {
                 | Some("mistral")
                 | Some("minimax_m3")
                 | Some("minimax-m3")
+                | Some("kimi_k3")
+                | Some("kimi-k3")
         )
     }
 
@@ -3435,6 +3482,8 @@ impl
             response_generator.update_isl(isl);
         }
 
+        let prompt_token_ids = common_request.token_ids.clone();
+
         // repack the common completion request
         let common_request = context.map(|_| common_request);
 
@@ -3461,11 +3510,13 @@ impl
             mm_counts,
         );
 
-        let transformed_stream = self.postprocessor_parsing_stream(
+        let transformed_stream = self.postprocessor_parsing_stream_with_prompt_tokens(
             stream,
             &request,
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
+            request_id.clone(),
+            &prompt_token_ids,
         )?;
 
         // Apply request payload aggregation strategy.
@@ -4014,6 +4065,18 @@ mod tests {
                 Some("minimax-m3"),
                 true,
                 "MiniMax M3 SGLang aliases → required",
+            ),
+            (
+                Some("kimi_k3"),
+                Some("kimi_k3"),
+                true,
+                "kimi_k3 unified parser → required (`<|open|>` / `<|sep|>` are special)",
+            ),
+            (
+                Some("kimi-k3"),
+                Some("kimi-k3"),
+                true,
+                "kimi-k3 hyphen alias → required",
             ),
             (None, None, false, "no parsers → not required"),
         ];

@@ -66,6 +66,8 @@ dynamo-runtime = { workspace = true }
 dynamo-tokenizers = { workspace = true }
 dynamo-renderer = { workspace = true }
 dynamo-tokens = { workspace = true }
+vllm-parser = { workspace = true }
+vllm-tokenizer = { workspace = true }
 
 # workspace
 anyhow = { workspace = true }
