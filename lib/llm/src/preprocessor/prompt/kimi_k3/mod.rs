@@ -6,6 +6,9 @@
 //! so the model card constructs the tokenizer through the explicit
 //! `TikTokenTokenizer::from_file` path using the helpers here.
 
+pub mod encoder;
+pub mod renderer;
+
 use rustc_hash::FxHashMap;
 
 /// BPE regex for the Kimi tiktoken vocabulary.

@@ -1,0 +1,445 @@
+{
+ "name": "assistant_raw_json_block_args",
+ "messages": [
+  {
+   "role": "user",
+   "content": "x"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "t",
+      "arguments": "{not json"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "ok"
+  },
+  {
+   "role": "user",
+   "content": "y"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "segments": [
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "x",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "response",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "response",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "tools",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "call",
+   "allow_special": false
+  },
+  {
+   "text": " tool",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "t",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": " index",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "1",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "json",
+   "allow_special": false
+  },
+  {
+   "text": " type",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "object",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "{not json",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "json",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "call",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "tools",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "tool",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": " tool",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "t",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": " index",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "1",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "ok",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "y",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  }
+ ],
+ "text": "<|open|>message role=\"user\"<|sep|>x<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"t\" index=\"1\"<|sep|><|open|>json type=\"object\"<|sep|>{not json<|close|>json<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"t\" index=\"1\"<|sep|>ok<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>y<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+}

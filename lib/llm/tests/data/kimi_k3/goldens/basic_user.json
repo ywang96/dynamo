@@ -1,0 +1,102 @@
+{
+ "name": "basic_user",
+ "messages": [
+  {
+   "role": "user",
+   "content": "hello"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "segments": [
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "hello",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  }
+ ],
+ "text": "<|open|>message role=\"user\"<|sep|>hello<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+}

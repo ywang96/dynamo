@@ -1,0 +1,119 @@
+{
+ "name": "attr_escaping",
+ "messages": [
+  {
+   "role": "user",
+   "name": "a&b\"c",
+   "content": "hi"
+  }
+ ],
+ "tools": null,
+ "kwargs": {},
+ "segments": [
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": " name",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "a&amp;b&quot;c",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "hi",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  }
+ ],
+ "text": "<|open|>message role=\"user\" name=\"a&amp;b&quot;c\"<|sep|>hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+}

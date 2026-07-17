@@ -1,0 +1,418 @@
+{
+ "name": "history_preserve_thinking",
+ "messages": [
+  {
+   "role": "user",
+   "content": "q1"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "old think",
+   "content": "a1"
+  },
+  {
+   "role": "user",
+   "content": "q2"
+  },
+  {
+   "role": "assistant",
+   "reasoning_content": "new think",
+   "content": "a2"
+  },
+  {
+   "role": "user",
+   "content": "q3"
+  }
+ ],
+ "tools": null,
+ "kwargs": {
+  "preserve_thinking": true
+ },
+ "segments": [
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "q1",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "old think",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "response",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "a1",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "response",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "q2",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "new think",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "response",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "a2",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "response",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "q3",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  }
+ ],
+ "text": "<|open|>message role=\"user\"<|sep|>q1<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>old think<|close|>think<|sep|><|open|>response<|sep|>a1<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>q2<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>new think<|close|>think<|sep|><|open|>response<|sep|>a2<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>q3<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+}

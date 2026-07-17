@@ -1,0 +1,170 @@
+{
+ "name": "response_format_json_object",
+ "messages": [
+  {
+   "role": "user",
+   "content": "hi"
+  }
+ ],
+ "tools": null,
+ "kwargs": {
+  "response_format": {
+   "type": "json_object"
+  }
+ },
+ "segments": [
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "user",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "hi",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "system",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": " type",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "response-format",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "The system is invoked with `response_format=json_object`.\nYour response must be raw JSON data without markdown code blocks (```json) or any additional formatting.",
+   "allow_special": false
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|end_of_msg|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "message",
+   "allow_special": false
+  },
+  {
+   "text": " role",
+   "allow_special": false
+  },
+  {
+   "text": "=\"",
+   "allow_special": false
+  },
+  {
+   "text": "assistant",
+   "allow_special": false
+  },
+  {
+   "text": "\"",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  }
+ ],
+ "text": "<|open|>message role=\"user\"<|sep|>hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\" type=\"response-format\"<|sep|>The system is invoked with `response_format=json_object`.\nYour response must be raw JSON data without markdown code blocks (```json) or any additional formatting.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+}

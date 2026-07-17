@@ -193,6 +193,21 @@ pub fn prompt_formatter_from_mdc(mdc: &ModelDeploymentCard) -> Result<PromptForm
         return Ok(formatter);
     }
 
+    // Kimi-K3 ships no chat template; its native renderer emits token IDs
+    // directly (see kimi_k3::encoder). The formatter here is a fail-loud stub
+    // so no code path can fall back to a String render, which would
+    // re-tokenize with specials enabled and let user text forge XTML
+    // structure. Must run before the prompt_formatter artifact requirement
+    // below: K3 model dirs carry no template artifact.
+    if model_type_lower
+        .as_deref()
+        .is_some_and(kimi_k3::is_kimi_k3_model_type)
+    {
+        return Ok(PromptFormatter::OAI(std::sync::Arc::new(
+            kimi_k3::encoder::KimiK3Formatter,
+        )));
+    }
+
     match mdc
         .prompt_formatter
         .as_ref()
