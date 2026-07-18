@@ -235,33 +235,24 @@ impl NvCreateChatCompletionRequest {
                 serde_json::Value::String(effort),
             );
         }
-        // `keep=all` preserves ALL prior-turn reasoning (renderer
-        // preserve_thinking = true); `keep=interleaved` keeps only the most
-        // recent (preserve_thinking = false). Previously inverted, which dropped
-        // reasoning history on keep=all.
-        match thinking_keep_raw.as_ref().and_then(|v| v.as_str()) {
-            Some("all") => {
-                args.insert(
-                    "preserve_thinking".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-            }
-            Some("interleaved") => {
-                args.insert(
-                    "preserve_thinking".to_string(),
-                    serde_json::Value::Bool(false),
-                );
-            }
-            _ => {
-                if let Some(keep) = thinking_keep_raw {
-                    // Never a 400: unknown values leave history handling at
-                    // the renderer default (keep-normalization rule).
-                    tracing::warn!(
-                        ?keep,
-                        "unrecognized `thinking.keep` value; leaving history handling at renderer default"
-                    );
-                }
-            }
+        // K3 spec §4 keep normalization: `thinking.keep` is honored only when the
+        // effective thinking type is enabled (i.e. NOT disabled) and is IGNORED
+        // when disabled. When enabled, `interleaved` keeps only the most recent
+        // reasoning (preserve_thinking = false); `all` or unset keeps all prior
+        // reasoning (preserve_thinking = true). Skipping the disabled case is what
+        // stops `thinking:{type:disabled, keep:all}` from wrongly preserving
+        // history (the renderer applies preserve_thinking regardless of the
+        // thinking flag). Unknown keep values are already rejected upstream by
+        // openai_thinking_keep, so they never reach here.
+        if !matches!(thinking_mode, Some(OpenAiThinkingMode::Disabled)) {
+            let preserve_thinking = !matches!(
+                thinking_keep_raw.as_ref().and_then(|v| v.as_str()),
+                Some("interleaved")
+            );
+            args.insert(
+                "preserve_thinking".to_string(),
+                serde_json::Value::Bool(preserve_thinking),
+            );
         }
 
         // The raw `thinking` payload has been folded into `chat_template_args`;
