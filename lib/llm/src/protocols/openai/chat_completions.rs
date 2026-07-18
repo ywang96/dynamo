@@ -30,8 +30,9 @@ pub use delta::DeltaGenerator;
 use dynamo_parsers::tool_calling::{ToolCallResponse, ToolCallResponseChunk};
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta, FinishReason,
-    FunctionCall, FunctionCallStream, FunctionType,
+    ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage,
+    ChatCompletionStreamResponseDelta, ChatCompletionTool, FinishReason, FunctionCall,
+    FunctionCallStream, FunctionType,
 };
 
 /// Map a parser-native [`ToolCallResponse`] onto the protocol/wire
@@ -128,6 +129,33 @@ pub struct NvCreateChatCompletionRequest {
 }
 
 impl NvCreateChatCompletionRequest {
+    /// Dynamic tools in message order.
+    pub(crate) fn dynamic_tools(&self) -> impl Iterator<Item = &ChatCompletionTool> {
+        self.inner
+            .messages
+            .iter()
+            .flat_map(|message| match message {
+                ChatCompletionRequestMessage::System(system) => {
+                    system.tools.as_deref().unwrap_or_default()
+                }
+                _ => &[],
+            })
+    }
+
+    /// Global and dynamic tools available to validation and output parsing.
+    ///
+    /// Prompt rendering still reads each system message directly, preserving
+    /// the declaration's position in the tokenized context.
+    pub(crate) fn effective_tools(&self) -> Vec<ChatCompletionTool> {
+        self.inner
+            .tools
+            .iter()
+            .flatten()
+            .chain(self.dynamic_tools())
+            .cloned()
+            .collect()
+    }
+
     /// Normalize OpenAI-style DS-V4 reasoning controls into the template kwargs
     /// consumed by the SGLang/DeepSeek-V4 prompt formatter.
     pub fn normalize_reasoning_template_args(&mut self) -> anyhow::Result<()> {
@@ -788,8 +816,10 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for stream_options
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
-        validate::validate_tools(&self.inner.tools.as_deref())?;
-        validate::validate_tool_choice(&self.inner.tool_choice, self.inner.tools.as_deref())?;
+        let effective_tools = self.effective_tools();
+        validate::validate_tools(&Some(effective_tools.as_slice()))?;
+        validate::validate_dynamic_tool_messages(&self.inner.messages, &effective_tools)?;
+        validate::validate_tool_choice(&self.inner.tool_choice, Some(&effective_tools))?;
         // none for parallel_tool_calls
         validate::validate_user(self.inner.user.as_deref())?;
         // none for function call
@@ -813,6 +843,161 @@ mod tests {
     use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
     use serde_json::json;
 
+    fn tool(name: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "A test tool",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })
+    }
+
+    fn dynamic_request(
+        dynamic_messages: Vec<serde_json::Value>,
+        global_tools: Option<Vec<serde_json::Value>>,
+    ) -> NvCreateChatCompletionRequest {
+        let mut messages = dynamic_messages;
+        messages.push(json!({"role": "user", "content": "Use a tool"}));
+
+        let mut request = json!({
+            "model": "test-model",
+            "messages": messages,
+            "tool_choice": "required"
+        });
+        if let Some(tools) = global_tools {
+            request["tools"] = json!(tools);
+        }
+
+        serde_json::from_value(request).expect("dynamic-tool request should deserialize")
+    }
+
+    fn validate_request(request: &NvCreateChatCompletionRequest) -> anyhow::Result<()> {
+        ValidateRequest::validate(request)
+    }
+
+    #[test]
+    fn test_dynamic_tools_satisfy_required_tool_choice() {
+        let request = dynamic_request(
+            vec![json!({
+                "role": "system",
+                "content": "",
+                "tools": [tool("get_weather")]
+            })],
+            None,
+        );
+
+        validate_request(&request).expect("dynamic tools should be available");
+    }
+
+    #[test]
+    fn test_dynamic_tools_require_empty_system_content() {
+        let request = dynamic_request(
+            vec![json!({
+                "role": "system",
+                "content": "not empty",
+                "tools": [tool("get_weather")]
+            })],
+            None,
+        );
+
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn test_dynamic_tools_require_complete_definitions_and_valid_names() {
+        let mut missing_parameters = tool("missing_parameters");
+        missing_parameters["function"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parameters");
+
+        for invalid_tool in [tool("1bad_name"), missing_parameters] {
+            let request = dynamic_request(
+                vec![json!({
+                    "role": "system",
+                    "content": "",
+                    "tools": [invalid_tool]
+                })],
+                None,
+            );
+            assert!(validate_request(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn test_dynamic_tools_reject_malformed_wire_definitions() {
+        let malformed_tools = [
+            json!({"function": {"name": "missing_type", "parameters": {}}}),
+            json!({"type": "function"}),
+            json!({"type": "function", "function": {"parameters": {}}}),
+            json!({"type": "bogus", "function": {"name": "bad_type"}}),
+        ];
+
+        for invalid_tool in malformed_tools {
+            let request = json!({
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "",
+                        "tools": [invalid_tool]
+                    },
+                    {"role": "user", "content": "hello"}
+                ]
+            });
+            assert!(serde_json::from_value::<NvCreateChatCompletionRequest>(request).is_err());
+        }
+    }
+
+    #[test]
+    fn test_dynamic_tool_names_must_be_unique() {
+        let cases = [
+            (
+                vec![json!({
+                    "role": "system",
+                    "content": "",
+                    "tools": [tool("dup"), tool("dup")]
+                })],
+                None,
+            ),
+            (
+                vec![
+                    json!({"role": "system", "content": "", "tools": [tool("dup")]}),
+                    json!({"role": "system", "content": "", "tools": [tool("dup")]}),
+                ],
+                None,
+            ),
+            (
+                vec![json!({
+                    "role": "system",
+                    "content": "",
+                    "tools": [tool("dup")]
+                })],
+                Some(vec![tool("dup")]),
+            ),
+        ];
+
+        for (messages, global_tools) in cases {
+            let request = dynamic_request(messages, global_tools);
+            assert!(validate_request(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn test_global_and_dynamic_tools_can_coexist() {
+        let request = dynamic_request(
+            vec![json!({
+                "role": "system",
+                "content": "",
+                "tools": [tool("get_weather")]
+            })],
+            Some(vec![tool("get_stock_price")]),
+        );
+
+        validate_request(&request).expect("distinct global and dynamic tools should coexist");
+    }
     #[test]
     fn test_skip_special_tokens_none() {
         let json_str = json!({

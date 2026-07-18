@@ -188,7 +188,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = { version = "2" }
 
 [patch.crates-io]
-dynamo-protocols = { git = "https://github.com/Inferact/dynamo.git", rev = "3442aebaa786d103067e4b2002cf6c8a08638683" }
+dynamo-protocols = { git = "https://github.com/Inferact/dynamo.git", rev = "d83ed9f2a2dfb41c6f2c2e874269c73da0718530" }
 
 [profile.dev.package]
 insta.opt-level = 3

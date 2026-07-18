@@ -52,7 +52,7 @@ impl OpenAIPreprocessor {
             return Ok(false);
         }
 
-        let tools = request.inner.tools.as_deref().unwrap_or(&[]);
+        let tools = request.effective_tools();
         let is_forced_tool_choice = matches!(
             tool_choice,
             ChatCompletionToolChoiceOption::Required | ChatCompletionToolChoiceOption::Named(_)
@@ -85,7 +85,7 @@ impl OpenAIPreprocessor {
 
         if self.apply_tool_choice_structural_tag(
             &convert_tool_choice(tool_choice),
-            &convert_tools(tools),
+            &convert_tools(&tools),
             request.inner.parallel_tool_calls,
             prompt_injected_reasoning,
             common_request,
@@ -93,7 +93,7 @@ impl OpenAIPreprocessor {
             return Ok(true);
         }
 
-        match get_json_schema_from_tools(Some(tool_choice), Some(tools)) {
+        match get_json_schema_from_tools(Some(tool_choice), Some(&tools)) {
             Ok(Some(schema)) => {
                 let gd = common_request
                     .sampling_options

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fmt::Display, sync::LazyLock};
+use std::{collections::HashSet, fmt::Display, sync::LazyLock};
 
 use dynamo_runtime::config::{
     env_is_truthy, environment_names::llm::DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS,
@@ -565,6 +565,73 @@ pub fn validate_tools(
             );
         }
     }
+    Ok(())
+}
+
+/// Validate Kimi K3 tool declarations carried by system messages.
+pub fn validate_dynamic_tool_messages(
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
+    effective_tools: &[dynamo_protocols::types::ChatCompletionTool],
+) -> Result<(), anyhow::Error> {
+    use dynamo_protocols::types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestSystemMessageContentPart,
+    };
+
+    let mut has_dynamic_tools = false;
+    for (message_index, message) in messages.iter().enumerate() {
+        let ChatCompletionRequestMessage::System(system) = message else {
+            continue;
+        };
+        let Some(tools) = system.tools.as_deref() else {
+            continue;
+        };
+        has_dynamic_tools = true;
+
+        let content_is_empty = match &system.content {
+            ChatCompletionRequestSystemMessageContent::Text(text) => text.is_empty(),
+            ChatCompletionRequestSystemMessageContent::Array(parts) => parts.iter().all(|part| {
+                matches!(
+                    part,
+                    ChatCompletionRequestSystemMessageContentPart::Text(text) if text.text.is_empty()
+                )
+            }),
+        };
+        if !content_is_empty {
+            anyhow::bail!(
+                "System message at index {message_index} must have empty content when `tools` is present"
+            );
+        }
+
+        for (tool_index, tool) in tools.iter().enumerate() {
+            if tool.function.parameters.is_none() {
+                anyhow::bail!(
+                    "Dynamic tool at messages[{message_index}].tools[{tool_index}] is missing `function.parameters`"
+                );
+            }
+
+            let first = tool.function.name.as_bytes().first().copied();
+            if !first.is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') {
+                anyhow::bail!(
+                    "Dynamic tool at messages[{message_index}].tools[{tool_index}] has an invalid name: \"{}\". The first character must be a-z, A-Z, or underscore.",
+                    tool.function.name,
+                );
+            }
+        }
+    }
+
+    if has_dynamic_tools {
+        let mut names = HashSet::with_capacity(effective_tools.len());
+        for tool in effective_tools {
+            if !names.insert(tool.function.name.as_str()) {
+                anyhow::bail!(
+                    "Tool name \"{}\" is declared more than once across global and dynamic tools",
+                    tool.function.name
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -2219,10 +2219,11 @@ impl OpenAIPreprocessor {
             self.runtime_config.reasoning_parser.as_deref(),
             self.tool_call_parser.as_deref(),
         ) {
+            let effective_tools = request.effective_tools();
             let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
                 unified::kimi_k3::output_stream(
                     stream,
-                    request.inner.tools.as_deref().unwrap_or_default(),
+                    &effective_tools,
                     self.tokenizer.clone(),
                     prompt_token_ids,
                 )?;

@@ -120,6 +120,54 @@ async fn k3_preprocess_uses_renderer_token_ids() {
 }
 
 #[tokio::test]
+async fn k3_preprocess_preserves_dynamic_tools_in_message_order() {
+    let dir = synthetic_k3_dir();
+    let mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");
+    let preprocessor = OpenAIPreprocessor::new(mdc.clone()).expect("build preprocessor");
+
+    let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": mdc.slug(),
+        "messages": [
+            {"role": "user", "content": "before dynamic declaration"},
+            {
+                "role": "system",
+                "content": "",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }]
+            },
+            {"role": "user", "content": "after dynamic declaration"}
+        ],
+        "tool_choice": "required"
+    }))
+    .expect("deserialize dynamic-tool request");
+
+    let (preprocessed, _, _) = preprocessor
+        .preprocess_request(&request, None)
+        .await
+        .expect("preprocess dynamic-tool request");
+    let renderer = KimiK3Renderer::from_model_dir(dir.path()).expect("build renderer");
+    let decoded = renderer
+        .decode(&preprocessed.token_ids)
+        .expect("decode rendered prompt");
+
+    let before = decoded.find("before dynamic declaration").unwrap();
+    let declaration = decoded.find("## New Tools Available").unwrap();
+    let after = decoded.find("after dynamic declaration").unwrap();
+    assert!(before < declaration && declaration < after);
+    assert!(decoded.contains("\"name\":\"get_weather\""));
+}
+
+#[tokio::test]
 async fn k3_preprocess_marks_prompt_injected_reasoning() {
     let dir = synthetic_k3_dir();
     let mut mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");

@@ -88,7 +88,13 @@ impl OpenAIPreprocessor {
             .and_then(WalleLevel::parse)
             .unwrap_or_default();
 
-        for tool in request.inner.tools.iter().flatten() {
+        for tool in request
+            .inner
+            .tools
+            .iter()
+            .flatten()
+            .chain(request.dynamic_tools())
+        {
             let Some(params) = tool.function.parameters.as_ref() else {
                 continue;
             };
