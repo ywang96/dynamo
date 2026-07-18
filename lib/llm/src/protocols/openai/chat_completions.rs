@@ -364,7 +364,15 @@ pub struct NvCreateChatCompletionResponse {
 
 /// A response structure for streamed chat completions, embedding OpenAI's
 /// `CreateChatCompletionStreamResponse` with optional NVIDIA extension metadata.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+///
+/// `Serialize` is implemented manually: tool-call continuation chunks (index +
+/// arguments only, produced by the wire-shape stage) must not serialize their
+/// unset `id`/`type`/`function.name` as JSON nulls — the streaming spec allows
+/// only `index` and `function.arguments` keys on continuations — and the chunk
+/// types live in the external `dynamo-protocols` crate where we cannot add
+/// `skip_serializing_if`. Frames without sparse chunks take a zero-cost path
+/// identical to the former derive.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct NvCreateChatCompletionStreamResponse {
     #[serde(flatten)]
     pub inner: dynamo_protocols::types::CreateChatCompletionStreamResponse,
@@ -374,6 +382,86 @@ pub struct NvCreateChatCompletionStreamResponse {
     /// client-facing OpenAI-compatible streams.
     #[serde(skip)]
     pub llm_metrics: Option<crate::protocols::common::metrics::LLMMetricAnnotation>,
+    /// Per-candidate usage for this frame's (single) choice, populated on the
+    /// candidate's end frame (Kimi streaming spec P0.4 / §5.5). Carried out of
+    /// band because `ChatChoiceStream` lives in the external dynamo-protocols
+    /// crate (also constructed by dynamo-parsers, so adding a field there
+    /// breaks external constructors); the manual `Serialize` impl below
+    /// injects it as `choices[0].usage` on the wire.
+    #[serde(skip)]
+    pub choice_usage: Option<dynamo_protocols::types::CompletionUsage>,
+}
+
+impl Serialize for NvCreateChatCompletionStreamResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Shadow<'a> {
+            #[serde(flatten)]
+            inner: &'a dynamo_protocols::types::CreateChatCompletionStreamResponse,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            nvext: &'a Option<serde_json::Value>,
+        }
+
+        let shadow = Shadow {
+            inner: &self.inner,
+            nvext: &self.nvext,
+        };
+
+        let has_sparse_tool_call_chunks = self.inner.choices.iter().any(|choice| {
+            choice.delta.tool_calls.iter().flatten().any(|chunk| {
+                chunk.id.is_none()
+                    || chunk.r#type.is_none()
+                    || chunk
+                        .function
+                        .as_ref()
+                        .is_some_and(|function| function.name.is_none())
+            })
+        });
+        if !has_sparse_tool_call_chunks && self.choice_usage.is_none() {
+            return shadow.serialize(serializer);
+        }
+
+        let mut value = serde_json::to_value(&shadow).map_err(serde::ser::Error::custom)?;
+        // Streaming spec P0.4 / §5.5: the candidate's end frame carries
+        // `choices[0].usage`. The field lives out of band on this wrapper
+        // (see `choice_usage`) because `ChatChoiceStream` is an external type.
+        if let Some(choice_usage) = &self.choice_usage
+            && let Some(choice) = value
+                .get_mut("choices")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|choices| choices.first_mut())
+            && let Some(obj) = choice.as_object_mut()
+        {
+            obj.insert(
+                "usage".to_string(),
+                serde_json::to_value(choice_usage).map_err(serde::ser::Error::custom)?,
+            );
+        }
+        if let Some(choices) = value.get_mut("choices").and_then(|v| v.as_array_mut()) {
+            for choice in choices {
+                let Some(tool_calls) = choice
+                    .get_mut("delta")
+                    .and_then(|d| d.get_mut("tool_calls"))
+                    .and_then(|v| v.as_array_mut())
+                else {
+                    continue;
+                };
+                for chunk in tool_calls {
+                    if let Some(obj) = chunk.as_object_mut() {
+                        obj.retain(|key, v| !(v.is_null() && matches!(key.as_str(), "id" | "type")));
+                        if let Some(function) = obj.get_mut("function").and_then(|f| f.as_object_mut())
+                        {
+                            function.retain(|key, v| !(v.is_null() && key == "name"));
+                        }
+                    }
+                }
+            }
+        }
+        value.serialize(serializer)
+    }
 }
 
 /// Build one synthetic stream choice from an existing response template.

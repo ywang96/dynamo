@@ -67,6 +67,9 @@ pub struct DeltaGenerator {
     /// Full generated token-id sequence, accumulated across streamed chunks, used
     /// to locate the `<think>`/`</think>` span for reasoning-token derivation.
     reasoning_output_ids: Vec<u32>,
+    /// Completion tokens per candidate index, for the per-candidate usage
+    /// snapshot on each candidate's end frame (streaming spec P0.4 / §5.5).
+    per_candidate_completion_tokens: std::collections::HashMap<u32, u32>,
 }
 
 impl DeltaGenerator {
@@ -86,6 +89,7 @@ impl DeltaGenerator {
             reasoning_start_id: None,
             reasoning_end_id: None,
             reasoning_output_ids: Vec::new(),
+            per_candidate_completion_tokens: std::collections::HashMap::new(),
         }
     }
 
@@ -240,6 +244,7 @@ impl DeltaGenerator {
             },
             nvext: None, // Will be populated by router layer if needed
             llm_metrics: None,
+            choice_usage: None,
         }
     }
 
@@ -264,6 +269,7 @@ impl DeltaGenerator {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         }
     }
 
@@ -341,6 +347,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             .expect("token_ids length exceeds u32::MAX");
 
         self.usage.completion_tokens += token_length;
+        let candidate_index = delta.index.unwrap_or(0);
+        *self
+            .per_candidate_completion_tokens
+            .entry(candidate_index)
+            .or_default() += token_length;
 
         // Accumulate the full generated token-id stream so `get_usage` can locate
         // the `<think>`/`</think>` span for reasoning-token derivation.
@@ -397,6 +408,24 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         // Create the streaming response.
         let index = delta.index.unwrap_or(0);
         let mut stream_response = self.create_choice(index, delta.text, finish_reason, logprobs);
+
+        // Streaming spec P0.4 / §5.5: the candidate's end frame carries a
+        // per-candidate usage snapshot (same null-free shape as the summary
+        // frame, completion tokens scoped to this candidate). Serialized as
+        // `choices[0].usage` by the manual Serialize impl on the response.
+        if finish_reason.is_some() {
+            let mut candidate_usage = self.get_usage();
+            let candidate_completion = self
+                .per_candidate_completion_tokens
+                .get(&index)
+                .copied()
+                .unwrap_or(candidate_usage.completion_tokens);
+            candidate_usage.completion_tokens = candidate_completion;
+            candidate_usage.total_tokens = candidate_usage
+                .prompt_tokens
+                .saturating_add(candidate_completion);
+            stream_response.choice_usage = Some(candidate_usage);
+        }
 
         // Record finish for timing/ITL accounting even when timing is not returned to the client.
         // Kept at call site because it's a side effect on the tracker — not a gating decision.
@@ -738,6 +767,32 @@ mod tests {
             })),
             routing_data: None,
         }
+    }
+
+    #[test]
+    fn finish_frame_carries_per_candidate_usage() {
+        // Streaming spec P0.4: the end frame gets a per-candidate usage
+        // snapshot; increment frames get none.
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-p04".to_string());
+
+        let mut increment = final_backend_output();
+        increment.finish_reason = None;
+        increment.token_ids = vec![1, 2, 3];
+        let response = generator
+            .choice_from_postprocessor(increment)
+            .expect("increment");
+        assert!(response.choice_usage.is_none());
+
+        let mut end = final_backend_output();
+        end.token_ids = vec![4];
+        let response = generator.choice_from_postprocessor(end).expect("finish");
+        let usage = response.choice_usage.expect("end frame usage");
+        assert_eq!(usage.completion_tokens, 4, "per-candidate completion tokens");
+        assert!(
+            usage.completion_tokens_details.is_some(),
+            "P0.2 detail counters present on the per-candidate snapshot"
+        );
     }
 
     #[test]

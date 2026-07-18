@@ -407,6 +407,7 @@ fn create_response_with_linear_probs(
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     }
 }
 
@@ -490,5 +491,6 @@ fn create_multi_choice_response(
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     }
 }

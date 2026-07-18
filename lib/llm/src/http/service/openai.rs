@@ -1438,6 +1438,7 @@ async fn handler_chat_completions(
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
+    reject_include_internal_content(&body)?;
     let normalized_body = normalize_bare_image_urls(&body);
     let body_ref: &[u8] = normalized_body.as_deref().unwrap_or_else(|| body.as_ref());
     let mut request: NvCreateChatCompletionRequest =
@@ -1552,6 +1553,51 @@ where
         "Accepted request after replacing invalid UTF-8 and escaping unescaped control characters in JSON strings"
     );
     Ok(request)
+}
+
+/// Streaming output spec P0.5 (Moonshot internal extension):
+/// `stream_options.include_internal_content=true` asks for
+/// `delta.internal_content.token_id` on every increment frame. This endpoint
+/// does not yet emit per-increment token ids, and the spec forbids silently
+/// ignoring the option ("if unsupported, reject at request-body validation
+/// with a 4xx; MUST NOT silently ignore") — which is what would otherwise
+/// happen, since the typed `StreamOptions` (external dynamo-protocols crate)
+/// has no such field and serde drops the unknown key. Checked on the raw
+/// body before typed parsing, mirroring smg's ingress rejection.
+/// TODO: implement real token-id passthrough (thread the decode chunk's
+/// token ids into each content/reasoning/tool increment frame) and drop
+/// this rejection once supported.
+fn reject_include_internal_content(body: &[u8]) -> Result<(), ErrorResponse> {
+    if !body
+        .windows(b"include_internal_content".len())
+        .any(|window| window == b"include_internal_content")
+    {
+        return Ok(());
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // Malformed JSON is handled (with better diagnostics) by the typed
+        // parse below.
+        return Ok(());
+    };
+    if value
+        .get("stream_options")
+        .and_then(|opts| opts.get("include_internal_content"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        let code = StatusCode::BAD_REQUEST;
+        return Err((
+            code,
+            Json(ErrorMessage {
+                message: "stream_options.include_internal_content is not supported by this endpoint"
+                    .to_string(),
+                error_type: map_error_code_to_error_type(code),
+                code: code.as_u16(),
+                details: None,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 /// Normalize Moonshot-compatible bare-string image URLs before typed parsing.
@@ -2036,7 +2082,7 @@ pub(crate) fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamRespon
                 content,
                 function_call,
                 tool_calls,
-                role: _,
+                role,
                 refusal,
                 reasoning_content,
             } = &c.delta;
@@ -2047,7 +2093,11 @@ pub(crate) fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamRespon
                 Some(ChatCompletionMessageContent::Text(t)) => t.is_empty(),
                 Some(ChatCompletionMessageContent::Parts(p)) => p.is_empty(),
             };
-            c.finish_reason.is_none()
+            // A role-carrying delta is never empty: the canonical first frame
+            // is exactly {"role":"assistant","content":""} (streaming spec
+            // P0.9/P1.5) and must reach the wire.
+            role.is_none()
+                && c.finish_reason.is_none()
                 && c.logprobs.is_none()
                 && content_empty
                 && function_call.is_none()
@@ -4005,6 +4055,24 @@ mod tests {
     };
 
     #[test]
+    fn include_internal_content_true_is_rejected() {
+        // P0.5: must reject, never silently ignore.
+        let body = br#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true,"include_internal_content":true}}"#;
+        let err = reject_include_internal_content(body).expect_err("must reject");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.0.message.contains("include_internal_content"));
+
+        // false / absent / other fields pass through.
+        for ok_body in [
+            br#"{"stream_options":{"include_usage":true,"include_internal_content":false}}"#.as_slice(),
+            br#"{"stream_options":{"include_usage":true}}"#.as_slice(),
+            br#"{"messages":[{"content":"include_internal_content"}]}"#.as_slice(),
+        ] {
+            reject_include_internal_content(ok_body).expect("must pass");
+        }
+    }
+
+    #[test]
     fn bare_string_image_url_is_normalized_to_object() {
         let body = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"http://example.com/y.png"}]}]}"#;
         let out =
@@ -5656,6 +5724,7 @@ mod tests {
                 },
                 nvext: None,
                 llm_metrics: None,
+                choice_usage: None,
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -5696,6 +5765,7 @@ mod tests {
                 },
                 nvext: None,
                 llm_metrics: None,
+                choice_usage: None,
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -6131,6 +6201,7 @@ mod tests {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         };
         Annotated {
             id: Some("test-id".to_string()),
@@ -6765,6 +6836,7 @@ mod tests {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         }
     }
 
@@ -6774,6 +6846,22 @@ mod tests {
         assert!(
             is_empty_stream_response(&make_delta(None, None, None, None, None, None, None, None)),
             "all-None delta → empty",
+        );
+
+        // Not empty: the canonical first frame {"role":"assistant","content":""}
+        // (streaming spec P0.9/P1.5) must never be dropped as an assembly artifact.
+        assert!(
+            !is_empty_stream_response(&make_delta(
+                Some(""),
+                None,
+                None,
+                None,
+                None,
+                Some(Role::Assistant),
+                None,
+                None
+            )),
+            "role-carrying first frame → not empty",
         );
 
         // Not empty: has content
@@ -6867,9 +6955,13 @@ mod tests {
             "usage present → not empty",
         );
 
-        // Role-only: still empty (backends repeat role on every chunk)
+        // Role-only: NOT empty. The wire-shape stage emits role exactly once,
+        // on the canonical first frame, and strips it everywhere else — so a
+        // role-carrying delta is always meaningful. (Historically this was
+        // "empty" because backends repeated role on every chunk; that noise is
+        // now removed upstream by wire_shape.)
         assert!(
-            is_empty_stream_response(&make_delta(
+            !is_empty_stream_response(&make_delta(
                 None,
                 None,
                 None,
@@ -6879,7 +6971,7 @@ mod tests {
                 None,
                 None,
             )),
-            "role-only → empty",
+            "role-only → not empty",
         );
 
         // Not empty: has refusal

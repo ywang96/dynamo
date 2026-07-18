@@ -16,18 +16,19 @@ pub mod lightseek_mm;
 pub mod media;
 pub mod prompt;
 pub mod speculative_prefill;
+mod stop_scope;
 mod structural_tag;
 mod tool_choice;
 pub mod tools;
 mod unified;
 mod walle;
+mod wire_shape;
 
 /// Parser names implemented by the delegated unified vLLM parser path.
 ///
 /// These names are absent from the split-parser registries in `dynamo-parsers`
 /// and must still be exposed to CLI validation.
 pub const DELEGATED_UNIFIED_PARSERS: &[&str] = &["kimi_k3"];
-
 use anyhow::Context;
 use anyhow::{Result, bail};
 
@@ -2225,7 +2226,7 @@ impl OpenAIPreprocessor {
                     self.tokenizer.clone(),
                     prompt_token_ids,
                 )?;
-            return Ok(transformed_stream);
+            return Ok(Box::pin(wire_shape::shape_chat_stream(transformed_stream)));
         }
 
         // Guided output may be bare JSON or `reasoning</think>JSON`. Supported
@@ -2379,7 +2380,7 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
-        Ok(transformed_stream)
+        Ok(Box::pin(wire_shape::shape_chat_stream(transformed_stream)))
     }
 
     pub fn transform_postprocessor_stream<S, Resp>(
@@ -2878,6 +2879,11 @@ impl OpenAIPreprocessor {
         struct PendingMetrics {
             template: Option<LLMMetricAnnotation>,
             chunk_tokens: usize,
+            /// Per-candidate end-frame usage (P0.4): the jail consumes the
+            /// backend finish frame and synthesizes its own final chunks, so
+            /// the wrapper-level `choice_usage` must be buffered across the
+            /// boundary and reattached to the emitted finish frame.
+            choice_usage: Option<dynamo_protocols::types::CompletionUsage>,
         }
         let pending = Arc::new(Mutex::new(PendingMetrics::default()));
         let pending_in = Arc::clone(&pending);
@@ -2888,6 +2894,10 @@ impl OpenAIPreprocessor {
                 let mut p = pending_in.lock().expect("jail metrics buffer poisoned");
                 p.chunk_tokens = p.chunk_tokens.saturating_add(metrics.chunk_tokens);
                 p.template = Some(metrics);
+            }
+            if let Some(choice_usage) = a.data.as_mut().and_then(|nv| nv.choice_usage.take()) {
+                let mut p = pending_in.lock().expect("jail metrics buffer poisoned");
+                p.choice_usage = Some(choice_usage);
             }
             JailAnnotated {
                 data: a.data.map(|nv| nv.inner),
@@ -2918,11 +2928,30 @@ impl OpenAIPreprocessor {
                     metrics
                 })
             });
+            // Reattach the buffered per-candidate usage (P0.4) to the frame
+            // the jail emits with a finish_reason — the backend's original
+            // finish frame was consumed while jailed.
+            let has_finish = a.data.as_ref().is_some_and(|inner| {
+                inner
+                    .choices
+                    .iter()
+                    .any(|choice| choice.finish_reason.is_some())
+            });
+            let choice_usage = if has_finish {
+                pending
+                    .lock()
+                    .expect("jail metrics buffer poisoned")
+                    .choice_usage
+                    .take()
+            } else {
+                None
+            };
             Annotated {
                 data: a.data.map(|inner| NvCreateChatCompletionStreamResponse {
                     inner,
                     nvext: None,
                     llm_metrics,
+                    choice_usage,
                 }),
                 id: a.id,
                 event: a.event,
@@ -3548,6 +3577,26 @@ impl
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
 
+        // P1.1 content-scoped stop: engine-side stop scanning matches over
+        // everything the model generates, so a stop string appearing inside
+        // reasoning or tool-call markup kills the request before any answer
+        // is produced. When a parser is active (reasoning or tool calls),
+        // withhold `stop` strings from the backend and enforce them
+        // frontend-side on `delta.content` only (see stop_scope.rs).
+        // `stop_token_ids` remain engine-side.
+        let frontend_stop_sequences = if self.runtime_config.reasoning_parser.is_some()
+            || self.tool_call_parser.is_some()
+        {
+            common_request
+                .stop_conditions
+                .stop
+                .take()
+                .filter(|stops| !stops.is_empty())
+        } else {
+            None
+        };
+        let expected_candidates = request.inner.n.map(|n| n.max(1) as usize).unwrap_or(1);
+
         // Capture media counts before `common_request` is moved into the context.
         let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
 
@@ -3608,6 +3657,20 @@ impl
             uses_tool_call_structural_tag,
             &prompt_token_ids,
         )?;
+
+        // Enforce withheld stop sequences on content increments only.
+        let transformed_stream: Pin<
+            Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+        > = if let Some(stop_sequences) = frontend_stop_sequences {
+            Box::pin(stop_scope::scan_content_stop(
+                transformed_stream,
+                stop_sequences,
+                expected_candidates,
+                context.clone(),
+            ))
+        } else {
+            Box::pin(transformed_stream)
+        };
 
         // Apply request payload aggregation strategy.
         // The payload branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,

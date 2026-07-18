@@ -622,6 +622,7 @@ mod tests {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         };
 
         Annotated {
@@ -671,6 +672,7 @@ mod tests {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         };
         Annotated {
             data: Some(data),
@@ -1187,6 +1189,7 @@ mod tests {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         };
 
         // Wrap it in Annotated and create a stream

@@ -119,6 +119,7 @@ fn load_test_data(file_path: &str) -> TestData {
                 },
                 nvext: None,
                 llm_metrics: None,
+                choice_usage: None,
             };
 
             Annotated {
@@ -1427,6 +1428,7 @@ mod tests {
                 },
                 nvext: None,
                 llm_metrics: None,
+                choice_usage: None,
             }),
             event: None,
             comment: None,
@@ -1979,6 +1981,7 @@ mod tests {
                         detokenize_count: None,
                         ..Default::default()
                     }),
+                    choice_usage: None,
                 }),
                 id: None,
                 event: None,

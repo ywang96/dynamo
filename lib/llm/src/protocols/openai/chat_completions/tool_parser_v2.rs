@@ -431,6 +431,7 @@ mod tests {
             },
             nvext: None,
             llm_metrics: None,
+            choice_usage: None,
         };
         Annotated {
             data: Some(response),

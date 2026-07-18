@@ -149,8 +149,14 @@ impl MergedToolCall {
 #[tokio::test]
 async fn postprocessor_parsing_stream_replays_unit_test_fixture() {
     let preprocessor = build_preprocessor(None, None);
-    let (request, expected_stream_json, input_chunks) =
+    // The fixture provides the recorded input chunks. The pipeline is no
+    // longer an identity transform — the wire-shape stage injects the
+    // canonical first frame, strips roles, and splits end frames — so the
+    // expected output lives in a separate golden file. Regenerate it with
+    // UPDATE_REPLAY_FIXTURES=1 after intentional shape changes.
+    let (request, _input_json, input_chunks) =
         parse_fixture(&fixture_path("stream_interval_1.jsonl"));
+    let expected_path = fixture_path("stream_interval_1.shaped.jsonl");
 
     let input_stream = stream::iter(input_chunks.into_iter().map(Annotated::from_data));
     let output_stream = preprocessor
@@ -159,20 +165,40 @@ async fn postprocessor_parsing_stream_replays_unit_test_fixture() {
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
+    let output_json: Vec<Value> = output_chunks
+        .iter()
+        .map(|output| {
+            let output_data = output
+                .data
+                .as_ref()
+                .expect("output stream chunk should include data");
+            serde_json::to_value(output_data).unwrap()
+        })
+        .collect();
 
-    assert_eq!(output_chunks.len(), expected_stream_json.len());
+    if std::env::var("UPDATE_REPLAY_FIXTURES").is_ok() {
+        let mut lines = String::new();
+        for value in &output_json {
+            lines.push_str(&serde_json::to_string(value).unwrap());
+            lines.push('\n');
+        }
+        fs::write(&expected_path, lines).unwrap();
+    }
 
-    for (idx, (output, expected)) in output_chunks
+    let expected_stream_json: Vec<Value> = fs::read_to_string(&expected_path)
+        .unwrap_or_else(|e| panic!("failed to read golden {}: {e}", expected_path.display()))
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    assert_eq!(output_json.len(), expected_stream_json.len());
+    for (idx, (output, expected)) in output_json
         .iter()
         .zip(expected_stream_json.iter())
         .enumerate()
     {
-        let output_data = output
-            .data
-            .as_ref()
-            .expect("output stream chunk should include data");
-        let output_json = serde_json::to_value(output_data).unwrap();
-        assert_eq!(output_json, *expected, "chunk {idx} did not match fixture");
+        assert_eq!(*output, *expected, "chunk {idx} did not match golden");
     }
 }
 
@@ -335,6 +361,7 @@ fn mock_content_chunk(content: &str) -> NvCreateChatCompletionStreamResponse {
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     }
 }
 
@@ -378,6 +405,7 @@ fn mock_multi_choice_content_chunk(
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     }
 }
 
@@ -418,6 +446,7 @@ fn mock_reasoning_only_chunk(reasoning: &str) -> NvCreateChatCompletionStreamRes
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     }
 }
 
@@ -453,6 +482,7 @@ fn mock_final_chunk() -> NvCreateChatCompletionStreamResponse {
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     }
 }
 

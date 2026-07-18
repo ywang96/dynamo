@@ -140,6 +140,11 @@ async fn preserves_unified_event_order() {
             continue;
         };
         for choice in data.inner.choices {
+            // Skip the wire-shape stage's canonical first frame
+            // ({"role":"assistant","content":""}) — it carries no increment.
+            if choice.delta.role.is_some() {
+                continue;
+            }
             if let Some(reasoning) = choice.delta.reasoning_content {
                 events.push(format!("reasoning:{reasoning}"));
             }
@@ -152,9 +157,9 @@ async fn preserves_unified_event_order() {
                     events.push(format!(
                         "tool:{}:{}:{}:{}",
                         tool_call.index,
-                        tool_call.id.unwrap(),
-                        function.name.unwrap(),
-                        function.arguments.unwrap()
+                        tool_call.id.as_deref().unwrap_or("-"),
+                        function.name.as_deref().unwrap_or("-"),
+                        function.arguments.unwrap_or_default()
                     ));
                 }
             }
@@ -162,14 +167,21 @@ async fn preserves_unified_event_order() {
         }
     }
 
+    // The wire-shape stage splits each complete tool call into a header chunk
+    // (id + name + empty arguments) followed by an arguments-only continuation
+    // (P0.13/P0.14).
     assert_eq!(
         events,
         [
             "reasoning:Inspect ",
             "reasoning:forecast",
+            // P1.7 end-of-thinking boundary: standalone reasoning_content "".
+            "reasoning:",
             "content:I will check.",
-            "tool:0:get_weather:0:get_weather:{\"city\":\"Paris\"}",
-            "tool:1:get_time:1:get_time:{\"zone\":\"UTC\"}",
+            "tool:0:get_weather:0:get_weather:",
+            "tool:0:-:-:{\"city\":\"Paris\"}",
+            "tool:1:get_time:1:get_time:",
+            "tool:1:-:-:{\"zone\":\"UTC\"}",
         ]
     );
     assert_eq!(finish_reasons, [FinishReason::ToolCalls]);

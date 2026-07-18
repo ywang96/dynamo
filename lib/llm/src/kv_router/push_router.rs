@@ -58,7 +58,9 @@ fn monitor_response_stream(
     context: Arc<dyn AsyncEngineContext>,
     context_id: String,
     mut guard: RequestGuard,
+    expected_candidates: usize,
 ) -> impl futures::Stream<Item = Annotated<LLMEngineOutput>> + Send {
+    let expected_candidates = expected_candidates.max(1);
     async_stream::stream! {
         // Keep one cancellation future alive for the whole response stream. Calling
         // `stopped()` for every item repeatedly clones and polls a watch receiver.
@@ -66,6 +68,11 @@ fn monitor_response_stream(
         tokio::pin!(stopped);
 
         let mut failed = false;
+        // With n>1 the engine multiplexes candidates on one stream and each
+        // candidate carries its own finish_reason. The request is terminal
+        // only once every expected candidate has finished — breaking on the
+        // first finish would truncate the remaining candidates mid-stream.
+        let mut finished_candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let completed = loop {
             tokio::select! {
                 biased;
@@ -81,7 +88,16 @@ fn monitor_response_stream(
                     };
                     failed |= response_item_failed(&item);
                     guard.on_item(&item).await;
-                    let completed_terminal = !failed && response_item_completed(&item);
+                    if !failed && response_item_completed(&item) {
+                        let index = item
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.index)
+                            .unwrap_or(0);
+                        finished_candidates.insert(index);
+                    }
+                    let completed_terminal =
+                        !failed && finished_candidates.len() >= expected_candidates;
                     if completed_terminal {
                         guard.mark_completed_terminal();
                     }
@@ -335,6 +351,11 @@ impl KvPushRouter {
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let context_id = request.context().id().to_string();
         let request_context = request.context().clone();
+        let expected_candidates = request
+            .sampling_options
+            .n
+            .map(|n| n.max(1) as usize)
+            .unwrap_or(1);
         let phase = request
             .tracker
             .as_ref()
@@ -390,6 +411,7 @@ impl KvPushRouter {
             context_for_monitoring,
             context_id,
             guard,
+            expected_candidates,
         ));
         Ok(ResponseStream::new(wrapped_stream, stream_context))
     }
@@ -858,7 +880,8 @@ mod tests {
                 Arc::clone(&context),
             );
             {
-                let monitored = monitor_response_stream(source, context, request_id.clone(), guard);
+                let monitored =
+                    monitor_response_stream(source, context, request_id.clone(), guard, 1);
                 tokio::pin!(monitored);
                 let item = monitored.next().await.unwrap();
                 assert_eq!(
@@ -888,6 +911,94 @@ mod tests {
                     },
                 ]
             );
+        }
+
+        // n>1: the stream is terminal only once EVERY candidate has finished.
+        // Candidate 1's frames after candidate 0's finish must still be
+        // yielded (regression: the monitor used to break on the first finish,
+        // truncating the remaining candidates mid-generation).
+        {
+            let request_id = "multi-candidate".to_string();
+            let mut response = scheduler
+                .schedule_request(ScheduleRequest {
+                    mode: ScheduleMode::TrackedWithAdmission {
+                        request_id: request_id.clone(),
+                    },
+                    token_seq: Some(vec![1]),
+                    block_hashes: None,
+                    isl_tokens: 1,
+                    lora_name: None,
+                    expected_output_tokens: None,
+                    pinned_worker: None,
+                    allowed_worker_ids: None,
+                    routing_constraints: RoutingConstraints::default(),
+                    router_config_override: None,
+                    priority_jump: 0.0,
+                    strict_priority: 0,
+                    policy_class: None,
+                    session_id: None,
+                    overlap: OverlapSignals::default(),
+                    shared_cache_hits: None,
+                })
+                .await
+                .unwrap();
+            let mut guard = RequestGuard::new(
+                Arc::clone(&router.chooser),
+                Arc::clone(&router.request_metrics),
+                request_id.clone(),
+                &request(),
+                true,
+                response.request_progress.take(),
+                response.admission_lease.take(),
+            );
+            guard.mark_dispatched().await;
+
+            let output = |index: u32, finish: Option<FinishReason>| {
+                Annotated::from_data(LLMEngineOutput {
+                    index: Some(index),
+                    finish_reason: finish,
+                    ..Default::default()
+                })
+            };
+            let context = Context::new(()).context();
+            let source = ResponseStream::new(
+                Box::pin(stream::iter([
+                    output(0, None),
+                    output(0, Some(FinishReason::Stop)),
+                    output(1, None),
+                    output(1, Some(FinishReason::Stop)),
+                ])),
+                Arc::clone(&context),
+            );
+            let monitored =
+                monitor_response_stream(source, context, request_id.clone(), guard, 2);
+            tokio::pin!(monitored);
+            let mut yielded = Vec::new();
+            while let Some(item) = monitored.next().await {
+                yielded.push((
+                    item.data.as_ref().and_then(|o| o.index),
+                    item.data.as_ref().and_then(|o| o.finish_reason.clone()),
+                ));
+            }
+            assert_eq!(
+                yielded,
+                [
+                    (Some(0), None),
+                    (Some(0), Some(FinishReason::Stop)),
+                    (Some(1), None),
+                    (Some(1), Some(FinishReason::Stop)),
+                ],
+                "all candidates' frames must be yielded, including after the first finish"
+            );
+
+            // 3 loop requests + this one, each reporting Dispatched + Completed.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while events.lock().unwrap().len() < 8 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("multi-candidate stream did not report admission completion");
         }
 
         assert!(

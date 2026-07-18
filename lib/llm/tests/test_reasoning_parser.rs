@@ -50,6 +50,7 @@ fn create_mock_response_chunk(
         },
         nvext: None,
         llm_metrics: None,
+        choice_usage: None,
     };
 
     Annotated {
