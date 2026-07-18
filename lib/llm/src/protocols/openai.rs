@@ -314,6 +314,11 @@ pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
     /// Get the current usage statistics with properly calculated total_tokens.
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage;
 
+    /// Provide the reasoning-boundary marker token ids (`<think>`/`</think>`) so the
+    /// generator can derive `reasoning_tokens` from the generated token stream when
+    /// the backend reports no count. Default no-op (only the chat generator uses it).
+    fn set_reasoning_markers(&mut self, _start_id: Option<u32>, _end_id: Option<u32>) {}
+
     /// Returns the request tracker if available, for accessing worker timing metrics.
     fn tracker(&self) -> Option<std::sync::Arc<common::timing::RequestTracker>> {
         None

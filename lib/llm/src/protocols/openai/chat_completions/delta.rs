@@ -58,6 +58,15 @@ pub struct DeltaGenerator {
     options: DeltaGeneratorOptions,
     /// Request tracker for per-request metrics (shared with PreprocessedRequest).
     tracker: Arc<RequestTracker>,
+    /// Token id of the reasoning-start marker (`<think>`), resolved from the
+    /// tokenizer by the preprocessor. `None` when unavailable or not a single
+    /// token. Used to derive `reasoning_tokens` when the backend reports none.
+    reasoning_start_id: Option<u32>,
+    /// Token id of the reasoning-end marker (`</think>`).
+    reasoning_end_id: Option<u32>,
+    /// Full generated token-id sequence, accumulated across streamed chunks, used
+    /// to locate the `<think>`/`</think>` span for reasoning-token derivation.
+    reasoning_output_ids: Vec<u32>,
 }
 
 impl DeltaGenerator {
@@ -74,7 +83,47 @@ impl DeltaGenerator {
             msg_counter: 0,
             options,
             tracker,
+            reasoning_start_id: None,
+            reasoning_end_id: None,
+            reasoning_output_ids: Vec::new(),
         }
+    }
+
+    /// Derive the reasoning-token count from the generated token-id stream, used
+    /// when the backend reports none (vLLM/TRT-LLM/MLX). Reasoning tokens are
+    /// those between `<think>` and `</think>`. The prefill case (model pre-opens
+    /// `<think>`, so it is absent from the output) is auto-detected: if `<think>`
+    /// is not seen but `</think>` is, counting starts at token 0. A `<think>` with
+    /// no `</think>` ran to the end (truncated mid-thinking). Returns 0 when no
+    /// reasoning span is present (e.g. thinking disabled).
+    fn derive_reasoning_tokens(
+        output_ids: &[u32],
+        start_id: Option<u32>,
+        end_id: Option<u32>,
+    ) -> u32 {
+        let (start, think_seen) =
+            match start_id.and_then(|s| output_ids.iter().position(|&t| t == s)) {
+                Some(pos) => (pos + 1, true),
+                None => (0usize, false),
+            };
+        let end = end_id.and_then(|e| {
+            output_ids[start.min(output_ids.len())..]
+                .iter()
+                .position(|&t| t == e)
+                .map(|rel| start + rel)
+        });
+        let count = match (think_seen, end) {
+            // `<think>` in the output: reasoning runs to `</think>`, or to the end
+            // if it never appears (truncated mid-thinking).
+            (true, Some(e)) => e.saturating_sub(start),
+            (true, None) => output_ids.len().saturating_sub(start),
+            // No `<think>` but a `</think>`: the model pre-opened `<think>` in the
+            // prefill, so reasoning is [0, `</think>`).
+            (false, Some(e)) => e,
+            // Neither marker: no reasoning span.
+            (false, None) => 0,
+        };
+        count as u32
     }
 
     /// Returns the request tracker. Tracking is enabled. For sharing with PreprocessedRequest.
@@ -231,6 +280,36 @@ impl DeltaGenerator {
     pub fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage {
         let mut usage = self.usage.clone();
         usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+
+        // Streaming spec P0.2: the usage object must carry `reasoning_tokens` and
+        // `cached_tokens` as integers (0 when absent), never null or omitted. The
+        // upstream (async-openai) `CompletionUsage` skips the `*_details` objects
+        // entirely when `None`, so populate both and zero-fill every numeric field
+        // to keep the whole usage object null-free.
+        let mut ctd = usage.completion_tokens_details.take().unwrap_or_default();
+        // Prefer a backend-reported reasoning-token count; otherwise derive it from
+        // the generated token stream (vLLM/TRT-LLM/MLX carry no such count, so
+        // `reasoning_tokens` would otherwise be a hardcoded 0 even when the model
+        // reasoned).
+        let reasoning_tokens = match ctd.reasoning_tokens {
+            Some(n) if n > 0 => n,
+            _ => Self::derive_reasoning_tokens(
+                &self.reasoning_output_ids,
+                self.reasoning_start_id,
+                self.reasoning_end_id,
+            ),
+        };
+        ctd.reasoning_tokens = Some(reasoning_tokens);
+        ctd.audio_tokens = Some(ctd.audio_tokens.unwrap_or(0));
+        ctd.accepted_prediction_tokens = Some(ctd.accepted_prediction_tokens.unwrap_or(0));
+        ctd.rejected_prediction_tokens = Some(ctd.rejected_prediction_tokens.unwrap_or(0));
+        usage.completion_tokens_details = Some(ctd);
+
+        let mut ptd = usage.prompt_tokens_details.take().unwrap_or_default();
+        ptd.cached_tokens = Some(ptd.cached_tokens.unwrap_or(0));
+        ptd.audio_tokens = Some(ptd.audio_tokens.unwrap_or(0));
+        usage.prompt_tokens_details = Some(ptd);
+
         usage
     }
 }
@@ -240,6 +319,11 @@ impl DeltaGenerator {
 impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamResponse>
     for DeltaGenerator
 {
+    fn set_reasoning_markers(&mut self, start_id: Option<u32>, end_id: Option<u32>) {
+        self.reasoning_start_id = start_id;
+        self.reasoning_end_id = end_id;
+    }
+
     /// Converts a backend response into a structured OpenAI-style streaming response.
     ///
     /// * `delta` - The backend response containing generated text and metadata.
@@ -258,6 +342,10 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
         self.usage.completion_tokens += token_length;
 
+        // Accumulate the full generated token-id stream so `get_usage` can locate
+        // the `<think>`/`</think>` span for reasoning-token derivation.
+        self.reasoning_output_ids.extend_from_slice(&delta.token_ids);
+
         // If backend provides completion_usage, use it to update usage stats
         // This is critical for prompt embeddings where prompt_tokens comes from
         // the embedding sequence length computed by the worker
@@ -268,6 +356,14 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             // Propagate prompt token details if provided
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
                 self.usage.prompt_tokens_details = Some(prompt_details.clone());
+            }
+
+            // Propagate completion token details (e.g. reasoning_tokens) if the
+            // backend reports them. The chat path previously dropped these, so a
+            // backend-reported reasoning_tokens count never reached the usage
+            // frame (the completions path already does this).
+            if let Some(completion_details) = completion_usage.completion_tokens_details.as_ref() {
+                self.usage.completion_tokens_details = Some(completion_details.clone());
             }
         }
 
@@ -379,6 +475,42 @@ mod tests {
     use super::*;
     use crate::protocols::common::{self, llm_backend::BackendOutput, timing::WORKER_TYPE_PREFILL};
     use crate::protocols::openai::DeltaGeneratorExt;
+
+    #[test]
+    fn derive_reasoning_tokens_counts_the_think_span() {
+        let start = Some(100u32); // <think>
+        let end = Some(200u32); // </think>
+
+        // Toggleable model, thinking on: explicit <think> in the output; reasoning
+        // is between the markers. [c, <think>, r, r, </think>, c] -> 2.
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2, 200, 9], start, end),
+            2
+        );
+        // Toggleable, <think> emitted but truncated before </think>: to the end.
+        // [c, <think>, r, r, r] -> 3.
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2, 3], start, end),
+            3
+        );
+        // Prefill model: <think> pre-opened (absent from output), </think> present.
+        // [r, r, r, </think>, c] -> 3.
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(&[1, 2, 3, 200, 9], start, end),
+            3
+        );
+        // No reasoning (thinking off): neither marker -> 0.
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(&[9, 9, 9], start, end),
+            0
+        );
+        // <think> present but </think> id unresolved -> counts to the end.
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2], start, None),
+            2
+        );
+    }
+
     use dynamo_protocols::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
@@ -475,6 +607,81 @@ mod tests {
             encoder_result: None,
             routing_data: None,
         }
+    }
+
+    #[test]
+    fn usage_always_includes_reasoning_and_cached_tokens_as_integers() {
+        // Streaming spec P0.2: reasoning_tokens + cached_tokens must be present
+        // integers (0 when absent), never null/omitted — even when the backend
+        // reports no token details.
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-usage-zero".to_string());
+        generator
+            .choice_from_postprocessor(final_backend_output())
+            .unwrap();
+        let usage = generator.get_usage();
+
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .expect("completion_tokens_details must be present (P0.2)")
+                .reasoning_tokens,
+            Some(0),
+            "reasoning_tokens must be integer 0, not null/omitted"
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .expect("prompt_tokens_details must be present (P0.2)")
+                .cached_tokens,
+            Some(0),
+            "cached_tokens must be integer 0, not null/omitted"
+        );
+
+        // And the serialized JSON must carry them as integers (never null).
+        let v = serde_json::to_value(&usage).unwrap();
+        assert!(
+            v["completion_tokens_details"]["reasoning_tokens"].is_u64(),
+            "reasoning_tokens must serialize as an integer, got {}",
+            v["completion_tokens_details"]["reasoning_tokens"]
+        );
+        assert!(
+            v["prompt_tokens_details"]["cached_tokens"].is_u64(),
+            "cached_tokens must serialize as an integer, got {}",
+            v["prompt_tokens_details"]["cached_tokens"]
+        );
+    }
+
+    #[test]
+    fn backend_reasoning_tokens_propagate_to_usage() {
+        // A backend-reported reasoning_tokens / cached_tokens count must reach the
+        // usage frame (the chat path previously dropped completion_tokens_details).
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-usage-prop".to_string());
+        let mut output = final_backend_output();
+        output.completion_usage = Some(dynamo_protocols::types::CompletionUsage {
+            prompt_tokens: 5,
+            completion_tokens: 0,
+            total_tokens: 5,
+            prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
+                cached_tokens: Some(3),
+                ..Default::default()
+            }),
+            completion_tokens_details: Some(dynamo_protocols::types::CompletionTokensDetails {
+                reasoning_tokens: Some(7),
+                ..Default::default()
+            }),
+        });
+        generator.choice_from_postprocessor(output).unwrap();
+        let usage = generator.get_usage();
+
+        assert_eq!(
+            usage.completion_tokens_details.unwrap().reasoning_tokens,
+            Some(7)
+        );
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(3));
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {

@@ -3492,6 +3492,20 @@ impl
             response_generator.update_isl(isl);
         }
 
+        // Reasoning-token derivation: give the generator the `<think>`/`</think>`
+        // marker ids (resolved from the tokenizer, single-token only) so it can
+        // count reasoning tokens from the generated stream when the backend reports
+        // none. Only when a reasoning parser is active for this model.
+        if self.runtime_config.reasoning_parser.is_some() {
+            let resolve = |marker: &str| -> Option<u32> {
+                match self.tokenizer.encode(marker).ok()?.token_ids() {
+                    [id] => Some(*id),
+                    _ => None,
+                }
+            };
+            response_generator.set_reasoning_markers(resolve("<think>"), resolve("</think>"));
+        }
+
         let prompt_token_ids = common_request.token_ids.clone();
 
         // repack the common completion request
