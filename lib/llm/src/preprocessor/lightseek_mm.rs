@@ -297,19 +297,22 @@ fn read_json(model_dir: &Path, filename: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// Read the chat-template placeholder id from a pre-parsed `config.json`:
-/// the literal `image_token_id` field (Qwen2-VL / Qwen2.5-VL, where the
-/// template-emitted placeholder differs from the per-patch expansion token
-/// returned by the spec), falling back to `media_placeholder_token_id`
-/// (Moonshot Kimi configs). For Kimi-K2.5 the fallback is a no-op — the
-/// per-model spec already resolves the same id into `image_token_id` — but
-/// Kimi-K3 has no `llm-multimodal` spec yet, so this fallback is the only
-/// source that lets its `<|media_pad|>` placeholder resolve from
-/// `config.json` alone.
+/// Read the literal `image_token_id` field from a pre-parsed `config.json`.
+/// Used by Qwen2-VL / Qwen2.5-VL where the chat-template-emitted placeholder
+/// is a single special token that differs from the per-patch expansion token
+/// returned by the spec.
+///
+/// Kimi-K3 is intentionally NOT resolved here: its chat placeholder is the
+/// unexpanded `<|kimi_image_placeholder|>`, which is not a special token and
+/// BPE-splits into several ordinary ids, so there is no single placeholder
+/// token id for exact MM-aware routing to align on. Such requests fall back to
+/// text-prefix routing (see `gather_mm_exact_routing_info`). Resolving
+/// `media_placeholder_token_id` (`<|media_pad|>`) here would be wrong — the
+/// frontend never emits that token; the backend only produces it inside its
+/// own placeholder expansion.
 fn extract_chat_placeholder_from_config(config: &serde_json::Value) -> Option<TokenIdType> {
     config
         .get("image_token_id")
-        .or_else(|| config.get("media_placeholder_token_id"))
         .and_then(|x| x.as_u64())
         .and_then(|id| u32::try_from(id).ok())
 }
@@ -414,17 +417,16 @@ mod tests {
     }
 
     #[test]
-    fn chat_placeholder_falls_back_to_media_placeholder_token_id() {
-        // Kimi-shaped config: only `media_placeholder_token_id` present.
-        let kimi = serde_json::json!({ "media_placeholder_token_id": 163605 });
-        assert_eq!(extract_chat_placeholder_from_config(&kimi), Some(163605));
+    fn chat_placeholder_resolves_image_token_id_only() {
+        // Qwen-shaped config: single-special-token placeholder.
+        let qwen = serde_json::json!({ "image_token_id": 151655 });
+        assert_eq!(extract_chat_placeholder_from_config(&qwen), Some(151655));
 
-        // `image_token_id` wins when both fields exist (Qwen semantics kept).
-        let both = serde_json::json!({
-            "image_token_id": 42,
-            "media_placeholder_token_id": 163605
-        });
-        assert_eq!(extract_chat_placeholder_from_config(&both), Some(42));
+        // Kimi-K3 exposes only `media_placeholder_token_id`; it is intentionally
+        // NOT used as the chat placeholder (its placeholder is the multi-token
+        // `<|kimi_image_placeholder|>`), so exact MM routing resolves nothing.
+        let kimi = serde_json::json!({ "media_placeholder_token_id": 163605 });
+        assert_eq!(extract_chat_placeholder_from_config(&kimi), None);
 
         // Neither field -> None.
         let neither = serde_json::json!({ "model_type": "kimi_k3" });

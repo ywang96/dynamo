@@ -19,9 +19,6 @@ use dynamo_llm::preprocessor::prompt::kimi_k3::renderer::{
 };
 use serde_json::Value;
 
-const KIMI_IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
-const MEDIA_PAD: &str = "<|media_pad|>";
-
 fn goldens_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/kimi_k3/goldens")
 }
@@ -37,19 +34,6 @@ fn golden_files() -> Vec<PathBuf> {
     files
 }
 
-/// The image path substitutes each image part's placeholder into the content
-/// string before the renderer runs; mirror that here so the media-pad case
-/// reaches `build_chat_segments` in production shape.
-fn substitute_placeholder(messages: &mut [Value]) {
-    for m in messages {
-        if let Some(Value::String(s)) = m.get_mut("content")
-            && s.contains(KIMI_IMAGE_PLACEHOLDER)
-        {
-            *s = s.replace(KIMI_IMAGE_PLACEHOLDER, MEDIA_PAD);
-        }
-    }
-}
-
 /// Map a golden `kwargs` object onto `RenderArgs`.
 fn args_from_kwargs(kwargs: &Value) -> RenderArgs {
     let mut args = RenderArgs::default();
@@ -62,10 +46,6 @@ fn args_from_kwargs(kwargs: &Value) -> RenderArgs {
                 "thinking_effort" => args.thinking_effort = v.as_str().map(str::to_string),
                 "tool_choice" => args.tool_choice = v.as_str().map(str::to_string),
                 "response_format" => args.response_format = Some(v.clone()),
-                // python-side only: gen_goldens passes image_prompts so
-                // encoding_k3.py splices <|media_pad|> at the placeholder; the
-                // Rust renderer handles the placeholder in content directly.
-                "image_prompts" => {}
                 other => panic!("unhandled golden kwarg: {other}"),
             }
         }
@@ -76,8 +56,7 @@ fn args_from_kwargs(kwargs: &Value) -> RenderArgs {
 fn golden_case(path: &Path) -> (String, Vec<Value>, Option<Value>, RenderArgs, String) {
     let name = path.file_stem().unwrap().to_string_lossy().to_string();
     let golden: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let mut messages: Vec<Value> = golden["messages"].as_array().cloned().unwrap_or_default();
-    substitute_placeholder(&mut messages);
+    let messages: Vec<Value> = golden["messages"].as_array().cloned().unwrap_or_default();
     let tools: Option<Value> = golden.get("tools").filter(|t| !t.is_null()).cloned();
     let args = args_from_kwargs(&golden["kwargs"]);
     let text = golden["text"].as_str().unwrap().to_string();

@@ -1,9 +1,24 @@
 {
- "name": "image_placeholder_split",
+ "name": "image_content_parts",
  "messages": [
   {
    "role": "user",
-   "content": "look <|kimi_image_placeholder|> here"
+   "content": [
+    {
+     "type": "text",
+     "text": "look "
+    },
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "http://x/a.png"
+     }
+    },
+    {
+     "type": "text",
+     "text": " here"
+    }
+   ]
   }
  ],
  "tools": null,
@@ -38,7 +53,15 @@
    "allow_special": true
   },
   {
-   "text": "look <|kimi_image_placeholder|> here",
+   "text": "look ",
+   "allow_special": false
+  },
+  {
+   "text": "<|kimi_image_placeholder|>",
+   "allow_special": true
+  },
+  {
+   "text": " here",
    "allow_special": false
   },
   {

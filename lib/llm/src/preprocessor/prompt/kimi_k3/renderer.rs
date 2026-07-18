@@ -24,11 +24,20 @@ const OPEN: &str = "<|open|>";
 const CLOSE: &str = "<|close|>";
 const SEP: &str = "<|sep|>";
 const END_OF_MSG: &str = "<|end_of_msg|>";
-/// Per-image placeholder emitted for image content; multimodal post-processing
-/// later expands it into the full media sequence.
-const MEDIA_PAD: &str = "<|media_pad|>";
-/// The model snapshot's literal image placeholder that may appear in string
-/// content (`config.json` `image_placeholder`); normalized to [`MEDIA_PAD`].
+/// Per-image placeholder emitted for image content parts (`config.json`
+/// `image_placeholder`). The vLLM Kimi-K3 backend
+/// (`KimiK3ForConditionalGeneration._get_prompt_updates`) searches the prompt
+/// for this exact placeholder and expands each occurrence into the full
+/// `<|media_begin|>image {w}x{h}<|media_content|>{pads}<|media_end|>` sequence,
+/// so the frontend must emit the *unexpanded* placeholder — one per image —
+/// exactly as the model's `encoding_k3.py` does with `image_prompts=None`.
+///
+/// Unlike `<|media_pad|>`, this is NOT a registered special token: it BPE-splits
+/// into ordinary tokens on both the frontend (fastokens) and the backend
+/// tokenizer, which is precisely what lets the backend's tokenizer-level match
+/// find it. Emitting `<|media_pad|>` here instead (a real single special token
+/// the backend never searches for) is what produced
+/// `AssertionError: Failed to apply prompt replacement for mm_items['image'][0]`.
 const KIMI_IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 
 const VALID_THINKING_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
@@ -314,32 +323,13 @@ fn end_of_msg(segs: &mut Vec<Segment>) {
     push_control(segs, END_OF_MSG);
 }
 
-/// `_append_text`: split content on media placeholders, emitting each
-/// placeholder as a `<|media_pad|>` special segment and the surrounding text
-/// ordinarily. Both the pre-substituted `<|media_pad|>` form and the model's
-/// literal `<|kimi_image_placeholder|>` are recognized. Equivalent to python
-/// `_append_text` with `image_prompts=["<|media_pad|>"]*N`.
+/// `_append_text`: emit user/tool content text as ordinary tokens. Any literal
+/// `<|kimi_image_placeholder|>` in string content is left inline verbatim — it
+/// is not a special token, so it BPE-splits like any other text and the vLLM
+/// backend later finds and expands it. Mirrors python `_append_text` with
+/// `image_prompts=None` (no pre-substitution or splicing on the frontend side).
 fn append_text(segs: &mut Vec<Segment>, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    let normalized = if text.contains(KIMI_IMAGE_PLACEHOLDER) {
-        text.replace(KIMI_IMAGE_PLACEHOLDER, MEDIA_PAD)
-    } else {
-        text.to_string()
-    };
-    if !normalized.contains(MEDIA_PAD) {
-        push_text(segs, &normalized);
-        return;
-    }
-    let parts: Vec<&str> = normalized.split(MEDIA_PAD).collect();
-    let last = parts.len() - 1;
-    for (i, part) in parts.iter().enumerate() {
-        push_text(segs, part);
-        if i < last {
-            push_control(segs, MEDIA_PAD);
-        }
-    }
+    push_text(segs, text);
 }
 
 // ---------------------------------------------------------------------------
@@ -640,8 +630,9 @@ fn normalize_tool_result_messages(messages: &[Value]) -> Vec<Value> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// `_render_content_segments`: string content (media-placeholder aware) or an
-/// array of OpenAI content parts (image parts emit a `<|media_pad|>` special).
+/// `_render_content_segments`: string content or an array of OpenAI content
+/// parts. Image parts emit one `<|kimi_image_placeholder|>` — the unexpanded
+/// placeholder the vLLM Kimi-K3 backend searches for and expands per image.
 fn render_content(segs: &mut Vec<Segment>, content: Option<&Value>) {
     match content {
         None | Some(Value::Null) => {}
@@ -650,7 +641,7 @@ fn render_content(segs: &mut Vec<Segment>, content: Option<&Value>) {
             for part in parts {
                 let kind = part.get("type").and_then(Value::as_str);
                 if matches!(kind, Some("image") | Some("image_url")) {
-                    push_control(segs, MEDIA_PAD);
+                    push_control(segs, KIMI_IMAGE_PLACEHOLDER);
                 } else if let Some(t) = part.get("text").and_then(Value::as_str) {
                     append_text(segs, t);
                 }
@@ -1167,31 +1158,26 @@ mod tests {
     }
 
     #[test]
-    fn media_pad_split_emits_special() {
-        // The literal snapshot placeholder in string content normalizes to a
-        // media-pad special segment.
+    fn string_content_keeps_image_placeholder_inline() {
+        // Under `image_prompts=None` semantics, a literal image placeholder in
+        // string content is emitted verbatim as ordinary text (not a special
+        // segment). It BPE-splits like any other text and the vLLM backend
+        // matches and expands it downstream.
         let segs = build(
             json!([{"role": "user", "content": "look <|kimi_image_placeholder|> here"}]),
             None,
             json!({"add_generation_prompt": false}),
         )
         .unwrap();
-        assert!(segs.contains(&s("look ", false)));
-        assert!(segs.contains(&s("<|media_pad|>", true)));
-        assert!(segs.contains(&s(" here", false)));
-
-        // Pre-substituted <|media_pad|> works identically.
-        let segs = build(
-            json!([{"role": "user", "content": "look <|media_pad|> here"}]),
-            None,
-            json!({"add_generation_prompt": false}),
-        )
-        .unwrap();
-        assert!(segs.contains(&s("<|media_pad|>", true)));
+        assert!(segs.contains(&s("look <|kimi_image_placeholder|> here", false)));
+        // Never emitted as a `<|media_pad|>` special — that is the token the
+        // backend does NOT search for (root cause of the apply-replacement
+        // assertion).
+        assert!(!segs.iter().any(|seg| seg.text == "<|media_pad|>"));
     }
 
     #[test]
-    fn content_part_array_images_emit_media_pad() {
+    fn content_part_array_images_emit_image_placeholder() {
         let segs = build(
             json!([{"role": "user", "content": [
                 {"type": "text", "text": "look "},
@@ -1203,8 +1189,9 @@ mod tests {
         )
         .unwrap();
         assert!(segs.contains(&s("look ", false)));
-        assert!(segs.contains(&s("<|media_pad|>", true)));
+        assert!(segs.contains(&s("<|kimi_image_placeholder|>", true)));
         assert!(segs.contains(&s(" here", false)));
+        assert!(!segs.iter().any(|seg| seg.text == "<|media_pad|>"));
     }
 
     #[test]

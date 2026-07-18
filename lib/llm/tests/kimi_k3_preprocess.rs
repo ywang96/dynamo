@@ -38,9 +38,10 @@ fn synthetic_k3_dir() -> tempfile::TempDir {
             "eos_token_id": 303,
             "max_position_embeddings": 8192,
             "vocab_size": 512,
-            // Mirrors the real K3 config (163605 there): the renderer emits
-            // this id for image content parts; MM routing resolves it from
-            // config.json (see lightseek_mm chat-placeholder fallback).
+            // Real K3 config carries this (163605). The vLLM backend uses it as
+            // the per-patch <|media_pad|> id inside its OWN placeholder expansion;
+            // the frontend renderer does NOT emit it — it emits the unexpanded
+            // <|kimi_image_placeholder|>.
             "media_placeholder_token_id": 306
         })
         .to_string(),
@@ -149,12 +150,15 @@ async fn k3_preprocess_marks_prompt_injected_reasoning() {
         "K3 with thinking off must not mark prompt-injected reasoning"
     );
 }
-/// Image-bearing requests render exactly one `<|media_pad|>` (id 306 in the
-/// synthetic vocab; 163605 on the real model) per image content part —
-/// downstream MM processing expands each placeholder into the full media
-/// sequence. Text parts around the images encode as ordinary tokens.
+/// Image-bearing requests render one `<|kimi_image_placeholder|>` per image
+/// content part — the UNEXPANDED placeholder the vLLM Kimi-K3 backend searches
+/// for and expands (`KimiK3ForConditionalGeneration._get_prompt_updates`). It
+/// is not a special token, so it BPE-splits into ordinary ids; it must NOT be
+/// pre-substituted to a `<|media_pad|>` special (the token the backend never
+/// searches for), which caused
+/// `Failed to apply prompt replacement for mm_items['image'][0]`.
 #[tokio::test]
-async fn k3_preprocess_image_parts_render_one_media_pad_each() {
+async fn k3_preprocess_image_parts_render_image_placeholder_each() {
     const MEDIA_PAD_ID: u32 = 306;
 
     let dir = synthetic_k3_dir();
@@ -191,14 +195,20 @@ async fn k3_preprocess_image_parts_render_one_media_pad_each() {
         .await
         .expect("preprocess image-bearing K3 request");
 
-    let pad_count = preprocessed
-        .token_ids
-        .iter()
-        .filter(|&&id| id == MEDIA_PAD_ID)
-        .count();
+    // The placeholder is not a special token, so it BPE-splits into ordinary
+    // (byte) ids; decode and count the literal placeholder, once per image.
+    let decoded = decode_synthetic(&preprocessed.token_ids);
+    let placeholder_count = decoded.matches("<|kimi_image_placeholder|>").count();
     assert_eq!(
-        pad_count, 2,
-        "exactly one <|media_pad|> per image part (got {pad_count}); ids: {:?}",
+        placeholder_count, 2,
+        "one <|kimi_image_placeholder|> per image part (got {placeholder_count}); decoded: {decoded}"
+    );
+
+    // The frontend must NOT emit a `<|media_pad|>` special — the backend does
+    // its own expansion and searches only for `<|kimi_image_placeholder|>`.
+    assert!(
+        !preprocessed.token_ids.contains(&MEDIA_PAD_ID),
+        "frontend must not emit <|media_pad|> ({MEDIA_PAD_ID}); ids: {:?}",
         preprocessed.token_ids
     );
 }
