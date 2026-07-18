@@ -1753,7 +1753,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "2.0.2"
-source = "git+https://github.com/Inferact/dynamo.git?rev=3442aebaa786d103067e4b2002cf6c8a08638683#3442aebaa786d103067e4b2002cf6c8a08638683"
+source = "git+https://github.com/Inferact/dynamo.git?rev=d83ed9f2a2dfb41c6f2c2e874269c73da0718530#d83ed9f2a2dfb41c6f2c2e874269c73da0718530"
 dependencies = [
  "async-openai",
  "derive_builder",
