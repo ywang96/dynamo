@@ -160,11 +160,13 @@ impl NvCreateChatCompletionRequest {
             .and_then(|effort| serde_json::to_value(effort).ok())
             .or(thinking_effort);
         // Kimi K3 renderer reads `thinking_effort` + `preserve_thinking` from the
-        // chat-template args. Resolve the effort with priority
-        //   thinking.effort  >  OpenAI reasoning_effort  >  default (max)
+        // chat-template args. Resolve the request-level effort with priority
+        //   thinking.effort  >  OpenAI reasoning_effort
         // applied only when thinking is not disabled, so effort reaches the K3
-        // renderer even when the request uses the OpenAI `reasoning_effort` field
-        // or omits effort entirely (python/#85 default parity). The renderer
+        // renderer even when the request uses the OpenAI `reasoning_effort` field.
+        // The spec §4 default (effort=max when enabled) is applied at insertion
+        // time, and only when the caller pinned no explicit `thinking_effort`
+        // template arg, so it never clobbers a user-supplied value. The renderer
         // validates the {low,medium,high,max} set and renders nothing otherwise.
         let thinking_effort_from_obj = self
             .thinking
@@ -184,14 +186,13 @@ impl NvCreateChatCompletionRequest {
             .as_ref()
             .and_then(|value| value.as_object())
             .and_then(|obj| obj.get("keep").cloned());
-        let k3_thinking_effort = match thinking_mode {
+        // Explicit request-level effort (thinking.effort > reasoning_effort);
+        // None when thinking is disabled. Authoritative over template kwargs.
+        // The `max` default is NOT folded in here — it is applied at insertion
+        // time only when the caller supplied no `thinking_effort` template arg.
+        let request_thinking_effort = match thinking_mode {
             Some(OpenAiThinkingMode::Disabled) => None,
-            _ => thinking_effort_from_obj
-                .or(oai_reasoning_effort)
-                .or_else(|| {
-                    matches!(thinking_mode, Some(OpenAiThinkingMode::Enabled))
-                        .then(|| "max".to_string())
-                }),
+            _ => thinking_effort_from_obj.or(oai_reasoning_effort),
         };
 
         if thinking_mode.is_none() && reasoning_effort.is_none() && thinking_keep.is_none() {
@@ -229,10 +230,20 @@ impl NvCreateChatCompletionRequest {
         // Request-level `thinking.effort` / `thinking.keep` are authoritative:
         // inserted after the user-supplied chat_template_args merge above so
         // they overwrite any user-provided `thinking_effort`/`preserve_thinking`.
-        if let Some(effort) = k3_thinking_effort {
+        // When the request carries no effort, fall back to the spec §4 default
+        // (`max`, thinking enabled) ONLY when the caller did not already pin an
+        // explicit `thinking_effort` template arg — never clobber their value.
+        if let Some(effort) = request_thinking_effort {
             args.insert(
                 "thinking_effort".to_string(),
                 serde_json::Value::String(effort),
+            );
+        } else if matches!(thinking_mode, Some(OpenAiThinkingMode::Enabled))
+            && !args.contains_key("thinking_effort")
+        {
+            args.insert(
+                "thinking_effort".to_string(),
+                serde_json::Value::String("max".to_string()),
             );
         }
         // K3 spec §4 keep normalization: `thinking.keep` is honored only when the
@@ -1322,37 +1333,47 @@ mod tests {
         assert_eq!(args.get("thinking"), Some(&json!(true)));
         assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
         assert_eq!(args.get("thinking_effort"), Some(&json!("high")));
-        assert_eq!(args.get("preserve_thinking"), Some(&json!(false)));
+        // spec §4: keep=all keeps all reasoning history => preserve_thinking=true.
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
         assert!(request.thinking.is_none());
     }
 
     #[test]
-    fn test_kimi_thinking_keep_interleaved_preserves_history() {
+    fn test_kimi_thinking_keep_interleaved_drops_history() {
         let request = normalize_thinking_object(json!({
             "type": "enabled", "keep": "interleaved"
         }));
         let args = request.chat_template_args.as_ref().unwrap();
-        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
-        // No effort on the request: key absent (renderer default applies).
-        assert_eq!(args.get("thinking_effort"), None);
+        // spec §4: interleaved keeps only the latest turn => preserve_thinking=false.
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(false)));
+        // No request effort + no caller kwarg + enabled => spec §4 default max.
+        assert_eq!(args.get("thinking_effort"), Some(&json!("max")));
     }
 
     #[test]
-    fn test_kimi_thinking_keep_absent_leaves_key_absent() {
+    fn test_kimi_thinking_keep_absent_defaults_to_preserve_all() {
         let request = normalize_thinking_object(json!({"type": "enabled", "effort": "low"}));
         let args = request.chat_template_args.as_ref().unwrap();
-        assert_eq!(args.get("preserve_thinking"), None);
+        // spec §4: keep unset normalizes to all => preserve_thinking=true.
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
         assert_eq!(args.get("thinking_effort"), Some(&json!("low")));
     }
 
     #[test]
-    fn test_kimi_thinking_keep_unknown_value_warns_and_skips() {
-        // Never a 400: unknown keep values leave the key unset.
-        let request = normalize_thinking_object(json!({
-            "type": "enabled", "keep": "sometimes"
-        }));
-        let args = request.chat_template_args.as_ref().unwrap();
-        assert_eq!(args.get("preserve_thinking"), None);
+    fn test_kimi_thinking_keep_unknown_value_rejected() {
+        // spec §4 allows only all/interleaved; anything else is a 400 at ingress
+        // (keep must map to a preserve_thinking bool, so there is no passthrough).
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "keep": "sometimes"}
+        });
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        assert!(
+            request.normalize_reasoning_template_args().is_err(),
+            "unknown thinking.keep must be rejected"
+        );
     }
 
     #[test]
@@ -1371,7 +1392,7 @@ mod tests {
         let json_str = json!({
             "model": "moonshotai/Kimi-K3",
             "messages": [{"role": "user", "content": "Hello"}],
-            "chat_template_args": {"thinking_effort": "low", "preserve_thinking": false},
+            "chat_template_args": {"thinking_effort": "low", "preserve_thinking": true},
             "thinking": {"type": "enabled", "effort": "high", "keep": "interleaved"}
         });
         let mut request: NvCreateChatCompletionRequest =
@@ -1382,7 +1403,8 @@ mod tests {
         let args = request.chat_template_args.as_ref().unwrap();
         // Authoritative request fields overwrite user-supplied kwargs.
         assert_eq!(args.get("thinking_effort"), Some(&json!("high")));
-        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
+        // keep=interleaved => preserve_thinking=false, overriding the caller's true.
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(false)));
     }
 
     #[test]

@@ -237,7 +237,7 @@ fn decode_synthetic(ids: &[u32]) -> String {
 /// End-to-end request-gate flow: `thinking {type, effort, keep}` normalized at
 /// ingress (mirroring the HTTP handler) must reach the renderer as
 /// `thinking_effort` / `preserve_thinking` — the thinking-effort control
-/// message renders and prior-turn think blocks are preserved.
+/// message renders and (keep=interleaved) prior-turn think blocks are dropped.
 #[tokio::test]
 async fn k3_thinking_effort_and_keep_render_end_to_end() {
     let dir = synthetic_k3_dir();
@@ -273,10 +273,10 @@ async fn k3_thinking_effort_and_keep_render_end_to_end() {
         text.contains("thinking_effort=high"),
         "missing thinking-effort control message: {text}"
     );
-    // keep=interleaved => preserve_thinking=true => prior-turn think survives.
+    // keep=interleaved => preserve_thinking=false => prior-turn think dropped.
     assert!(
-        text.contains("old think"),
-        "history think dropped despite keep=interleaved: {text}"
+        !text.contains("old think"),
+        "history think survived despite keep=interleaved: {text}"
     );
     // Thinking enabled: generation prefix ends inside the think channel.
     assert!(
@@ -286,9 +286,9 @@ async fn k3_thinking_effort_and_keep_render_end_to_end() {
     assert!(text.ends_with("<|open|>think<|sep|>"), "prefix: {text}");
 }
 
-/// keep=all (the default history rule) drops prior-turn think blocks.
+/// keep=all (the default history rule) keeps prior-turn think blocks.
 #[tokio::test]
-async fn k3_thinking_keep_all_drops_history_think() {
+async fn k3_thinking_keep_all_keeps_history_think() {
     let dir = synthetic_k3_dir();
     let mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");
     let preprocessor = OpenAIPreprocessor::new(mdc.clone()).expect("build preprocessor");
@@ -313,8 +313,8 @@ async fn k3_thinking_keep_all_drops_history_think() {
         .expect("preprocess K3 request");
     let text = decode_synthetic(&preprocessed.token_ids);
     assert!(
-        !text.contains("old think"),
-        "keep=all must drop pre-final-assistant think blocks: {text}"
+        text.contains("old think"),
+        "keep=all must keep pre-final-assistant think blocks: {text}"
     );
     // a1 (the response content) still renders.
     assert!(text.contains("a1"), "history response missing: {text}");
