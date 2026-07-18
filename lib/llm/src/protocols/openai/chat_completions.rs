@@ -159,24 +159,40 @@ impl NvCreateChatCompletionRequest {
             .as_ref()
             .and_then(|effort| serde_json::to_value(effort).ok())
             .or(thinking_effort);
-        // Kimi-dialect extras carried on the `thinking` object: `effort` feeds
-        // the K3 renderer's thinking-effort control message (passed through
-        // verbatim; the renderer validates the {low,medium,high,max} set and
-        // renders nothing for other values, python parity) and `keep`
-        // normalizes to the `preserve_thinking` history switch. Inert for
-        // formatters that don't read these keys.
-        let thinking_extras = self
+        // Kimi K3 renderer reads `thinking_effort` + `preserve_thinking` from the
+        // chat-template args. Resolve the effort with priority
+        //   thinking.effort  >  OpenAI reasoning_effort  >  default (max)
+        // applied only when thinking is not disabled, so effort reaches the K3
+        // renderer even when the request uses the OpenAI `reasoning_effort` field
+        // or omits effort entirely (python/#85 default parity). The renderer
+        // validates the {low,medium,high,max} set and renders nothing otherwise.
+        let thinking_effort_from_obj = self
             .thinking
             .as_ref()
             .and_then(|value| value.as_object())
-            .map(|obj| {
-                (
-                    obj.get("effort")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    obj.get("keep").cloned(),
-                )
-            });
+            .and_then(|obj| obj.get("effort"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let oai_reasoning_effort = self
+            .inner
+            .reasoning_effort
+            .as_ref()
+            .and_then(|effort| serde_json::to_value(effort).ok())
+            .and_then(|v| v.as_str().map(str::to_string));
+        let thinking_keep_raw = self
+            .thinking
+            .as_ref()
+            .and_then(|value| value.as_object())
+            .and_then(|obj| obj.get("keep").cloned());
+        let k3_thinking_effort = match thinking_mode {
+            Some(OpenAiThinkingMode::Disabled) => None,
+            _ => thinking_effort_from_obj
+                .or(oai_reasoning_effort)
+                .or_else(|| {
+                    matches!(thinking_mode, Some(OpenAiThinkingMode::Enabled))
+                        .then(|| "max".to_string())
+                }),
+        };
 
         if thinking_mode.is_none() && reasoning_effort.is_none() && thinking_keep.is_none() {
             return Ok(());
@@ -213,35 +229,37 @@ impl NvCreateChatCompletionRequest {
         // Request-level `thinking.effort` / `thinking.keep` are authoritative:
         // inserted after the user-supplied chat_template_args merge above so
         // they overwrite any user-provided `thinking_effort`/`preserve_thinking`.
-        if let Some((effort, keep)) = thinking_extras {
-            if let Some(effort) = effort {
+        if let Some(effort) = k3_thinking_effort {
+            args.insert(
+                "thinking_effort".to_string(),
+                serde_json::Value::String(effort),
+            );
+        }
+        // `keep=all` preserves ALL prior-turn reasoning (renderer
+        // preserve_thinking = true); `keep=interleaved` keeps only the most
+        // recent (preserve_thinking = false). Previously inverted, which dropped
+        // reasoning history on keep=all.
+        match thinking_keep_raw.as_ref().and_then(|v| v.as_str()) {
+            Some("all") => {
                 args.insert(
-                    "thinking_effort".to_string(),
-                    serde_json::Value::String(effort),
+                    "preserve_thinking".to_string(),
+                    serde_json::Value::Bool(true),
                 );
             }
-            match keep.as_ref().and_then(|v| v.as_str()) {
-                Some("all") => {
-                    args.insert(
-                        "preserve_thinking".to_string(),
-                        serde_json::Value::Bool(false),
+            Some("interleaved") => {
+                args.insert(
+                    "preserve_thinking".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+            _ => {
+                if let Some(keep) = thinking_keep_raw {
+                    // Never a 400: unknown values leave history handling at
+                    // the renderer default (keep-normalization rule).
+                    tracing::warn!(
+                        ?keep,
+                        "unrecognized `thinking.keep` value; leaving history handling at renderer default"
                     );
-                }
-                Some("interleaved") => {
-                    args.insert(
-                        "preserve_thinking".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-                _ => {
-                    if let Some(keep) = keep {
-                        // Never a 400: unknown values leave history handling at
-                        // the renderer default (keep-normalization rule).
-                        tracing::warn!(
-                            ?keep,
-                            "unrecognized `thinking.keep` value; leaving history handling at renderer default"
-                        );
-                    }
                 }
             }
         }
