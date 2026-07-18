@@ -184,6 +184,9 @@ tokio-rustls = { version = "0.26" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2" }
 
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/Inferact/dynamo.git", rev = "3442aebaa786d103067e4b2002cf6c8a08638683" }
+
 [profile.dev.package]
 insta.opt-level = 3
 

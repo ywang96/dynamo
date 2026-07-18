@@ -1265,6 +1265,16 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn multimodal_message_content(
+        message: &ChatCompletionRequestMessage,
+    ) -> Option<&ChatCompletionRequestUserMessageContent> {
+        match message {
+            ChatCompletionRequestMessage::User(message) => Some(&message.content),
+            ChatCompletionRequestMessage::Tool(message) => Some(&message.content),
+            _ => None,
+        }
+    }
+
     pub async fn gather_multi_modal_data<
         R: OAIChatLikeRequest + MediaRequestExt + NvExtProvider,
     >(
@@ -1315,12 +1325,11 @@ impl OpenAIPreprocessor {
         let has_media_loader = self.media_loader.is_some();
 
         for message in messages.iter() {
-            let content_parts = match message {
-                ChatCompletionRequestMessage::User(u) => match &u.content {
-                    ChatCompletionRequestUserMessageContent::Array(parts) => parts,
-                    _ => continue,
-                },
-                _ => continue,
+            let Some(content) = Self::multimodal_message_content(message) else {
+                continue;
+            };
+            let ChatCompletionRequestUserMessageContent::Array(content_parts) = content else {
+                continue;
             };
             for content_part in content_parts.iter() {
                 if has_media_loader {
@@ -3762,6 +3771,41 @@ impl
 #[cfg(test)]
 mod strip_tests {
     use super::OpenAIPreprocessor;
+    use dynamo_protocols::types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
+        ChatCompletionRequestToolMessageContentPart,
+    };
+
+    #[test]
+    fn tool_message_is_multimodal_content_source() {
+        let messages: Vec<ChatCompletionRequestMessage> =
+            serde_json::from_value(serde_json::json!([
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "result"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/result.png"}
+                        }
+                    ]
+                },
+                {"role": "assistant", "content": "plain text"}
+            ]))
+            .unwrap();
+
+        let content = OpenAIPreprocessor::multimodal_message_content(&messages[0])
+            .expect("tool content should be scanned for media");
+        let ChatCompletionRequestToolMessageContent::Array(parts) = content else {
+            panic!("expected multimodal tool content");
+        };
+        assert!(matches!(
+            parts[1],
+            ChatCompletionRequestToolMessageContentPart::ImageUrl(_)
+        ));
+        assert!(OpenAIPreprocessor::multimodal_message_content(&messages[1]).is_none());
+    }
 
     #[test]
     fn test_strip_inline_data_urls_replaces_data_urls() {

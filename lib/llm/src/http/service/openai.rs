@@ -1438,7 +1438,10 @@ async fn handler_chat_completions(
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
-    let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
+    let normalized_body = normalize_bare_image_urls(&body);
+    let body_ref: &[u8] = normalized_body.as_deref().unwrap_or_else(|| body.as_ref());
+    let mut request: NvCreateChatCompletionRequest =
+        parse_json_request("chat completions", body_ref)?;
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -1549,6 +1552,41 @@ where
         "Accepted request after replacing invalid UTF-8 and escaping unescaped control characters in JSON strings"
     );
     Ok(request)
+}
+
+/// Normalize Moonshot-compatible bare-string image URLs before typed parsing.
+fn normalize_bare_image_urls(body: &[u8]) -> Option<Vec<u8>> {
+    if !body
+        .windows(b"image_url".len())
+        .any(|window| window == b"image_url")
+    {
+        return None;
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = value.get_mut("messages")?.as_array_mut()?;
+    let mut changed = false;
+
+    for message in messages {
+        let Some(parts) = message
+            .get_mut("content")
+            .and_then(|content| content.as_array_mut())
+        else {
+            continue;
+        };
+        for part in parts {
+            let Some(object) = part.as_object_mut() else {
+                continue;
+            };
+            if let Some(url) = object.get("image_url").and_then(|value| value.as_str()) {
+                let url = url.to_string();
+                object.insert("image_url".to_string(), serde_json::json!({ "url": url }));
+                changed = true;
+            }
+        }
+    }
+
+    changed.then(|| serde_json::to_vec(&value).ok()).flatten()
 }
 
 fn json_deserialize_error(error: serde_json::Error) -> ErrorResponse {
@@ -3965,6 +4003,57 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
         CreateCompletionRequest, Prompt,
     };
+
+    #[test]
+    fn bare_string_image_url_is_normalized_to_object() {
+        let body = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"http://example.com/y.png"}]}]}"#;
+        let out =
+            normalize_bare_image_urls(body).expect("bare-string image_url should be rewritten");
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value["messages"][0]["content"][0]["image_url"]["url"],
+            "http://example.com/y.png"
+        );
+    }
+
+    #[test]
+    fn object_image_url_is_left_unchanged() {
+        let body = br#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://example.com/y.png"}}]}]}"#;
+        assert!(normalize_bare_image_urls(body).is_none());
+    }
+
+    #[test]
+    fn request_without_image_url_is_skipped() {
+        let body = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        assert!(normalize_bare_image_urls(body).is_none());
+    }
+
+    #[test]
+    fn bare_string_image_url_in_tool_role_is_normalized() {
+        let body = br#"{"messages":[{"role":"tool","tool_call_id":"c1","content":[{"type":"image_url","image_url":"data:image/png;base64,AAAA"}]}]}"#;
+        let out = normalize_bare_image_urls(body)
+            .expect("tool-role bare-string image_url should rewrite");
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value["messages"][0]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn bare_string_tool_image_request_parses_only_after_normalization() {
+        let raw = br#"{"model":"m","messages":[{"role":"tool","tool_call_id":"c1","content":[{"type":"image_url","image_url":"https://example.com/a.png"}]}]}"#;
+        assert!(
+            parse_json_request::<NvCreateChatCompletionRequest>("test", raw).is_err(),
+            "bare-string tool image should fail before normalization"
+        );
+
+        let normalized = normalize_bare_image_urls(raw).expect("bare string should normalize");
+        assert!(
+            parse_json_request::<NvCreateChatCompletionRequest>("test", &normalized).is_ok(),
+            "normalized tool image request must deserialize"
+        );
+    }
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
 

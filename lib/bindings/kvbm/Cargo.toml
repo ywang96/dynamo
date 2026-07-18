@@ -60,3 +60,8 @@ dlpark = { version = "0.5", features = ["pyo3", "half"], optional = true }
 cudarc = { version = "=0.19.8", features = ["cuda-version-from-build-system", "fallback-latest"], optional = true }
 
 [dev-dependencies]
+
+# This manifest is an independent workspace synced by image-build cargo_vendor.
+# Keep this patch aligned with the workspace root to avoid duplicate sources.
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/Inferact/dynamo.git", rev = "3442aebaa786d103067e4b2002cf6c8a08638683" }

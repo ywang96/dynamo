@@ -220,6 +220,7 @@ fn convert_user_blocks(
                     ChatCompletionRequestToolMessage {
                         content: ChatCompletionRequestToolMessageContent::Text(text),
                         tool_call_id: tool_use_id.clone(),
+                        name: None,
                     },
                 ));
             }

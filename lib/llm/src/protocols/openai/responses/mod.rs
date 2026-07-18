@@ -507,6 +507,7 @@ fn convert_input_items_to_messages(
                         ChatCompletionRequestToolMessage {
                             content: ChatCompletionRequestToolMessageContent::Text(output_text),
                             tool_call_id: fco.call_id.clone(),
+                            name: None,
                         },
                     ));
                 }
