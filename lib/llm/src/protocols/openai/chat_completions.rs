@@ -137,21 +137,28 @@ impl NvCreateChatCompletionRequest {
             .map(openai_thinking_mode)
             .transpose()?
             .flatten();
-        let thinking_effort = self
-            .thinking
-            .as_ref()
-            .map(openai_thinking_effort)
-            .transpose()?
-            .flatten();
-        let thinking_keep = self
-            .thinking
-            .as_ref()
-            .map(openai_thinking_keep)
-            .transpose()?
-            .flatten();
-        let (thinking_effort, thinking_keep) = match thinking_mode {
-            Some(OpenAiThinkingMode::Disabled) => (None, None),
-            _ => (thinking_effort, thinking_keep),
+        // spec §4: `thinking.effort` / `thinking.keep` apply only when thinking is
+        // enabled and are IGNORED when disabled. Skip their validation entirely in
+        // the disabled case, so an invalid effort/keep under `type: disabled` is
+        // ignored rather than rejected with a 400.
+        let is_disabled = matches!(thinking_mode, Some(OpenAiThinkingMode::Disabled));
+        let thinking_effort = if is_disabled {
+            None
+        } else {
+            self.thinking
+                .as_ref()
+                .map(openai_thinking_effort)
+                .transpose()?
+                .flatten()
+        };
+        let thinking_keep = if is_disabled {
+            None
+        } else {
+            self.thinking
+                .as_ref()
+                .map(openai_thinking_keep)
+                .transpose()?
+                .flatten()
         };
         let reasoning_effort = self
             .inner
@@ -332,12 +339,15 @@ fn openai_thinking_mode(value: &serde_json::Value) -> anyhow::Result<Option<Open
             "`thinking` must be a boolean or an object with `type` set to `enabled` or `disabled`"
         );
     };
-    let Some(thinking_type) = thinking_object.get("type").and_then(|v| v.as_str()) else {
-        anyhow::bail!("`thinking.type` must be `enabled` or `disabled`");
+    // spec §4: `thinking.type` is optional and defaults to `enabled`. An object
+    // with no `type` (e.g. only `keep`/`effort`) is enabled thinking; a present
+    // but unrecognized value (e.g. `adaptive`) or non-string is still rejected.
+    let Some(thinking_type) = thinking_object.get("type") else {
+        return Ok(Some(OpenAiThinkingMode::Enabled));
     };
-    match thinking_type {
-        "enabled" => Ok(Some(OpenAiThinkingMode::Enabled)),
-        "disabled" => Ok(Some(OpenAiThinkingMode::Disabled)),
+    match thinking_type.as_str() {
+        Some("enabled") => Ok(Some(OpenAiThinkingMode::Enabled)),
+        Some("disabled") => Ok(Some(OpenAiThinkingMode::Disabled)),
         _ => anyhow::bail!("`thinking.type` must be `enabled` or `disabled`"),
     }
 }
@@ -1374,6 +1384,41 @@ mod tests {
             request.normalize_reasoning_template_args().is_err(),
             "unknown thinking.keep must be rejected"
         );
+    }
+
+    #[test]
+    fn test_kimi_thinking_type_absent_defaults_enabled() {
+        // spec §4: `thinking.type` is optional; an object with no type (here only
+        // `keep`) is enabled thinking, not a 400.
+        let request = normalize_thinking_object(json!({"keep": "all"}));
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&json!(true)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("enabled")));
+        // keep=all + enabled => preserve all reasoning; effort defaults to max.
+        assert_eq!(args.get("preserve_thinking"), Some(&json!(true)));
+        assert_eq!(args.get("thinking_effort"), Some(&json!("max")));
+    }
+
+    #[test]
+    fn test_kimi_thinking_disabled_ignores_invalid_keep_and_effort() {
+        // spec §4: keep/effort are ignored when disabled — an otherwise-invalid
+        // keep must NOT 400 (it is not validated in the disabled path).
+        let json_str = json!({
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "disabled", "keep": "none", "effort": "high"}
+        });
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request
+            .normalize_reasoning_template_args()
+            .expect("disabled thinking must ignore (not validate) keep/effort");
+        let args = request.chat_template_args.as_ref().unwrap();
+        assert_eq!(args.get("thinking"), Some(&json!(false)));
+        assert_eq!(args.get("thinking_mode"), Some(&json!("disabled")));
+        assert_eq!(args.get("thinking_keep"), None);
+        assert_eq!(args.get("preserve_thinking"), None);
+        assert_eq!(args.get("thinking_effort"), None);
     }
 
     #[test]
