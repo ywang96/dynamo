@@ -3130,6 +3130,13 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn reasoning_token_markers(reasoning_parser: &str) -> (&'static str, &'static str) {
+        match reasoning_parser {
+            "kimi_k3" => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+            _ => ("<think>", "</think>"),
+        }
+    }
+
     fn prompt_injected_reasoning_ended_arg(
         reasoning_parser: Option<&str>,
         formatted_prompt: Option<&str>,
@@ -3609,18 +3616,20 @@ impl
             response_generator.update_isl(isl);
         }
 
-        // Reasoning-token derivation: give the generator the `<think>`/`</think>`
-        // marker ids (resolved from the tokenizer, single-token only) so it can
-        // count reasoning tokens from the generated stream when the backend reports
-        // none. Only when a reasoning parser is active for this model.
-        if self.runtime_config.reasoning_parser.is_some() {
-            let resolve = |marker: &str| -> Option<u32> {
-                match self.tokenizer.encode(marker).ok()?.token_ids() {
-                    [id] => Some(*id),
-                    _ => None,
-                }
+        // Reasoning-token derivation: give the generator the parser-specific marker
+        // token sequences and prompt-prefill state so it can count reasoning tokens
+        // from the generated stream when the backend reports none.
+        if let Some(reasoning_parser) = self.runtime_config.reasoning_parser.as_deref() {
+            let resolve = |marker: &str| -> Option<Vec<u32>> {
+                let ids = self.tokenizer.encode(marker).ok()?.token_ids().to_vec();
+                (!ids.is_empty()).then_some(ids)
             };
-            response_generator.set_reasoning_markers(resolve("<think>"), resolve("</think>"));
+            let (start_marker, end_marker) = Self::reasoning_token_markers(reasoning_parser);
+            response_generator.set_reasoning_markers(
+                resolve(start_marker),
+                resolve(end_marker),
+                prompt_injected_reasoning,
+            );
         }
 
         let prompt_token_ids = common_request.token_ids.clone();
@@ -4434,6 +4443,18 @@ mod tests {
             Some("no think marker here"),
             None
         ));
+    }
+
+    #[test]
+    fn test_reasoning_token_markers_select_kimi_k3_xtml() {
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_token_markers("kimi_k3"),
+            ("<|open|>think<|sep|>", "<|close|>think<|sep|>")
+        );
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_token_markers("deepseek_v3"),
+            ("<think>", "</think>")
+        );
     }
 
     #[test]

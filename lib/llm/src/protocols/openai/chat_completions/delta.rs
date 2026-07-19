@@ -58,14 +58,16 @@ pub struct DeltaGenerator {
     options: DeltaGeneratorOptions,
     /// Request tracker for per-request metrics (shared with PreprocessedRequest).
     tracker: Arc<RequestTracker>,
-    /// Token id of the reasoning-start marker (`<think>`), resolved from the
-    /// tokenizer by the preprocessor. `None` when unavailable or not a single
-    /// token. Used to derive `reasoning_tokens` when the backend reports none.
-    reasoning_start_id: Option<u32>,
-    /// Token id of the reasoning-end marker (`</think>`).
-    reasoning_end_id: Option<u32>,
+    /// Token ids of the reasoning-start marker, resolved from the tokenizer by
+    /// the preprocessor. Used to derive `reasoning_tokens` when the backend
+    /// reports none.
+    reasoning_start_ids: Option<Vec<u32>>,
+    /// Token ids of the reasoning-end marker.
+    reasoning_end_ids: Option<Vec<u32>>,
+    /// Whether the prompt ended inside the reasoning channel.
+    is_reasoning_started_in_prompt: bool,
     /// Full generated token-id sequence, accumulated across streamed chunks, used
-    /// to locate the `<think>`/`</think>` span for reasoning-token derivation.
+    /// to locate the configured reasoning span.
     reasoning_output_ids: Vec<u32>,
     /// Completion tokens per candidate index, for the per-candidate usage
     /// snapshot on each candidate's end frame (streaming spec P0.4 / §5.5).
@@ -86,48 +88,48 @@ impl DeltaGenerator {
             msg_counter: 0,
             options,
             tracker,
-            reasoning_start_id: None,
-            reasoning_end_id: None,
+            reasoning_start_ids: None,
+            reasoning_end_ids: None,
+            is_reasoning_started_in_prompt: false,
             reasoning_output_ids: Vec::new(),
             per_candidate_completion_tokens: std::collections::HashMap::new(),
         }
     }
 
     /// Derive the reasoning-token count from the generated token-id stream, used
-    /// when the backend reports none (vLLM/TRT-LLM/MLX). Reasoning tokens are
-    /// those between `<think>` and `</think>`. The prefill case (model pre-opens
-    /// `<think>`, so it is absent from the output) is auto-detected: if `<think>`
-    /// is not seen but `</think>` is, counting starts at token 0. A `<think>` with
-    /// no `</think>` ran to the end (truncated mid-thinking). Returns 0 when no
-    /// reasoning span is present (e.g. thinking disabled).
+    /// when the backend reports none (vLLM/TRT-LLM/MLX). Reasoning tokens are those
+    /// between the configured marker sequences. If the prompt opened the reasoning
+    /// channel, counting starts at token 0; seeing only an end marker retains the
+    /// legacy prefill auto-detection. An open reasoning span with no end marker runs
+    /// to the end (truncated mid-thinking). Returns 0 when no span is present.
     fn derive_reasoning_tokens(
         output_ids: &[u32],
-        start_id: Option<u32>,
-        end_id: Option<u32>,
+        start_ids: Option<&[u32]>,
+        end_ids: Option<&[u32]>,
+        is_reasoning_started_in_prompt: bool,
     ) -> u32 {
-        let (start, think_seen) =
-            match start_id.and_then(|s| output_ids.iter().position(|&t| t == s)) {
-                Some(pos) => (pos + 1, true),
-                None => (0usize, false),
-            };
-        let end = end_id.and_then(|e| {
-            output_ids[start.min(output_ids.len())..]
-                .iter()
-                .position(|&t| t == e)
-                .map(|rel| start + rel)
-        });
-        let count = match (think_seen, end) {
-            // `<think>` in the output: reasoning runs to `</think>`, or to the end
-            // if it never appears (truncated mid-thinking).
-            (true, Some(e)) => e.saturating_sub(start),
-            (true, None) => output_ids.len().saturating_sub(start),
-            // No `<think>` but a `</think>`: the model pre-opened `<think>` in the
-            // prefill, so reasoning is [0, `</think>`).
-            (false, Some(e)) => e,
-            // Neither marker: no reasoning span.
-            (false, None) => 0,
+        let find_marker = |marker: &[u32], from: usize| -> Option<usize> {
+            if marker.is_empty() {
+                return None;
+            }
+            output_ids
+                .get(from..)?
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .map(|relative| from + relative)
         };
-        count as u32
+
+        let explicit_start = start_ids
+            .and_then(|marker| find_marker(marker, 0).map(|position| position + marker.len()));
+        let start = explicit_start.unwrap_or(0);
+        let end = end_ids.and_then(|marker| find_marker(marker, start));
+        let has_reasoning_started =
+            explicit_start.is_some() || is_reasoning_started_in_prompt || end.is_some();
+        if !has_reasoning_started {
+            return 0;
+        }
+
+        end.unwrap_or(output_ids.len()).saturating_sub(start) as u32
     }
 
     /// Returns the request tracker. Tracking is enabled. For sharing with PreprocessedRequest.
@@ -301,8 +303,9 @@ impl DeltaGenerator {
             Some(n) if n > 0 => n,
             _ => Self::derive_reasoning_tokens(
                 &self.reasoning_output_ids,
-                self.reasoning_start_id,
-                self.reasoning_end_id,
+                self.reasoning_start_ids.as_deref(),
+                self.reasoning_end_ids.as_deref(),
+                self.is_reasoning_started_in_prompt,
             ),
         };
         ctd.reasoning_tokens = Some(reasoning_tokens);
@@ -325,9 +328,15 @@ impl DeltaGenerator {
 impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamResponse>
     for DeltaGenerator
 {
-    fn set_reasoning_markers(&mut self, start_id: Option<u32>, end_id: Option<u32>) {
-        self.reasoning_start_id = start_id;
-        self.reasoning_end_id = end_id;
+    fn set_reasoning_markers(
+        &mut self,
+        start_ids: Option<Vec<u32>>,
+        end_ids: Option<Vec<u32>>,
+        is_reasoning_started_in_prompt: bool,
+    ) {
+        self.reasoning_start_ids = start_ids;
+        self.reasoning_end_ids = end_ids;
+        self.is_reasoning_started_in_prompt = is_reasoning_started_in_prompt;
     }
 
     /// Converts a backend response into a structured OpenAI-style streaming response.
@@ -354,8 +363,9 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             .or_default() += token_length;
 
         // Accumulate the full generated token-id stream so `get_usage` can locate
-        // the `<think>`/`</think>` span for reasoning-token derivation.
-        self.reasoning_output_ids.extend_from_slice(&delta.token_ids);
+        // the configured reasoning-boundary sequences.
+        self.reasoning_output_ids
+            .extend_from_slice(&delta.token_ids);
 
         // If backend provides completion_usage, use it to update usage stats
         // This is critical for prompt embeddings where prompt_tokens comes from
@@ -507,36 +517,54 @@ mod tests {
 
     #[test]
     fn derive_reasoning_tokens_counts_the_think_span() {
-        let start = Some(100u32); // <think>
-        let end = Some(200u32); // </think>
+        let start = [100u32]; // <think>
+        let end = [200u32]; // </think>
+        let derive = |output: &[u32]| {
+            DeltaGenerator::derive_reasoning_tokens(output, Some(&start), Some(&end), false)
+        };
 
         // Toggleable model, thinking on: explicit <think> in the output; reasoning
         // is between the markers. [c, <think>, r, r, </think>, c] -> 2.
-        assert_eq!(
-            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2, 200, 9], start, end),
-            2
-        );
+        assert_eq!(derive(&[9, 100, 1, 2, 200, 9]), 2);
         // Toggleable, <think> emitted but truncated before </think>: to the end.
         // [c, <think>, r, r, r] -> 3.
-        assert_eq!(
-            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2, 3], start, end),
-            3
-        );
+        assert_eq!(derive(&[9, 100, 1, 2, 3]), 3);
         // Prefill model: <think> pre-opened (absent from output), </think> present.
         // [r, r, r, </think>, c] -> 3.
-        assert_eq!(
-            DeltaGenerator::derive_reasoning_tokens(&[1, 2, 3, 200, 9], start, end),
-            3
-        );
+        assert_eq!(derive(&[1, 2, 3, 200, 9]), 3);
         // No reasoning (thinking off): neither marker -> 0.
-        assert_eq!(
-            DeltaGenerator::derive_reasoning_tokens(&[9, 9, 9], start, end),
-            0
-        );
+        assert_eq!(derive(&[9, 9, 9]), 0);
         // <think> present but </think> id unresolved -> counts to the end.
         assert_eq!(
-            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2], start, None),
+            DeltaGenerator::derive_reasoning_tokens(&[9, 100, 1, 2], Some(&start), None, false,),
             2
+        );
+    }
+
+    #[test]
+    fn derive_reasoning_tokens_supports_multi_token_markers() {
+        let start = [100, 101, 102]; // <|open|>think<|sep|>
+        let end = [200, 101, 102]; // <|close|>think<|sep|>
+
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(
+                &[9, 100, 101, 102, 1, 2, 200, 101, 102, 9],
+                Some(&start),
+                Some(&end),
+                false,
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn derive_reasoning_tokens_counts_prompt_prefilled_truncation() {
+        let start = [100, 101, 102]; // <|open|>think<|sep|>
+        let end = [200, 101, 102]; // <|close|>think<|sep|>
+
+        assert_eq!(
+            DeltaGenerator::derive_reasoning_tokens(&[1, 2, 3], Some(&start), Some(&end), true,),
+            3
         );
     }
 
@@ -711,6 +739,23 @@ mod tests {
             Some(7)
         );
         assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(3));
+    }
+
+    #[test]
+    fn k3_marker_sequences_populate_reasoning_tokens_in_usage() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-k3-usage".to_string());
+        generator.set_reasoning_markers(Some(vec![100, 101, 102]), Some(vec![200, 101, 102]), true);
+        let mut output = final_backend_output();
+        output.token_ids = vec![1, 2, 200, 101, 102, 9];
+        generator.choice_from_postprocessor(output).unwrap();
+
+        let usage = generator.get_usage();
+        assert_eq!(usage.completion_tokens, 6);
+        assert_eq!(
+            usage.completion_tokens_details.unwrap().reasoning_tokens,
+            Some(2)
+        );
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {
