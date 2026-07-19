@@ -63,19 +63,19 @@ fn auto_only_builds_for_strict_tools_and_keeps_tools_optional() {
 }
 
 #[test]
-fn named_choice_selects_one_tool_and_rejects_an_unknown_name() {
+fn named_choice_is_not_part_of_the_k3_api_contract() {
     let tools = [
         tool("first", json!({"type": "object"}), None),
         tool("second", json!({"type": "object"}), None),
     ];
 
-    let tag =
-        build(ToolChoice::Named("second".into()), &tools).expect("named choice must build a tag");
-    let serialized = serde_json::to_string(&tag).unwrap();
+    let err = build_kimi_k3_structural_tag(&ToolChoice::Named("second".into()), &tools)
+        .expect_err("K3 only supports auto, required, and none");
 
-    assert!(serialized.contains("tool=\\\"second\\\""));
-    assert!(!serialized.contains("tool=\\\"first\\\""));
-    assert!(build_kimi_k3_structural_tag(&ToolChoice::Named("missing".into()), &tools).is_err());
+    assert!(
+        err.to_string()
+            .contains("named tool choice is not supported")
+    );
 }
 
 #[test]

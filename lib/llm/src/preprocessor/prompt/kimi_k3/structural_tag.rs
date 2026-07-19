@@ -26,11 +26,14 @@ const STRING_ATOM: &str = "(?:[^<]|<[^|])";
 ///
 /// This mirrors vLLM's K3 structural-tag activation: none, empty tools, and
 /// non-strict auto do not constrain generation; strict auto is optional;
-/// required and a named choice require a tools channel.
+/// required uses a mandatory tools channel. Named choice is outside the K3 API.
 pub fn build_kimi_k3_structural_tag(
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
 ) -> anyhow::Result<Option<Value>> {
+    if matches!(tool_choice, ToolChoice::Named(_)) {
+        bail!("named tool choice is not supported for Kimi K3");
+    }
     if tools.is_empty() || matches!(tool_choice, ToolChoice::None) {
         return Ok(None);
     }
@@ -40,17 +43,7 @@ pub fn build_kimi_k3_structural_tag(
         return Ok(None);
     }
 
-    let selected_tools = match tool_choice {
-        ToolChoice::Named(name) => {
-            let Some(tool) = tools.iter().find(|tool| tool.name == *name) else {
-                bail!("named tool choice refers to unknown tool '{name}'");
-            };
-            std::slice::from_ref(tool)
-        }
-        _ => tools,
-    };
-
-    let tools_channel = Format::Tag(k3_tools_channel(selected_tools));
+    let tools_channel = Format::Tag(k3_tools_channel(tools));
     let tools_part = if matches!(tool_choice, ToolChoice::Auto) {
         Format::Optional(OptionalFormat {
             content: Box::new(tools_channel),

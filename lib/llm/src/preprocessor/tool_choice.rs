@@ -3,6 +3,7 @@
 
 //! Tool-choice guided decoding policy for OpenAI chat requests.
 
+use crate::local_model::runtime_config::StructuralTagMode;
 use crate::preprocessor::prompt::kimi_k3::structural_tag::build_kimi_k3_structural_tag;
 use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest, unified};
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
@@ -73,6 +74,7 @@ impl OpenAIPreprocessor {
             self.tool_call_parser.as_deref(),
         ) {
             return apply_kimi_k3_structural_tag(
+                self.runtime_config.structural_tag_mode,
                 &convert_tool_choice(tool_choice),
                 &convert_tools(&tools),
                 common_request,
@@ -110,10 +112,21 @@ impl OpenAIPreprocessor {
 }
 
 fn apply_kimi_k3_structural_tag(
+    structural_tag_mode: StructuralTagMode,
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
     common_request: &mut PreprocessedRequest,
 ) -> Result<bool, DynamoError> {
+    if matches!(tool_choice, ToolChoice::Named(_)) {
+        return Err(invalid_argument(
+            "Named tool choice is not supported for Kimi K3. \
+             Use `tool_choice` set to \"auto\", \"required\", or \"none\" instead.",
+        ));
+    }
+    if structural_tag_mode == StructuralTagMode::Off {
+        return Ok(false);
+    }
+
     let Some(structural_tag) = build_kimi_k3_structural_tag(tool_choice, tools)
         .map_err(|err| invalid_argument(err.to_string()))?
     else {
@@ -197,6 +210,7 @@ mod tests {
         let mut request = preprocessed_request();
 
         let applied = apply_kimi_k3_structural_tag(
+            StructuralTagMode::On,
             &ToolChoice::Required,
             &[tool("lookup", None)],
             &mut request,
@@ -213,29 +227,38 @@ mod tests {
     }
 
     #[test]
-    fn k3_named_attaches_only_the_selected_tool() {
+    fn k3_named_is_rejected_even_when_structural_tags_are_disabled() {
+        let mut request = preprocessed_request();
+
+        let err = apply_kimi_k3_structural_tag(
+            StructuralTagMode::Off,
+            &ToolChoice::Named("second".into()),
+            &[tool("first", None), tool("second", None)],
+            &mut request,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Named tool choice is not supported for Kimi K3")
+        );
+        assert!(request.sampling_options.guided_decoding.is_none());
+    }
+
+    #[test]
+    fn k3_required_leaves_xgrammar_inactive_when_structural_tags_are_disabled() {
         let mut request = preprocessed_request();
 
         assert!(
-            apply_kimi_k3_structural_tag(
-                &ToolChoice::Named("second".into()),
-                &[tool("first", None), tool("second", None)],
+            !apply_kimi_k3_structural_tag(
+                StructuralTagMode::Off,
+                &ToolChoice::Required,
+                &[tool("lookup", None)],
                 &mut request,
             )
             .unwrap()
         );
-        let serialized = serde_json::to_string(
-            request
-                .sampling_options
-                .guided_decoding
-                .unwrap()
-                .structural_tag
-                .as_ref()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(serialized.contains(r#"tool=\"second\""#));
-        assert!(!serialized.contains(r#"tool=\"first\""#));
+        assert!(request.sampling_options.guided_decoding.is_none());
     }
 
     #[test]
@@ -244,6 +267,7 @@ mod tests {
 
         assert!(
             !apply_kimi_k3_structural_tag(
+                StructuralTagMode::On,
                 &ToolChoice::Auto,
                 &[tool("lookup", None)],
                 &mut request,
@@ -251,5 +275,47 @@ mod tests {
             .unwrap()
         );
         assert!(request.sampling_options.guided_decoding.is_none());
+    }
+
+    #[test]
+    fn k3_required_constraint_uses_dynamic_tools() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k3",
+            "messages": [{
+                "role": "system",
+                "content": "",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"}
+                    }
+                }]
+            }],
+            "tool_choice": "required"
+        }))
+        .unwrap();
+        let mut preprocessed = preprocessed_request();
+
+        assert!(
+            apply_kimi_k3_structural_tag(
+                StructuralTagMode::On,
+                &convert_tool_choice(request.inner.tool_choice.as_ref().unwrap()),
+                &convert_tools(&request.effective_tools()),
+                &mut preprocessed,
+            )
+            .unwrap()
+        );
+        let structural_tag = preprocessed
+            .sampling_options
+            .guided_decoding
+            .unwrap()
+            .structural_tag
+            .unwrap();
+        assert!(
+            serde_json::to_string(&structural_tag)
+                .unwrap()
+                .contains(r#"tool=\"get_weather\""#)
+        );
     }
 }
