@@ -312,6 +312,14 @@ fn open_tag(segs: &mut Vec<Segment>, tag: &str, attrs: &[(&str, String)]) {
     push_control(segs, SEP);
 }
 
+/// The exact terminal prefill added when a generation prompt starts in K3's
+/// thinking channel.
+pub(super) fn think_prefill_segments() -> Vec<Segment> {
+    let mut segs = Vec::new();
+    open_tag(&mut segs, "think", &[]);
+    segs
+}
+
 /// `_close_tag`: CLOSE(special) + tag + SEP(special).
 fn close_tag(segs: &mut Vec<Segment>, tag: &str) {
     push_control(segs, CLOSE);

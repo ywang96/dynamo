@@ -110,6 +110,20 @@ impl KimiK3Renderer {
         self.encode_segments(&segments)
     }
 
+    /// Return the number of token IDs occupied by the terminal think-channel
+    /// prefill, or zero when the rendered prompt does not end with that prefill.
+    ///
+    /// The count is derived with this renderer's tokenizer rather than assumed
+    /// to be three, which keeps synthetic and alternate K3 tokenizers correct.
+    pub fn trailing_think_prefill_token_count(&self, ids: &[u32]) -> Result<usize> {
+        let think_prefill = self.encode_segments(&renderer::think_prefill_segments())?;
+        Ok(if ids.ends_with(&think_prefill) {
+            think_prefill.len()
+        } else {
+            0
+        })
+    }
+
     /// Look up a special-token id (e.g. `<|open|>`), for tests and MM wiring.
     pub fn special_id(&self, token: &str) -> Option<u32> {
         self.specials.get(token).copied()

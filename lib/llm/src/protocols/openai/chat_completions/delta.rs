@@ -58,6 +58,10 @@ pub struct DeltaGenerator {
     options: DeltaGeneratorOptions,
     /// Request tracker for per-request metrics (shared with PreprocessedRequest).
     tracker: Arc<RequestTracker>,
+    /// Prompt tokens sent to the model but excluded from API usage for protocol
+    /// compatibility. Applied to both the frontend ISL and any authoritative
+    /// prompt count later reported by the worker.
+    prompt_tokens_adjustment: u32,
     /// Token ids of the reasoning-start marker, resolved from the tokenizer by
     /// the preprocessor. Used to derive `reasoning_tokens` when the backend
     /// reports none.
@@ -86,6 +90,7 @@ impl DeltaGenerator {
             service_tier: None,
             usage,
             msg_counter: 0,
+            prompt_tokens_adjustment: 0,
             options,
             tracker,
             reasoning_start_ids: None,
@@ -137,12 +142,22 @@ impl DeltaGenerator {
         self.tracker.clone()
     }
 
+    fn adjusted_prompt_tokens(&self, prompt_tokens: u32) -> u32 {
+        prompt_tokens.saturating_sub(self.prompt_tokens_adjustment)
+    }
+
+    /// Exclude a request-specific suffix from API prompt usage without changing
+    /// the token IDs sent to the model.
+    pub(crate) fn set_prompt_tokens_adjustment(&mut self, adjustment: u32) {
+        self.prompt_tokens_adjustment = adjustment;
+    }
+
     /// Updates the prompt token usage count.
     ///
     /// # Arguments
     /// * `isl` - Input Sequence Length. The number of prompt tokens used.
     pub fn update_isl(&mut self, isl: u32) {
-        self.usage.prompt_tokens = isl;
+        self.usage.prompt_tokens = self.adjusted_prompt_tokens(isl);
     }
 
     pub fn create_logprobs(
@@ -372,7 +387,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         // the embedding sequence length computed by the worker
         if let Some(completion_usage) = delta.completion_usage.as_ref() {
             // Update prompt_tokens from worker if provided (e.g., for embeddings)
-            self.usage.prompt_tokens = completion_usage.prompt_tokens;
+            self.usage.prompt_tokens = self.adjusted_prompt_tokens(completion_usage.prompt_tokens);
 
             // Propagate prompt token details if provided
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
@@ -755,6 +770,35 @@ mod tests {
         assert_eq!(
             usage.completion_tokens_details.unwrap().reasoning_tokens,
             Some(2)
+        );
+    }
+
+    #[test]
+    fn prompt_token_adjustment_survives_backend_usage_override() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-prompt-adjustment".to_string());
+
+        generator.set_prompt_tokens_adjustment(3);
+        generator.update_isl(39);
+        assert_eq!(generator.get_usage().prompt_tokens, 36);
+
+        // Workers can replace the frontend ISL with their own prompt count (for
+        // example after multimodal placeholder expansion). The API-only
+        // adjustment must still apply to that authoritative backend count.
+        let mut output = final_backend_output();
+        output.completion_usage = Some(dynamo_protocols::types::CompletionUsage {
+            prompt_tokens: 122,
+            completion_tokens: 0,
+            total_tokens: 122,
+            ..Default::default()
+        });
+        generator.choice_from_postprocessor(output).unwrap();
+
+        let usage = generator.get_usage();
+        assert_eq!(usage.prompt_tokens, 119);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
         );
     }
 

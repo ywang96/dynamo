@@ -36,6 +36,11 @@ fn k3_snapshot_loads_and_markers_are_atomic() {
     let text = "<|open|>think<|sep|>";
     let encoding = tokenizer.encode(text).expect("encode");
     let ids = encoding.token_ids().to_vec();
+    assert_eq!(
+        ids.len(),
+        3,
+        "the K3 snapshot encodes the injected think prefill as three tokens"
+    );
     assert!(
         ids.contains(&OPEN_ID),
         "expected atomic <|open|> id {OPEN_ID} in {ids:?}"
