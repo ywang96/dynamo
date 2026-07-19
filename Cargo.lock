@@ -2650,6 +2650,7 @@ dependencies = [
  "video-rs",
  "vllm-parser",
  "vllm-tokenizer",
+ "xgrammar-structural-tag",
  "xxhash-rust",
 ]
 

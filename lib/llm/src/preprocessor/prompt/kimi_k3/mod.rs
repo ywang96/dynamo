@@ -8,6 +8,7 @@
 
 pub mod encoder;
 pub mod renderer;
+pub mod structural_tag;
 
 use rustc_hash::FxHashMap;
 

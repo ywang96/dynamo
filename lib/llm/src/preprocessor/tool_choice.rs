@@ -3,6 +3,7 @@
 
 //! Tool-choice guided decoding policy for OpenAI chat requests.
 
+use crate::preprocessor::prompt::kimi_k3::structural_tag::build_kimi_k3_structural_tag;
 use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest, unified};
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 use crate::protocols::openai::tools::get_json_schema_from_tools;
@@ -36,22 +37,6 @@ impl OpenAIPreprocessor {
             .as_ref()
             .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
 
-        if unified::kimi_k3::is_selected(
-            self.runtime_config.reasoning_parser.as_deref(),
-            self.tool_call_parser.as_deref(),
-        ) {
-            if matches!(tool_choice, ChatCompletionToolChoiceOption::Named(_)) {
-                return Err(invalid_argument(
-                    "Named tool choice is not supported for Kimi K3. \
-                     Use `tool_choice` set to \"auto\", \"required\", or \"none\" instead.",
-                ));
-            }
-            // TODO: Add Kimi K3-native tool-choice constraints once guided decoding can
-            // express its XTML tools/call/argument grammar. The available generic JSON
-            // schema and structural-tag formats do not match the unified K3 parser.
-            return Ok(false);
-        }
-
         let tools = request.effective_tools();
         let is_forced_tool_choice = matches!(
             tool_choice,
@@ -83,6 +68,17 @@ impl OpenAIPreprocessor {
             gd.json = None;
         }
 
+        if unified::kimi_k3::is_selected(
+            self.runtime_config.reasoning_parser.as_deref(),
+            self.tool_call_parser.as_deref(),
+        ) {
+            return apply_kimi_k3_structural_tag(
+                &convert_tool_choice(tool_choice),
+                &convert_tools(&tools),
+                common_request,
+            );
+        }
+
         if self.apply_tool_choice_structural_tag(
             &convert_tool_choice(tool_choice),
             &convert_tools(&tools),
@@ -111,6 +107,24 @@ impl OpenAIPreprocessor {
         // tool-choice JSON fallback were needed.
         Ok(false)
     }
+}
+
+fn apply_kimi_k3_structural_tag(
+    tool_choice: &ToolChoice,
+    tools: &[ToolDefinition],
+    common_request: &mut PreprocessedRequest,
+) -> Result<bool, DynamoError> {
+    let Some(structural_tag) = build_kimi_k3_structural_tag(tool_choice, tools)
+        .map_err(|err| invalid_argument(err.to_string()))?
+    else {
+        return Ok(false);
+    };
+    common_request
+        .sampling_options
+        .guided_decoding
+        .get_or_insert_default()
+        .structural_tag = Some(structural_tag);
+    Ok(true)
 }
 
 fn has_explicit_guided_decoding(request: &NvCreateChatCompletionRequest) -> bool {
@@ -152,4 +166,90 @@ fn convert_tools(tools: &[ChatCompletionTool]) -> Vec<ToolDefinition> {
             strict: tool.function.strict,
         })
         .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+    use serde_json::json;
+
+    fn preprocessed_request() -> PreprocessedRequest {
+        PreprocessedRequest::builder()
+            .model("kimi-k3".to_string())
+            .token_ids(vec![1])
+            .stop_conditions(StopConditions::default())
+            .sampling_options(SamplingOptions::default())
+            .output_options(OutputOptions::default())
+            .build()
+            .unwrap()
+    }
+
+    fn tool(name: &str, strict: Option<bool>) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            parameters: Some(json!({"type": "object"})),
+            strict,
+        }
+    }
+
+    #[test]
+    fn k3_required_attaches_structural_tag_for_backend_xgrammar() {
+        let mut request = preprocessed_request();
+
+        let applied = apply_kimi_k3_structural_tag(
+            &ToolChoice::Required,
+            &[tool("lookup", None)],
+            &mut request,
+        )
+        .unwrap();
+
+        assert!(applied);
+        let guided = request.sampling_options.guided_decoding.unwrap();
+        assert!(guided.json.is_none());
+        assert_eq!(
+            guided.structural_tag.as_ref().unwrap()["type"],
+            "structural_tag"
+        );
+    }
+
+    #[test]
+    fn k3_named_attaches_only_the_selected_tool() {
+        let mut request = preprocessed_request();
+
+        assert!(
+            apply_kimi_k3_structural_tag(
+                &ToolChoice::Named("second".into()),
+                &[tool("first", None), tool("second", None)],
+                &mut request,
+            )
+            .unwrap()
+        );
+        let serialized = serde_json::to_string(
+            request
+                .sampling_options
+                .guided_decoding
+                .unwrap()
+                .structural_tag
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(serialized.contains(r#"tool=\"second\""#));
+        assert!(!serialized.contains(r#"tool=\"first\""#));
+    }
+
+    #[test]
+    fn k3_auto_without_strict_tool_leaves_xgrammar_inactive() {
+        let mut request = preprocessed_request();
+
+        assert!(
+            !apply_kimi_k3_structural_tag(
+                &ToolChoice::Auto,
+                &[tool("lookup", None)],
+                &mut request,
+            )
+            .unwrap()
+        );
+        assert!(request.sampling_options.guided_decoding.is_none());
+    }
 }
