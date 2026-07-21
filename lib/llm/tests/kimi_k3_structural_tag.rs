@@ -79,7 +79,7 @@ fn named_choice_is_not_part_of_the_k3_api_contract() {
 }
 
 #[test]
-fn argument_formats_match_k3_raw_string_and_json_channels() {
+fn argument_formats_use_mke_typed_and_raw_json_channels() {
     let tools = [tool(
         "typed",
         json!({
@@ -96,10 +96,15 @@ fn argument_formats_match_k3_raw_string_and_json_channels() {
 
     let tag = build(ToolChoice::Required, &tools).unwrap();
     let serialized = serde_json::to_string(&tag).unwrap();
+    let call_content = &tools_part(&tag)["content"]["tags"][0]["content"];
 
-    assert!(serialized.contains(r#""type":"or""#));
+    assert_eq!(call_content["elements"][0]["pattern"], "[1-9][0-9]*");
+    assert_eq!(call_content["elements"][2]["type"], "or");
+    assert_eq!(
+        call_content["elements"][2]["elements"][1]["begin"],
+        "<|open|>json type=\"object\"<|sep|>"
+    );
     assert!(serialized.contains(r#""value":"fast""#));
-    assert!(serialized.contains(r#""pattern":"(?:[^<]|<[^|]){2,8}""#));
     assert!(serialized.contains(r#""$defs":{"payload""#));
 }
 

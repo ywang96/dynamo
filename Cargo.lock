@@ -10740,7 +10740,7 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/mke.git?rev=2eff80907c21062d882b1c2b3bd352739c0073b5#2eff80907c21062d882b1c2b3bd352739c0073b5"
+source = "git+https://github.com/Inferact/mke.git?rev=500522f6a6fbfea11e9aaf67949d61734fb0bae0#500522f6a6fbfea11e9aaf67949d61734fb0bae0"
 dependencies = [
  "easy-ext",
  "serde",
@@ -10755,7 +10755,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/mke.git?rev=2eff80907c21062d882b1c2b3bd352739c0073b5#2eff80907c21062d882b1c2b3bd352739c0073b5"
+source = "git+https://github.com/Inferact/mke.git?rev=500522f6a6fbfea11e9aaf67949d61734fb0bae0#500522f6a6fbfea11e9aaf67949d61734fb0bae0"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -11478,9 +11478,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xgrammar-structural-tag"
-version = "0.1.0+xgrammar.0.2.2.4d145cc"
+version = "0.2.0+xgrammar.0.2.4.dd729e7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2436dea2393d55a3b188588aa300c5a8afe8f45a77da52c611fb4498a6c876e6"
+checksum = "d4d24c842efc3c24e9756aa426d530cbdac0980e49af223cb384e276e981ca0a"
 dependencies = [
  "auto_impl",
  "serde",

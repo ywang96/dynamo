@@ -57,15 +57,15 @@ dynamo-mocker = { path = "lib/mocker", version = "1.3.0" }
 dynamo-kv-router = { path = "lib/kv-router", version = "1.3.0", features = ["metrics", "runtime-protocols"] }
 dynamo-protocols = { version = "=2.0.2" }
 dynamo-parsers = { version = "5.0.0" }
-xgrammar-structural-tag = { version = "=0.1.0" }
+xgrammar-structural-tag = { version = "=0.2.0" }
 # Published on crates.io. To see all available versions:
 #   web:          https://crates.io/crates/dynamo-parsers-v2/versions
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
 dynamo-parsers-v2 = { version = "0.1.19" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.3.0" }
 fastokens = { version = "0.2.1" }
-vllm-parser = { git = "https://github.com/Inferact/mke.git", rev = "2eff80907c21062d882b1c2b3bd352739c0073b5" }
-vllm-tokenizer = { git = "https://github.com/Inferact/mke.git", rev = "2eff80907c21062d882b1c2b3bd352739c0073b5" }
+vllm-parser = { git = "https://github.com/Inferact/mke.git", rev = "500522f6a6fbfea11e9aaf67949d61734fb0bae0" }
+vllm-tokenizer = { git = "https://github.com/Inferact/mke.git", rev = "500522f6a6fbfea11e9aaf67949d61734fb0bae0" }
 # FxHashMap for the tiktoken special-token maps (same 1.x line as
 # dynamo-tokenizers, so the map type unifies across the from_file boundary).
 rustc-hash = "1"
