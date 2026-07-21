@@ -259,6 +259,12 @@ async def async_main():
         "tokenizer_backend": config.tokenizer_backend,
         "kimi_schema_validation": config.kimi_schema_validation,
         "kimi_schema_validation_level": config.kimi_schema_validation_level,
+        "kimi_api_compliance": config.kimi_api_compliance,
+        "kimi_default_max_completion_tokens": config.kimi_default_max_completion_tokens,
+        "kimi_allowed_thinking_types": config.kimi_allowed_thinking_types,
+        "kimi_default_reasoning_effort": config.kimi_default_reasoning_effort,
+        "kimi_allowed_reasoning_efforts": config.kimi_allowed_reasoning_efforts,
+        "kimi_allowed_top_p": config.kimi_allowed_top_p,
     }
     if config.migration_max_seq_len is not None:
         kwargs["migration_max_seq_len"] = config.migration_max_seq_len

@@ -22,7 +22,7 @@ use dynamo_llm::entrypoint::EngineConfig as RsEngineConfig;
 use dynamo_llm::entrypoint::RouterConfig as RsRouterConfig;
 use dynamo_llm::entrypoint::input::Input;
 use dynamo_llm::entrypoint::{ChatEngineFactoryCallback, PrefillRoutedEngine};
-use dynamo_llm::frontend_config::{FrontendApiConfig, MetricsConfig};
+use dynamo_llm::frontend_config::{FrontendApiConfig, KimiApiComplianceConfig, MetricsConfig};
 use dynamo_llm::local_model::DEFAULT_HTTP_PORT;
 use dynamo_llm::local_model::runtime_config::TokenizerBackend;
 use dynamo_llm::local_model::{LocalModel, LocalModelBuilder};
@@ -494,6 +494,38 @@ impl From<RouterConfig> for RsRouterConfig {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_frontend_api_config(
+    enable_anthropic_api: Option<bool>,
+    strip_anthropic_preamble: Option<bool>,
+    enable_streaming_tool_dispatch: Option<bool>,
+    enable_streaming_reasoning_dispatch: Option<bool>,
+    kimi_api_compliance: Option<bool>,
+    kimi_default_max_completion_tokens: Option<u32>,
+    kimi_allowed_thinking_types: Option<Vec<String>>,
+    kimi_default_reasoning_effort: Option<String>,
+    kimi_allowed_reasoning_efforts: Option<Vec<String>>,
+    kimi_allowed_top_p: Option<Vec<f32>>,
+) -> PyResult<Option<FrontendApiConfig>> {
+    let kimi_api_compliance = KimiApiComplianceConfig::from_optional_flags(
+        kimi_api_compliance,
+        kimi_default_max_completion_tokens,
+        kimi_allowed_thinking_types,
+        kimi_default_reasoning_effort,
+        kimi_allowed_reasoning_efforts,
+        kimi_allowed_top_p,
+    )
+    .map_err(PyValueError::new_err)?;
+
+    Ok(FrontendApiConfig::from_optional_flags(
+        enable_anthropic_api,
+        strip_anthropic_preamble,
+        enable_streaming_tool_dispatch,
+        enable_streaming_reasoning_dispatch,
+        kimi_api_compliance,
+    ))
+}
+
 /// Wrapper to hold Python callback and its TaskLocals for async execution
 #[derive(Clone)]
 struct PyEngineFactory {
@@ -543,7 +575,7 @@ pub(crate) struct EntrypointArgs {
 impl EntrypointArgs {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (engine_type, model_path=None, model_name=None, endpoint_id=None, template_file=None, router_config=None, kv_cache_block_size=None, http_host=None, http_port=None, http_metrics_port=None, tls_cert_path=None, tls_key_path=None, extra_engine_args=None, mocker_engine_args=None, runtime_config=None, namespace=None, namespace_prefix=None, is_prefill=false, is_decode=false, migration_limit=0, migration_max_seq_len=None, chat_engine_factory=None, aic_perf_config=None, *, metrics_prefix=None, enable_anthropic_api=None, strip_anthropic_preamble=None, enable_streaming_tool_dispatch=None, enable_streaming_reasoning_dispatch=None, tokenizer_backend=None, kimi_schema_validation=None, kimi_schema_validation_level=None))]
+    #[pyo3(signature = (engine_type, model_path=None, model_name=None, endpoint_id=None, template_file=None, router_config=None, kv_cache_block_size=None, http_host=None, http_port=None, http_metrics_port=None, tls_cert_path=None, tls_key_path=None, extra_engine_args=None, mocker_engine_args=None, runtime_config=None, namespace=None, namespace_prefix=None, is_prefill=false, is_decode=false, migration_limit=0, migration_max_seq_len=None, chat_engine_factory=None, aic_perf_config=None, *, metrics_prefix=None, enable_anthropic_api=None, strip_anthropic_preamble=None, enable_streaming_tool_dispatch=None, enable_streaming_reasoning_dispatch=None, tokenizer_backend=None, kimi_schema_validation=None, kimi_schema_validation_level=None, kimi_api_compliance=None, kimi_default_max_completion_tokens=None, kimi_allowed_thinking_types=None, kimi_default_reasoning_effort=None, kimi_allowed_reasoning_efforts=None, kimi_allowed_top_p=None))]
     pub fn new(
         py: Python<'_>,
         engine_type: EngineType,
@@ -577,6 +609,12 @@ impl EntrypointArgs {
         tokenizer_backend: Option<String>,
         kimi_schema_validation: Option<bool>,
         kimi_schema_validation_level: Option<String>,
+        kimi_api_compliance: Option<bool>,
+        kimi_default_max_completion_tokens: Option<u32>,
+        kimi_allowed_thinking_types: Option<Vec<String>>,
+        kimi_default_reasoning_effort: Option<String>,
+        kimi_allowed_reasoning_efforts: Option<Vec<String>>,
+        kimi_allowed_top_p: Option<Vec<f32>>,
     ) -> PyResult<Self> {
         let endpoint_id_obj: Option<EndpointId> = endpoint_id.as_deref().map(EndpointId::from);
         if (tls_cert_path.is_some() && tls_key_path.is_none())
@@ -633,12 +671,18 @@ impl EntrypointArgs {
             http_port: http_port.unwrap_or(DEFAULT_HTTP_PORT),
             http_metrics_port,
             metrics_config: metrics_prefix.map(|prefix| MetricsConfig::new(Some(prefix))),
-            frontend_api_config: FrontendApiConfig::from_optional_flags(
+            frontend_api_config: build_frontend_api_config(
                 enable_anthropic_api,
                 strip_anthropic_preamble,
                 enable_streaming_tool_dispatch,
                 enable_streaming_reasoning_dispatch,
-            ),
+                kimi_api_compliance,
+                kimi_default_max_completion_tokens,
+                kimi_allowed_thinking_types,
+                kimi_default_reasoning_effort,
+                kimi_allowed_reasoning_efforts,
+                kimi_allowed_top_p,
+            )?,
             tls_cert_path,
             tls_key_path,
             extra_engine_args,
@@ -973,4 +1017,35 @@ where
     E: Display,
 {
     PyException::new_err(format!("{}", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_preserves_kimi_values() {
+        let config = build_frontend_api_config(
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(131_072),
+            Some(vec!["enabled".into()]),
+            Some("max".into()),
+            Some(vec!["max".into()]),
+            Some(vec![0.95]),
+        )
+        .expect("valid binding config")
+        .expect("explicit values should produce frontend config");
+
+        let kimi = config.kimi_api_compliance();
+        assert!(kimi.enabled());
+        assert_eq!(kimi.default_max_completion_tokens(), 131_072);
+        assert_eq!(kimi.allowed_thinking_types(), &["enabled"]);
+        assert_eq!(kimi.default_reasoning_effort(), "max");
+        assert_eq!(kimi.allowed_reasoning_efforts(), &["max"]);
+        assert_eq!(kimi.allowed_top_p(), &[0.95]);
+    }
 }
