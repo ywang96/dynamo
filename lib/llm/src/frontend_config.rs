@@ -137,23 +137,176 @@ impl Default for StreamingDispatchConfig {
     }
 }
 
+pub const KIMI_DEFAULT_MAX_COMPLETION_TOKENS: u32 = 32_768;
+pub const KIMI_DEFAULT_REASONING_EFFORT: &str = "max";
+pub const KIMI_ALLOWED_THINKING_TYPES: &[&str] = &["enabled", "disabled"];
+pub const KIMI_ALLOWED_REASONING_EFFORTS: &[&str] = &["low", "high", "max"];
+pub const KIMI_ALLOWED_TOP_P: &[f32] = &[0.95, 1.0];
+
+/// Kimi API request defaults and allowlists.
+///
+/// The frontend enables this policy explicitly. It never infers Kimi behavior
+/// from the requested model name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KimiApiComplianceConfig {
+    enabled: bool,
+    default_max_completion_tokens: u32,
+    allowed_thinking_types: Vec<String>,
+    default_reasoning_effort: String,
+    allowed_reasoning_efforts: Vec<String>,
+    allowed_top_p: Vec<f32>,
+}
+
+impl Default for KimiApiComplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_max_completion_tokens: KIMI_DEFAULT_MAX_COMPLETION_TOKENS,
+            allowed_thinking_types: KIMI_ALLOWED_THINKING_TYPES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            default_reasoning_effort: KIMI_DEFAULT_REASONING_EFFORT.to_string(),
+            allowed_reasoning_efforts: KIMI_ALLOWED_REASONING_EFFORTS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            allowed_top_p: KIMI_ALLOWED_TOP_P.to_vec(),
+        }
+    }
+}
+
+impl KimiApiComplianceConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_optional_flags(
+        enabled: Option<bool>,
+        default_max_completion_tokens: Option<u32>,
+        allowed_thinking_types: Option<Vec<String>>,
+        default_reasoning_effort: Option<String>,
+        allowed_reasoning_efforts: Option<Vec<String>>,
+        allowed_top_p: Option<Vec<f32>>,
+    ) -> Result<Option<Self>, String> {
+        if enabled.is_none()
+            && default_max_completion_tokens.is_none()
+            && allowed_thinking_types.is_none()
+            && default_reasoning_effort.is_none()
+            && allowed_reasoning_efforts.is_none()
+            && allowed_top_p.is_none()
+        {
+            return Ok(None);
+        }
+
+        let defaults = Self::default();
+        let config = Self {
+            enabled: enabled.unwrap_or(defaults.enabled),
+            default_max_completion_tokens: default_max_completion_tokens
+                .unwrap_or(defaults.default_max_completion_tokens),
+            allowed_thinking_types: allowed_thinking_types
+                .unwrap_or_else(|| defaults.allowed_thinking_types.clone()),
+            default_reasoning_effort: default_reasoning_effort
+                .unwrap_or_else(|| defaults.default_reasoning_effort.clone()),
+            allowed_reasoning_efforts: allowed_reasoning_efforts
+                .unwrap_or_else(|| defaults.allowed_reasoning_efforts.clone()),
+            allowed_top_p: allowed_top_p.unwrap_or_else(|| defaults.allowed_top_p.clone()),
+        };
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.default_max_completion_tokens == 0 {
+            return Err("--kimi-default-max-completion-tokens must be >= 1".to_string());
+        }
+        if self.allowed_thinking_types.is_empty()
+            || !self
+                .allowed_thinking_types
+                .iter()
+                .any(|value| value == "enabled")
+            || self
+                .allowed_thinking_types
+                .iter()
+                .any(|value| !KIMI_ALLOWED_THINKING_TYPES.contains(&value.as_str()))
+        {
+            return Err(
+                "--kimi-allowed-thinking-types must contain enabled and only enabled,disabled"
+                    .to_string(),
+            );
+        }
+        if self.allowed_reasoning_efforts.is_empty()
+            || self
+                .allowed_reasoning_efforts
+                .iter()
+                .any(|value| !KIMI_ALLOWED_REASONING_EFFORTS.contains(&value.as_str()))
+            || !self
+                .allowed_reasoning_efforts
+                .contains(&self.default_reasoning_effort)
+        {
+            return Err(
+                "--kimi-default-reasoning-effort must belong to a non-empty valid allowlist"
+                    .to_string(),
+            );
+        }
+        if self.allowed_top_p.is_empty()
+            || self
+                .allowed_top_p
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        {
+            return Err(
+                "--kimi-allowed-top-p must contain finite values between 0 and 1".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn default_max_completion_tokens(&self) -> u32 {
+        self.default_max_completion_tokens
+    }
+
+    pub fn allowed_thinking_types(&self) -> &[String] {
+        &self.allowed_thinking_types
+    }
+
+    pub fn default_reasoning_effort(&self) -> &str {
+        &self.default_reasoning_effort
+    }
+
+    pub fn allowed_reasoning_efforts(&self) -> &[String] {
+        &self.allowed_reasoning_efforts
+    }
+
+    pub fn allowed_top_p(&self) -> &[f32] {
+        &self.allowed_top_p
+    }
+}
+
 /// Frontend API behavior consumed by the HTTP service.
 ///
 /// Groups endpoint-surface and streaming-behavior settings that originate from
 /// the frontend CLI/env contract. `EntrypointArgs` builds this from flat Python
 /// kwargs, `LocalModel` carries it, and `HttpServiceConfig` installs it into
 /// request-handler state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FrontendApiConfig {
     anthropic: AnthropicApiConfig,
     streaming_dispatch: StreamingDispatchConfig,
+    kimi_api_compliance: KimiApiComplianceConfig,
 }
 
 impl FrontendApiConfig {
-    pub fn new(anthropic: AnthropicApiConfig, streaming_dispatch: StreamingDispatchConfig) -> Self {
+    pub fn new(
+        anthropic: AnthropicApiConfig,
+        streaming_dispatch: StreamingDispatchConfig,
+        kimi_api_compliance: KimiApiComplianceConfig,
+    ) -> Self {
         Self {
             anthropic,
             streaming_dispatch,
+            kimi_api_compliance,
         }
     }
 
@@ -162,6 +315,7 @@ impl FrontendApiConfig {
         strip_anthropic_preamble: bool,
         enable_streaming_tool_dispatch: bool,
         enable_streaming_reasoning_dispatch: bool,
+        kimi_api_compliance: KimiApiComplianceConfig,
     ) -> Self {
         Self {
             anthropic: AnthropicApiConfig::new(enable_anthropic_api, strip_anthropic_preamble),
@@ -169,23 +323,24 @@ impl FrontendApiConfig {
                 enable_streaming_tool_dispatch,
                 enable_streaming_reasoning_dispatch,
             ),
+            kimi_api_compliance,
         }
     }
-
     pub fn from_optional_flags(
         enable_anthropic_api: Option<bool>,
         strip_anthropic_preamble: Option<bool>,
         enable_streaming_tool_dispatch: Option<bool>,
         enable_streaming_reasoning_dispatch: Option<bool>,
+        kimi_api_compliance: Option<KimiApiComplianceConfig>,
     ) -> Option<Self> {
         if enable_anthropic_api.is_none()
             && strip_anthropic_preamble.is_none()
             && enable_streaming_tool_dispatch.is_none()
             && enable_streaming_reasoning_dispatch.is_none()
+            && kimi_api_compliance.is_none()
         {
             return None;
         }
-
         let defaults = Self::default();
         Some(Self::from_flags(
             enable_anthropic_api.unwrap_or_else(|| defaults.anthropic().enabled()),
@@ -194,9 +349,9 @@ impl FrontendApiConfig {
                 .unwrap_or_else(|| defaults.streaming_dispatch().tool_dispatch()),
             enable_streaming_reasoning_dispatch
                 .unwrap_or_else(|| defaults.streaming_dispatch().reasoning_dispatch()),
+            kimi_api_compliance.unwrap_or_else(|| defaults.kimi_api_compliance().clone()),
         ))
     }
-
     pub fn anthropic(&self) -> &AnthropicApiConfig {
         &self.anthropic
     }
@@ -212,6 +367,10 @@ impl FrontendApiConfig {
     pub fn streaming_dispatch_mut(&mut self) -> &mut StreamingDispatchConfig {
         &mut self.streaming_dispatch
     }
+
+    pub fn kimi_api_compliance(&self) -> &KimiApiComplianceConfig {
+        &self.kimi_api_compliance
+    }
 }
 
 #[cfg(test)]
@@ -220,11 +379,10 @@ mod tests {
 
     #[test]
     fn optional_flags_return_none_when_all_values_are_unspecified() {
-        let config = FrontendApiConfig::from_optional_flags(None, None, None, None);
+        let config = FrontendApiConfig::from_optional_flags(None, None, None, None, None);
 
         assert_eq!(config, None);
     }
-
     #[test]
     fn optional_flags_preserve_explicit_false_values() {
         let config = FrontendApiConfig::from_optional_flags(
@@ -232,9 +390,9 @@ mod tests {
             Some(true),
             Some(false),
             Some(true),
+            None,
         )
         .expect("explicit flags should produce a config");
-
         assert!(!config.anthropic().enabled());
         assert!(config.anthropic().strip_preamble());
         assert!(!config.streaming_dispatch().tool_dispatch());
@@ -251,15 +409,98 @@ mod tests {
                 (env_llm::DYN_ENABLE_STREAMING_REASONING_DISPATCH, Some("1")),
             ],
             || {
-                let config =
-                    FrontendApiConfig::from_optional_flags(Some(false), None, None, Some(false))
-                        .expect("partial flags should produce a config");
+                let config = FrontendApiConfig::from_optional_flags(
+                    Some(false),
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                )
+                .expect("partial flags should produce a config");
 
                 assert!(!config.anthropic().enabled());
                 assert!(config.anthropic().strip_preamble());
                 assert!(config.streaming_dispatch().tool_dispatch());
                 assert!(!config.streaming_dispatch().reasoning_dispatch());
             },
+        );
+    }
+
+    #[test]
+    fn kimi_config_preserves_narrowed_values() {
+        let config = KimiApiComplianceConfig::from_optional_flags(
+            Some(true),
+            Some(131_072),
+            Some(vec!["enabled".into()]),
+            Some("max".into()),
+            Some(vec!["max".into()]),
+            Some(vec![0.95]),
+        )
+        .expect("valid Kimi config")
+        .expect("explicit values should produce a config");
+
+        assert!(config.enabled());
+        assert_eq!(config.default_max_completion_tokens(), 131_072);
+        assert_eq!(config.allowed_thinking_types(), &["enabled"]);
+        assert_eq!(config.default_reasoning_effort(), "max");
+        assert_eq!(config.allowed_reasoning_efforts(), &["max"]);
+        assert_eq!(config.allowed_top_p(), &[0.95]);
+    }
+
+    #[test]
+    fn kimi_config_returns_none_when_unspecified() {
+        let config =
+            KimiApiComplianceConfig::from_optional_flags(None, None, None, None, None, None)
+                .expect("unspecified config is valid");
+
+        assert_eq!(config, None);
+    }
+
+    #[test]
+    fn kimi_config_rejects_invalid_values() {
+        assert!(
+            KimiApiComplianceConfig::from_optional_flags(
+                Some(true),
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            KimiApiComplianceConfig::from_optional_flags(
+                Some(true),
+                None,
+                Some(vec!["disabled".into()]),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            KimiApiComplianceConfig::from_optional_flags(
+                Some(true),
+                None,
+                None,
+                Some("max".into()),
+                Some(vec!["high".into()]),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            KimiApiComplianceConfig::from_optional_flags(
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                Some(Vec::new()),
+            )
+            .is_err()
         );
     }
 }
