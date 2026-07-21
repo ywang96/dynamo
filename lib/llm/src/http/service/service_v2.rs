@@ -45,7 +45,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
-use crate::frontend_config::{FrontendApiConfig, KimiApiComplianceConfig, MetricsConfig};
+use crate::frontend_config::{
+    AutoToolChoiceOverrideMode, FrontendApiConfig, KimiApiComplianceConfig, MetricsConfig,
+};
 
 /// Middleware that echoes `x-request-id` from request to response headers.
 async fn echo_request_id_header(
@@ -488,8 +490,8 @@ impl State {
         self.frontend_api_config.kimi_api_compliance()
     }
 
-    /// Returns whether explicit `tool_choice="auto"` requests become `"required"`.
-    pub fn override_auto_tool_choice_to_required(&self) -> bool {
+    /// Returns the policy for rewriting explicit `tool_choice="auto"` requests.
+    pub fn override_auto_tool_choice_to_required(&self) -> Option<AutoToolChoiceOverrideMode> {
         self.frontend_api_config
             .override_auto_tool_choice_to_required()
     }

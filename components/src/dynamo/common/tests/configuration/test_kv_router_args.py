@@ -712,12 +712,16 @@ def test_frontend_auto_tool_choice_override_flag() -> None:
     FrontendArgGroup().add_arguments(parser)
 
     defaults = FrontendConfig.from_cli_args(parser.parse_args([]))
-    enabled = FrontendConfig.from_cli_args(
+    all_tools = FrontendConfig.from_cli_args(
         parser.parse_args(["--override-auto-tool-choice-to-required"])
     )
+    strict_tools = FrontendConfig.from_cli_args(
+        parser.parse_args(["--override-auto-tool-choice-to-required", "strict"])
+    )
 
-    assert defaults.override_auto_tool_choice_to_required is False
-    assert enabled.override_auto_tool_choice_to_required is True
+    assert defaults.override_auto_tool_choice_to_required is None
+    assert all_tools.override_auto_tool_choice_to_required == "all"
+    assert strict_tools.override_auto_tool_choice_to_required == "strict"
 
 
 def test_frontend_kimi_compliance_rejects_medium_reasoning_effort() -> None:

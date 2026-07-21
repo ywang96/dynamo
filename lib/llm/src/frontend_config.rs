@@ -284,6 +284,26 @@ impl KimiApiComplianceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoToolChoiceOverrideMode {
+    All,
+    Strict,
+}
+
+impl std::str::FromStr for AutoToolChoiceOverrideMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "all" => Ok(Self::All),
+            "strict" => Ok(Self::Strict),
+            _ => Err(
+                "--override-auto-tool-choice-to-required must be one of: all, strict".to_string(),
+            ),
+        }
+    }
+}
+
 /// Frontend API behavior consumed by the HTTP service.
 ///
 /// Groups endpoint-surface and streaming-behavior settings that originate from
@@ -295,7 +315,7 @@ pub struct FrontendApiConfig {
     anthropic: AnthropicApiConfig,
     streaming_dispatch: StreamingDispatchConfig,
     kimi_api_compliance: KimiApiComplianceConfig,
-    override_auto_tool_choice_to_required: bool,
+    override_auto_tool_choice_to_required: Option<AutoToolChoiceOverrideMode>,
 }
 
 impl FrontendApiConfig {
@@ -303,7 +323,7 @@ impl FrontendApiConfig {
         anthropic: AnthropicApiConfig,
         streaming_dispatch: StreamingDispatchConfig,
         kimi_api_compliance: KimiApiComplianceConfig,
-        override_auto_tool_choice_to_required: bool,
+        override_auto_tool_choice_to_required: Option<AutoToolChoiceOverrideMode>,
     ) -> Self {
         Self {
             anthropic,
@@ -319,7 +339,7 @@ impl FrontendApiConfig {
         enable_streaming_tool_dispatch: bool,
         enable_streaming_reasoning_dispatch: bool,
         kimi_api_compliance: KimiApiComplianceConfig,
-        override_auto_tool_choice_to_required: bool,
+        override_auto_tool_choice_to_required: Option<AutoToolChoiceOverrideMode>,
     ) -> Self {
         Self {
             anthropic: AnthropicApiConfig::new(enable_anthropic_api, strip_anthropic_preamble),
@@ -337,7 +357,7 @@ impl FrontendApiConfig {
         enable_streaming_tool_dispatch: Option<bool>,
         enable_streaming_reasoning_dispatch: Option<bool>,
         kimi_api_compliance: Option<KimiApiComplianceConfig>,
-        override_auto_tool_choice_to_required: Option<bool>,
+        override_auto_tool_choice_to_required: Option<AutoToolChoiceOverrideMode>,
     ) -> Option<Self> {
         if enable_anthropic_api.is_none()
             && strip_anthropic_preamble.is_none()
@@ -358,7 +378,7 @@ impl FrontendApiConfig {
                 .unwrap_or_else(|| defaults.streaming_dispatch().reasoning_dispatch()),
             kimi_api_compliance.unwrap_or_else(|| defaults.kimi_api_compliance().clone()),
             override_auto_tool_choice_to_required
-                .unwrap_or_else(|| defaults.override_auto_tool_choice_to_required()),
+                .or(defaults.override_auto_tool_choice_to_required()),
         ))
     }
     pub fn anthropic(&self) -> &AnthropicApiConfig {
@@ -381,7 +401,7 @@ impl FrontendApiConfig {
         &self.kimi_api_compliance
     }
 
-    pub fn override_auto_tool_choice_to_required(&self) -> bool {
+    pub fn override_auto_tool_choice_to_required(&self) -> Option<AutoToolChoiceOverrideMode> {
         self.override_auto_tool_choice_to_required
     }
 }
@@ -397,21 +417,24 @@ mod tests {
         assert_eq!(config, None);
     }
     #[test]
-    fn optional_flags_preserve_explicit_false_values() {
+    fn optional_flags_preserve_explicit_values() {
         let config = FrontendApiConfig::from_optional_flags(
             Some(false),
             Some(true),
             Some(false),
             Some(true),
             None,
-            Some(true),
+            Some(AutoToolChoiceOverrideMode::Strict),
         )
         .expect("explicit flags should produce a config");
         assert!(!config.anthropic().enabled());
         assert!(config.anthropic().strip_preamble());
         assert!(!config.streaming_dispatch().tool_dispatch());
         assert!(config.streaming_dispatch().reasoning_dispatch());
-        assert!(config.override_auto_tool_choice_to_required());
+        assert_eq!(
+            config.override_auto_tool_choice_to_required(),
+            Some(AutoToolChoiceOverrideMode::Strict)
+        );
     }
 
     #[test]

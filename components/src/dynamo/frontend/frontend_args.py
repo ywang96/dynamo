@@ -102,7 +102,7 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
     enable_streaming_tool_dispatch: bool
     enable_streaming_reasoning_dispatch: bool
     exclude_tools_when_tool_choice_none: bool
-    override_auto_tool_choice_to_required: bool
+    override_auto_tool_choice_to_required: Optional[str]
     preprocess_workers: int
     tokenizer_backend: str
     trust_remote_code: bool
@@ -502,17 +502,20 @@ class FrontendArgGroup(ArgGroup):
                 "tool calls in the content field."
             ),
         )
-        add_negatable_bool_argument(
+        add_argument(
             g,
             flag_name="--override-auto-tool-choice-to-required",
             env_var="DYN_OVERRIDE_AUTO_TOOL_CHOICE_TO_REQUIRED",
-            default=False,
+            default=None,
+            nargs="?",
+            const="all",
+            choices=("all", "strict"),
             help=(
-                "Rewrite explicit tool_choice='auto' to tool_choice='required' "
-                "for Chat Completions requests. Other tool_choice values are unchanged."
+                "Rewrite explicit tool_choice='auto' to 'required'. Use 'all' "
+                "(the default when no mode is given) for every auto request, or "
+                "'strict' only when at least one declared function tool is strict."
             ),
         )
-
         add_negatable_bool_argument(
             g,
             flag_name="--kimi-api-compliance",

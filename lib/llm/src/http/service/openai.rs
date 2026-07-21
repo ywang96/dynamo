@@ -50,6 +50,7 @@ use super::{
     service_v2,
 };
 use crate::engines::ValidateRequest;
+use crate::frontend_config::AutoToolChoiceOverrideMode;
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId,
@@ -1445,16 +1446,26 @@ fn enforce_kimi_api_compliance(
     })
 }
 
-fn override_auto_tool_choice_to_required(
-    enabled: bool,
+fn apply_auto_tool_choice_override(
+    mode: Option<AutoToolChoiceOverrideMode>,
     request: &mut NvCreateChatCompletionRequest,
 ) {
-    if enabled
-        && matches!(
-            request.inner.tool_choice.as_ref(),
-            Some(ChatCompletionToolChoiceOption::Auto)
-        )
-    {
+    if !matches!(
+        request.inner.tool_choice.as_ref(),
+        Some(ChatCompletionToolChoiceOption::Auto)
+    ) {
+        return;
+    }
+
+    let should_override = match mode {
+        None => false,
+        Some(AutoToolChoiceOverrideMode::All) => true,
+        Some(AutoToolChoiceOverrideMode::Strict) => request
+            .effective_tools()
+            .iter()
+            .any(|tool| tool.function.strict == Some(true)),
+    };
+    if should_override {
         request.inner.tool_choice = Some(ChatCompletionToolChoiceOption::Required);
     }
 }
@@ -1471,10 +1482,7 @@ async fn handler_chat_completions(
     let mut request: NvCreateChatCompletionRequest =
         parse_json_request("chat completions", body_ref)?;
     enforce_kimi_api_compliance(state.kimi_api_compliance_config(), &mut request)?;
-    override_auto_tool_choice_to_required(
-        state.override_auto_tool_choice_to_required(),
-        &mut request,
-    );
+    apply_auto_tool_choice_override(state.override_auto_tool_choice_to_required(), &mut request);
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -4087,38 +4095,71 @@ mod tests {
     };
 
     #[test]
-    fn auto_tool_choice_override_only_changes_explicit_auto() {
-        fn request(tool_choice: Option<&str>) -> NvCreateChatCompletionRequest {
+    fn auto_tool_choice_override_supports_all_and_strict_modes() {
+        fn request(extra: serde_json::Value) -> NvCreateChatCompletionRequest {
             let mut body = serde_json::json!({
                 "model": "model",
                 "messages": [{"role": "user", "content": "hello"}]
             });
-            if let Some(tool_choice) = tool_choice {
-                body["tool_choice"] = serde_json::json!(tool_choice);
-            }
+            body.as_object_mut()
+                .expect("base request is an object")
+                .extend(extra.as_object().expect("extra is an object").clone());
             serde_json::from_value(body).expect("valid chat request")
         }
 
-        let mut auto = request(Some("auto"));
-        override_auto_tool_choice_to_required(true, &mut auto);
+        let mut all = request(serde_json::json!({"tool_choice": "auto"}));
+        apply_auto_tool_choice_override(Some(AutoToolChoiceOverrideMode::All), &mut all);
         assert_eq!(
-            auto.inner.tool_choice,
+            all.inner.tool_choice,
             Some(ChatCompletionToolChoiceOption::Required)
         );
 
-        let mut disabled = request(Some("auto"));
-        override_auto_tool_choice_to_required(false, &mut disabled);
+        let mut strict = request(serde_json::json!({
+            "tool_choice": "auto",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                    "strict": true
+                }
+            }]
+        }));
+        apply_auto_tool_choice_override(Some(AutoToolChoiceOverrideMode::Strict), &mut strict);
+        assert_eq!(
+            strict.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+        );
+
+        let mut non_strict = request(serde_json::json!({
+            "tool_choice": "auto",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}}
+            }]
+        }));
+        apply_auto_tool_choice_override(Some(AutoToolChoiceOverrideMode::Strict), &mut non_strict);
+        assert_eq!(
+            non_strict.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Auto)
+        );
+
+        for unchanged in [
+            serde_json::json!({}),
+            serde_json::json!({"tool_choice": "none"}),
+        ] {
+            let mut request = request(unchanged);
+            let original = request.inner.tool_choice.clone();
+            apply_auto_tool_choice_override(Some(AutoToolChoiceOverrideMode::All), &mut request);
+            assert_eq!(request.inner.tool_choice, original);
+        }
+
+        let mut disabled = request(serde_json::json!({"tool_choice": "auto"}));
+        apply_auto_tool_choice_override(None, &mut disabled);
         assert_eq!(
             disabled.inner.tool_choice,
             Some(ChatCompletionToolChoiceOption::Auto)
         );
-
-        for unchanged in [None, Some("none"), Some("required")] {
-            let mut request = request(unchanged);
-            let original = request.inner.tool_choice.clone();
-            override_auto_tool_choice_to_required(true, &mut request);
-            assert_eq!(request.inner.tool_choice, original);
-        }
     }
 
     #[test]

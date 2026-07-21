@@ -22,7 +22,9 @@ use dynamo_llm::entrypoint::EngineConfig as RsEngineConfig;
 use dynamo_llm::entrypoint::RouterConfig as RsRouterConfig;
 use dynamo_llm::entrypoint::input::Input;
 use dynamo_llm::entrypoint::{ChatEngineFactoryCallback, PrefillRoutedEngine};
-use dynamo_llm::frontend_config::{FrontendApiConfig, KimiApiComplianceConfig, MetricsConfig};
+use dynamo_llm::frontend_config::{
+    AutoToolChoiceOverrideMode, FrontendApiConfig, KimiApiComplianceConfig, MetricsConfig,
+};
 use dynamo_llm::local_model::DEFAULT_HTTP_PORT;
 use dynamo_llm::local_model::runtime_config::TokenizerBackend;
 use dynamo_llm::local_model::{LocalModel, LocalModelBuilder};
@@ -506,7 +508,7 @@ fn build_frontend_api_config(
     kimi_default_reasoning_effort: Option<String>,
     kimi_allowed_reasoning_efforts: Option<Vec<String>>,
     kimi_allowed_top_p: Option<Vec<f32>>,
-    override_auto_tool_choice_to_required: Option<bool>,
+    override_auto_tool_choice_to_required: Option<String>,
 ) -> PyResult<Option<FrontendApiConfig>> {
     let kimi_api_compliance = KimiApiComplianceConfig::from_optional_flags(
         kimi_api_compliance,
@@ -517,6 +519,10 @@ fn build_frontend_api_config(
         kimi_allowed_top_p,
     )
     .map_err(PyValueError::new_err)?;
+    let override_auto_tool_choice_to_required = override_auto_tool_choice_to_required
+        .map(|mode| mode.parse::<AutoToolChoiceOverrideMode>())
+        .transpose()
+        .map_err(PyValueError::new_err)?;
 
     Ok(FrontendApiConfig::from_optional_flags(
         enable_anthropic_api,
@@ -617,7 +623,7 @@ impl EntrypointArgs {
         kimi_default_reasoning_effort: Option<String>,
         kimi_allowed_reasoning_efforts: Option<Vec<String>>,
         kimi_allowed_top_p: Option<Vec<f32>>,
-        override_auto_tool_choice_to_required: Option<bool>,
+        override_auto_tool_choice_to_required: Option<String>,
     ) -> PyResult<Self> {
         let endpoint_id_obj: Option<EndpointId> = endpoint_id.as_deref().map(EndpointId::from);
         if (tls_cert_path.is_some() && tls_key_path.is_none())
@@ -1040,7 +1046,7 @@ mod tests {
             Some("max".into()),
             Some(vec!["max".into()]),
             Some(vec![0.95]),
-            Some(true),
+            Some("strict".into()),
         )
         .expect("valid binding config")
         .expect("explicit values should produce frontend config");
@@ -1052,6 +1058,9 @@ mod tests {
         assert_eq!(kimi.default_reasoning_effort(), "max");
         assert_eq!(kimi.allowed_reasoning_efforts(), &["max"]);
         assert_eq!(kimi.allowed_top_p(), &[0.95]);
-        assert!(config.override_auto_tool_choice_to_required());
+        assert_eq!(
+            config.override_auto_tool_choice_to_required(),
+            Some(AutoToolChoiceOverrideMode::Strict)
+        );
     }
 }
