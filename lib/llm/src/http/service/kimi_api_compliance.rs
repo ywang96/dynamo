@@ -10,7 +10,7 @@ const FLOAT_TOLERANCE: f32 = 1e-6;
 const THINKING_TEMPERATURE: f32 = 1.0;
 const NON_THINKING_TEMPERATURE: f32 = 0.6;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 #[error("Kimi request field {field} {requirement}")]
 pub(crate) struct KimiComplianceError {
     field: &'static str,
@@ -83,7 +83,7 @@ pub(crate) fn apply(
             }
         }
         if request.inner.reasoning_effort.is_none() && nested_effort.is_none() {
-            request.inner.reasoning_effort = Some(configured_reasoning_effort(config));
+            request.inner.reasoning_effort = Some(configured_reasoning_effort(config)?);
         }
     } else if request.inner.reasoning_effort.is_some() {
         return Err(KimiComplianceError::new(
@@ -120,18 +120,20 @@ pub(crate) fn apply(
         return Err(KimiComplianceError::new("n", "must be 1"));
     }
 
+    let default_top_p = config
+        .allowed_top_p()
+        .iter()
+        .copied()
+        .find(|top_p| nearly_equal(*top_p, 1.0))
+        .or_else(|| config.allowed_top_p().first().copied())
+        .ok_or_else(|| {
+            KimiComplianceError::new("top_p", "requires a non-empty configured allowlist")
+        })?;
     request
         .inner
         .temperature
         .get_or_insert(expected_temperature);
-    request.inner.top_p.get_or_insert_with(|| {
-        config
-            .allowed_top_p()
-            .iter()
-            .copied()
-            .find(|top_p| nearly_equal(*top_p, 1.0))
-            .unwrap_or(config.allowed_top_p()[0])
-    });
+    request.inner.top_p.get_or_insert(default_top_p);
     request.inner.presence_penalty.get_or_insert(0.0);
     request.inner.frequency_penalty.get_or_insert(0.0);
     request.inner.n.get_or_insert(1);
@@ -178,13 +180,21 @@ fn validate_effort(
     Ok(())
 }
 
-fn configured_reasoning_effort(config: &KimiApiComplianceConfig) -> ReasoningEffort {
-    match config.default_reasoning_effort() {
+fn configured_reasoning_effort(
+    config: &KimiApiComplianceConfig,
+) -> Result<ReasoningEffort, KimiComplianceError> {
+    let effort = match config.default_reasoning_effort() {
         "low" => ReasoningEffort::Low,
         "high" => ReasoningEffort::High,
         "max" => ReasoningEffort::Max,
-        _ => unreachable!("Kimi config validation restricts reasoning effort values"),
-    }
+        _ => {
+            return Err(allowed_values_error(
+                "reasoning_effort",
+                config.allowed_reasoning_efforts(),
+            ));
+        }
+    };
+    Ok(effort)
 }
 
 fn reasoning_effort_name(effort: &ReasoningEffort) -> &'static str {
@@ -322,7 +332,7 @@ mod tests {
     #[test]
     fn explicit_allowed_zero_top_p_is_preserved() {
         let mut request = request(json!({"top_p": 0.0}));
-        let config = config(None, None, None, None, Some(vec![0.0, 0.95]));
+        let config = config(None, None, None, None, Some(vec![0.0, 1.0]));
 
         apply(&mut request, &config).unwrap();
 
