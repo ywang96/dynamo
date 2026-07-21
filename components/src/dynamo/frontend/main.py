@@ -256,6 +256,7 @@ async def async_main():
         "strip_anthropic_preamble": config.strip_anthropic_preamble,
         "enable_streaming_tool_dispatch": config.enable_streaming_tool_dispatch,
         "enable_streaming_reasoning_dispatch": config.enable_streaming_reasoning_dispatch,
+        "override_auto_tool_choice_to_required": config.override_auto_tool_choice_to_required,
         "tokenizer_backend": config.tokenizer_backend,
         "kimi_schema_validation": config.kimi_schema_validation,
         "kimi_schema_validation_level": config.kimi_schema_validation_level,

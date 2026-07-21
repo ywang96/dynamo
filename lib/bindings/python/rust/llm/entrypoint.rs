@@ -506,6 +506,7 @@ fn build_frontend_api_config(
     kimi_default_reasoning_effort: Option<String>,
     kimi_allowed_reasoning_efforts: Option<Vec<String>>,
     kimi_allowed_top_p: Option<Vec<f32>>,
+    override_auto_tool_choice_to_required: Option<bool>,
 ) -> PyResult<Option<FrontendApiConfig>> {
     let kimi_api_compliance = KimiApiComplianceConfig::from_optional_flags(
         kimi_api_compliance,
@@ -523,6 +524,7 @@ fn build_frontend_api_config(
         enable_streaming_tool_dispatch,
         enable_streaming_reasoning_dispatch,
         kimi_api_compliance,
+        override_auto_tool_choice_to_required,
     ))
 }
 
@@ -575,7 +577,7 @@ pub(crate) struct EntrypointArgs {
 impl EntrypointArgs {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (engine_type, model_path=None, model_name=None, endpoint_id=None, template_file=None, router_config=None, kv_cache_block_size=None, http_host=None, http_port=None, http_metrics_port=None, tls_cert_path=None, tls_key_path=None, extra_engine_args=None, mocker_engine_args=None, runtime_config=None, namespace=None, namespace_prefix=None, is_prefill=false, is_decode=false, migration_limit=0, migration_max_seq_len=None, chat_engine_factory=None, aic_perf_config=None, *, metrics_prefix=None, enable_anthropic_api=None, strip_anthropic_preamble=None, enable_streaming_tool_dispatch=None, enable_streaming_reasoning_dispatch=None, tokenizer_backend=None, kimi_schema_validation=None, kimi_schema_validation_level=None, kimi_api_compliance=None, kimi_default_max_completion_tokens=None, kimi_allowed_thinking_types=None, kimi_default_reasoning_effort=None, kimi_allowed_reasoning_efforts=None, kimi_allowed_top_p=None))]
+    #[pyo3(signature = (engine_type, model_path=None, model_name=None, endpoint_id=None, template_file=None, router_config=None, kv_cache_block_size=None, http_host=None, http_port=None, http_metrics_port=None, tls_cert_path=None, tls_key_path=None, extra_engine_args=None, mocker_engine_args=None, runtime_config=None, namespace=None, namespace_prefix=None, is_prefill=false, is_decode=false, migration_limit=0, migration_max_seq_len=None, chat_engine_factory=None, aic_perf_config=None, *, metrics_prefix=None, enable_anthropic_api=None, strip_anthropic_preamble=None, enable_streaming_tool_dispatch=None, enable_streaming_reasoning_dispatch=None, tokenizer_backend=None, kimi_schema_validation=None, kimi_schema_validation_level=None, kimi_api_compliance=None, kimi_default_max_completion_tokens=None, kimi_allowed_thinking_types=None, kimi_default_reasoning_effort=None, kimi_allowed_reasoning_efforts=None, kimi_allowed_top_p=None, override_auto_tool_choice_to_required=None))]
     pub fn new(
         py: Python<'_>,
         engine_type: EngineType,
@@ -615,6 +617,7 @@ impl EntrypointArgs {
         kimi_default_reasoning_effort: Option<String>,
         kimi_allowed_reasoning_efforts: Option<Vec<String>>,
         kimi_allowed_top_p: Option<Vec<f32>>,
+        override_auto_tool_choice_to_required: Option<bool>,
     ) -> PyResult<Self> {
         let endpoint_id_obj: Option<EndpointId> = endpoint_id.as_deref().map(EndpointId::from);
         if (tls_cert_path.is_some() && tls_key_path.is_none())
@@ -682,6 +685,7 @@ impl EntrypointArgs {
                 kimi_default_reasoning_effort,
                 kimi_allowed_reasoning_efforts,
                 kimi_allowed_top_p,
+                override_auto_tool_choice_to_required,
             )?,
             tls_cert_path,
             tls_key_path,
@@ -1024,7 +1028,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn binding_preserves_kimi_values() {
+    fn binding_preserves_frontend_values() {
         let config = build_frontend_api_config(
             None,
             None,
@@ -1036,6 +1040,7 @@ mod tests {
             Some("max".into()),
             Some(vec!["max".into()]),
             Some(vec![0.95]),
+            Some(true),
         )
         .expect("valid binding config")
         .expect("explicit values should produce frontend config");
@@ -1047,5 +1052,6 @@ mod tests {
         assert_eq!(kimi.default_reasoning_effort(), "max");
         assert_eq!(kimi.allowed_reasoning_efforts(), &["max"]);
         assert_eq!(kimi.allowed_top_p(), &[0.95]);
+        assert!(config.override_auto_tool_choice_to_required());
     }
 }

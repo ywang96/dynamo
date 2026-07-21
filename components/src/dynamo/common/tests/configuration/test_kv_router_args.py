@@ -707,6 +707,19 @@ def test_frontend_kimi_compliance_flags_parse_and_validate() -> None:
     assert config.kimi_allowed_top_p == (0.95, 1.0)
 
 
+def test_frontend_auto_tool_choice_override_flag() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    defaults = FrontendConfig.from_cli_args(parser.parse_args([]))
+    enabled = FrontendConfig.from_cli_args(
+        parser.parse_args(["--override-auto-tool-choice-to-required"])
+    )
+
+    assert defaults.override_auto_tool_choice_to_required is False
+    assert enabled.override_auto_tool_choice_to_required is True
+
+
 def test_frontend_kimi_compliance_rejects_medium_reasoning_effort() -> None:
     parser = argparse.ArgumentParser()
     FrontendArgGroup().add_arguments(parser)

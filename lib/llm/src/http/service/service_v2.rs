@@ -488,6 +488,12 @@ impl State {
         self.frontend_api_config.kimi_api_compliance()
     }
 
+    /// Returns whether explicit `tool_choice="auto"` requests become `"required"`.
+    pub fn override_auto_tool_choice_to_required(&self) -> bool {
+        self.frontend_api_config
+            .override_auto_tool_choice_to_required()
+    }
+
     /// Returns true if streaming tool call dispatch is enabled.
     ///
     /// When enabled, the chat completions streaming path emits `event: tool_call_dispatch`

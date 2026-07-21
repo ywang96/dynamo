@@ -295,6 +295,7 @@ pub struct FrontendApiConfig {
     anthropic: AnthropicApiConfig,
     streaming_dispatch: StreamingDispatchConfig,
     kimi_api_compliance: KimiApiComplianceConfig,
+    override_auto_tool_choice_to_required: bool,
 }
 
 impl FrontendApiConfig {
@@ -302,11 +303,13 @@ impl FrontendApiConfig {
         anthropic: AnthropicApiConfig,
         streaming_dispatch: StreamingDispatchConfig,
         kimi_api_compliance: KimiApiComplianceConfig,
+        override_auto_tool_choice_to_required: bool,
     ) -> Self {
         Self {
             anthropic,
             streaming_dispatch,
             kimi_api_compliance,
+            override_auto_tool_choice_to_required,
         }
     }
 
@@ -316,6 +319,7 @@ impl FrontendApiConfig {
         enable_streaming_tool_dispatch: bool,
         enable_streaming_reasoning_dispatch: bool,
         kimi_api_compliance: KimiApiComplianceConfig,
+        override_auto_tool_choice_to_required: bool,
     ) -> Self {
         Self {
             anthropic: AnthropicApiConfig::new(enable_anthropic_api, strip_anthropic_preamble),
@@ -324,6 +328,7 @@ impl FrontendApiConfig {
                 enable_streaming_reasoning_dispatch,
             ),
             kimi_api_compliance,
+            override_auto_tool_choice_to_required,
         }
     }
     pub fn from_optional_flags(
@@ -332,12 +337,14 @@ impl FrontendApiConfig {
         enable_streaming_tool_dispatch: Option<bool>,
         enable_streaming_reasoning_dispatch: Option<bool>,
         kimi_api_compliance: Option<KimiApiComplianceConfig>,
+        override_auto_tool_choice_to_required: Option<bool>,
     ) -> Option<Self> {
         if enable_anthropic_api.is_none()
             && strip_anthropic_preamble.is_none()
             && enable_streaming_tool_dispatch.is_none()
             && enable_streaming_reasoning_dispatch.is_none()
             && kimi_api_compliance.is_none()
+            && override_auto_tool_choice_to_required.is_none()
         {
             return None;
         }
@@ -350,6 +357,8 @@ impl FrontendApiConfig {
             enable_streaming_reasoning_dispatch
                 .unwrap_or_else(|| defaults.streaming_dispatch().reasoning_dispatch()),
             kimi_api_compliance.unwrap_or_else(|| defaults.kimi_api_compliance().clone()),
+            override_auto_tool_choice_to_required
+                .unwrap_or_else(|| defaults.override_auto_tool_choice_to_required()),
         ))
     }
     pub fn anthropic(&self) -> &AnthropicApiConfig {
@@ -371,6 +380,10 @@ impl FrontendApiConfig {
     pub fn kimi_api_compliance(&self) -> &KimiApiComplianceConfig {
         &self.kimi_api_compliance
     }
+
+    pub fn override_auto_tool_choice_to_required(&self) -> bool {
+        self.override_auto_tool_choice_to_required
+    }
 }
 
 #[cfg(test)]
@@ -379,7 +392,7 @@ mod tests {
 
     #[test]
     fn optional_flags_return_none_when_all_values_are_unspecified() {
-        let config = FrontendApiConfig::from_optional_flags(None, None, None, None, None);
+        let config = FrontendApiConfig::from_optional_flags(None, None, None, None, None, None);
 
         assert_eq!(config, None);
     }
@@ -391,12 +404,14 @@ mod tests {
             Some(false),
             Some(true),
             None,
+            Some(true),
         )
         .expect("explicit flags should produce a config");
         assert!(!config.anthropic().enabled());
         assert!(config.anthropic().strip_preamble());
         assert!(!config.streaming_dispatch().tool_dispatch());
         assert!(config.streaming_dispatch().reasoning_dispatch());
+        assert!(config.override_auto_tool_choice_to_required());
     }
 
     #[test]
@@ -414,6 +429,7 @@ mod tests {
                     None,
                     None,
                     Some(false),
+                    None,
                     None,
                 )
                 .expect("partial flags should produce a config");

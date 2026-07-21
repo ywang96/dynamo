@@ -74,6 +74,7 @@ use crate::types::Annotated;
 use dynamo_protocols::types::ChatCompletionMessageContent;
 use dynamo_protocols::types::ChatCompletionMessageToolCallChunk;
 use dynamo_protocols::types::ChatCompletionStreamResponseDelta;
+use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 use dynamo_protocols::types::Choice;
 use dynamo_runtime::logging::get_distributed_tracing_context;
 use tracing::Instrument;
@@ -1444,6 +1445,20 @@ fn enforce_kimi_api_compliance(
     })
 }
 
+fn override_auto_tool_choice_to_required(
+    enabled: bool,
+    request: &mut NvCreateChatCompletionRequest,
+) {
+    if enabled
+        && matches!(
+            request.inner.tool_choice.as_ref(),
+            Some(ChatCompletionToolChoiceOption::Auto)
+        )
+    {
+        request.inner.tool_choice = Some(ChatCompletionToolChoiceOption::Required);
+    }
+}
+
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
@@ -1456,6 +1471,10 @@ async fn handler_chat_completions(
     let mut request: NvCreateChatCompletionRequest =
         parse_json_request("chat completions", body_ref)?;
     enforce_kimi_api_compliance(state.kimi_api_compliance_config(), &mut request)?;
+    override_auto_tool_choice_to_required(
+        state.override_auto_tool_choice_to_required(),
+        &mut request,
+    );
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -4063,9 +4082,44 @@ mod tests {
     use dynamo_protocols::types::responses::{CreateResponse, Input, PromptConfig};
     use dynamo_protocols::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
-        CreateCompletionRequest, Prompt,
+        ChatCompletionRequestUserMessageContent, ChatCompletionToolChoiceOption,
+        CreateChatCompletionRequest, CreateCompletionRequest, Prompt,
     };
+
+    #[test]
+    fn auto_tool_choice_override_only_changes_explicit_auto() {
+        fn request(tool_choice: Option<&str>) -> NvCreateChatCompletionRequest {
+            let mut body = serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            if let Some(tool_choice) = tool_choice {
+                body["tool_choice"] = serde_json::json!(tool_choice);
+            }
+            serde_json::from_value(body).expect("valid chat request")
+        }
+
+        let mut auto = request(Some("auto"));
+        override_auto_tool_choice_to_required(true, &mut auto);
+        assert_eq!(
+            auto.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+        );
+
+        let mut disabled = request(Some("auto"));
+        override_auto_tool_choice_to_required(false, &mut disabled);
+        assert_eq!(
+            disabled.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Auto)
+        );
+
+        for unchanged in [None, Some("none"), Some("required")] {
+            let mut request = request(unchanged);
+            let original = request.inner.tool_choice.clone();
+            override_auto_tool_choice_to_required(true, &mut request);
+            assert_eq!(request.inner.tool_choice, original);
+        }
+    }
 
     #[test]
     fn kimi_rejection_maps_to_openai_400() {
