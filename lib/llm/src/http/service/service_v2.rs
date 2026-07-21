@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
-use crate::frontend_config::{FrontendApiConfig, MetricsConfig};
+use crate::frontend_config::{FrontendApiConfig, KimiApiComplianceConfig, MetricsConfig};
 
 /// Middleware that echoes `x-request-id` from request to response headers.
 async fn echo_request_id_header(
@@ -481,6 +481,11 @@ impl State {
     /// Returns true if the Anthropic Messages API is enabled by service config.
     pub fn anthropic_api_enabled(&self) -> bool {
         self.frontend_api_config.anthropic().enabled()
+    }
+
+    /// Returns the configured Kimi Chat Completions request policy.
+    pub fn kimi_api_compliance_config(&self) -> &KimiApiComplianceConfig {
+        self.frontend_api_config.kimi_api_compliance()
     }
 
     /// Returns true if streaming tool call dispatch is enabled.

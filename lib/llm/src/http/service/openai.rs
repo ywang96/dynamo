@@ -1432,6 +1432,18 @@ fn decode_base64_embedding_to_floats(s: &str) -> Result<Vec<f32>, anyhow::Error>
     Ok(floats)
 }
 
+fn enforce_kimi_api_compliance(
+    config: &crate::frontend_config::KimiApiComplianceConfig,
+    request: &mut NvCreateChatCompletionRequest,
+) -> Result<(), ErrorResponse> {
+    super::kimi_api_compliance::apply(request, config).map_err(|error| {
+        ErrorMessage::from_http_error(HttpError {
+            code: StatusCode::BAD_REQUEST.as_u16(),
+            message: format!("{VALIDATION_PREFIX}{error}"),
+        })
+    })
+}
+
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
@@ -1443,6 +1455,7 @@ async fn handler_chat_completions(
     let body_ref: &[u8] = normalized_body.as_deref().unwrap_or_else(|| body.as_ref());
     let mut request: NvCreateChatCompletionRequest =
         parse_json_request("chat completions", body_ref)?;
+    enforce_kimi_api_compliance(state.kimi_api_compliance_config(), &mut request)?;
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -4053,6 +4066,36 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
         CreateCompletionRequest, Prompt,
     };
+
+    #[test]
+    fn kimi_rejection_maps_to_openai_400() {
+        let config = crate::frontend_config::KimiApiComplianceConfig::from_optional_flags(
+            Some(true),
+            Some(131_072),
+            Some(vec!["enabled".to_string()]),
+            Some("max".to_string()),
+            Some(vec!["max".to_string()]),
+            Some(vec![0.95]),
+        )
+        .expect("valid Kimi config")
+        .expect("enabled flag creates Kimi config");
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "moonshotai/Kimi-K3-Instruct",
+                "messages": [{"role": "user", "content": "hello"}],
+                "thinking": {"type": "disabled"},
+                "top_p": 0.95
+            }))
+            .expect("valid chat request");
+
+        let (status, body) = enforce_kimi_api_compliance(&config, &mut request).unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.error_type, "invalid_request_error");
+        assert_eq!(body.0.code, 400);
+        assert!(body.0.message.starts_with(VALIDATION_PREFIX));
+        assert!(body.0.message.contains("thinking.type"));
+    }
 
     #[test]
     fn include_internal_content_true_is_rejected() {
