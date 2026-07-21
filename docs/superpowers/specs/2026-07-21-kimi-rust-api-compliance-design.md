@@ -31,6 +31,8 @@ OpenAI ingress so both processors expose the same Kimi API contract.
 - Do not add a second Kimi-specific set of CLI flags or model-name detection.
 - Do not change behavior when `--kimi-api-compliance` is disabled.
 - Do not make `max_completion_tokens` a hard cap. The configured value remains an omission default.
+- Do not extend `/v1/responses`. Pull request 85 applies to Chat Completions, and the current
+  Responses protocol cannot represent the Kimi `max` effort without a separate protocol change.
 
 ## Existing Contract
 
@@ -82,9 +84,8 @@ name to decide whether compliance applies.
 
 ### Shared Request Policy
 
-Add a small Rust Kimi compliance module under the OpenAI HTTP service. It exposes separate adapters
-for Chat Completions and Responses requests while sharing validation and default-selection helpers.
-Each adapter mutates the parsed request only when the typed config is enabled.
+Add a small Rust Kimi compliance module under the OpenAI HTTP service. It validates and defaults
+Chat Completions requests only when the typed config is enabled.
 
 The handlers apply the policy immediately after JSON deserialization and before request-template
 sampling defaults. This order makes the Kimi defaults authoritative and ensures invalid values are
@@ -95,11 +96,6 @@ For Chat Completions, the policy updates `NvCreateChatCompletionRequest`. The ex
 K3 template arguments. The policy validates every explicit effort alias and injects the configured
 default only when neither alias is present. The existing and required default is `max`. Existing
 Rust normalization continues to own alias precedence and template argument construction.
-
-For Responses, the policy updates supported `NvCreateResponse` fields before response parameters
-are captured and before conversion to the internal chat request. The converted request receives the
-same effective thinking and effort defaults before native K3 normalization. This keeps response
-echoes and worker sampling parameters consistent.
 
 ### Python Processor Compatibility
 
@@ -113,7 +109,7 @@ change.
 
 ## Request Flow
 
-1. Parse the OpenAI request.
+1. Parse the OpenAI Chat Completions request.
 2. Read `KimiApiComplianceConfig` from shared frontend state.
 3. If disabled, continue without mutation.
 4. If enabled, validate explicit values and apply omission defaults.
@@ -140,9 +136,9 @@ Add focused coverage at three boundaries:
 - Rust policy tests cover enabled and disabled thinking, effort default `max`, narrowed allowlists,
   omission defaults, explicit values, explicit allowed `top_p=0.0`, token-limit aliases, and HTTP
   400 errors.
-- HTTP tests exercise Chat Completions and Responses through the default Rust processor. The live
-  compliance matrix must reject disabled thinking and disallowed `top_p` values when configured to
-  allow only enabled thinking and `top_p=0.95`.
+- HTTP tests exercise Chat Completions through the default Rust processor. The live compliance
+  matrix must reject disabled thinking and disallowed `top_p` values when configured to allow only
+  enabled thinking and `top_p=0.95`.
 
 Retain the pull request 85 Python tests and add the explicit-zero regression. Existing K3 tool-call,
 reasoning, and structural-tag tests must remain unchanged and pass.
