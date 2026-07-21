@@ -292,17 +292,19 @@ def _apply_kimi_compliance(
     if n is not None and n != 1:
         raise PreprocessError("Kimi request field n must be 1")
 
+    top_p = getattr(request_for_sampling, "top_p", None)
+    presence_penalty = getattr(request_for_sampling, "presence_penalty", None)
+    frequency_penalty = getattr(request_for_sampling, "frequency_penalty", None)
     updates: dict[str, Any] = {
         "temperature": expected_temperature,
-        "top_p": getattr(request_for_sampling, "top_p", None)
-        or _default_kimi_top_p(config.allowed_top_p),
-        "presence_penalty": (
-            getattr(request_for_sampling, "presence_penalty", None) or 0.0
+        "top_p": (
+            top_p if top_p is not None else _default_kimi_top_p(config.allowed_top_p)
         ),
+        "presence_penalty": presence_penalty if presence_penalty is not None else 0.0,
         "frequency_penalty": (
-            getattr(request_for_sampling, "frequency_penalty", None) or 0.0
+            frequency_penalty if frequency_penalty is not None else 0.0
         ),
-        "n": n or 1,
+        "n": n if n is not None else 1,
         "reasoning_effort": reasoning_effort,
     }
     if (

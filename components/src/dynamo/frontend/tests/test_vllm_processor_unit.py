@@ -383,6 +383,17 @@ class TestKimiCompliance:
 
         assert request_for_sampling.top_p == top_p
 
+    def test_kimi_preserves_explicit_allowed_zero_top_p(self):
+        request_for_sampling, _, _ = self._prepare(
+            {"top_p": 0.0},
+            config=KimiComplianceConfig(
+                enabled=True,
+                allowed_top_p=(0.0, 1.0),
+            ),
+        )
+
+        assert request_for_sampling.top_p == 0.0
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [
