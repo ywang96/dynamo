@@ -3608,14 +3608,14 @@ impl
         // Capture media counts before `common_request` is moved into the context.
         let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
 
-        // K3 pre-opens the think channel for the model, but its API contract
-        // excludes that terminal structural prefill from prompt-token usage.
+        // K3 pre-opens the think or response channel for the model, but its API
+        // contract excludes that terminal structural prefill from prompt-token usage.
         // Detect the exact encoded suffix so thinking-disabled requests and
         // alternate tokenizer vocabularies remain correct.
         let prompt_tokens_adjustment = self
             .kimi_k3_renderer
             .as_ref()
-            .map(|k3| k3.trailing_think_prefill_token_count(&common_request.token_ids))
+            .map(|k3| k3.trailing_generation_prefill_token_count(&common_request.token_ids))
             .transpose()?
             .unwrap_or_default()
             .try_into()

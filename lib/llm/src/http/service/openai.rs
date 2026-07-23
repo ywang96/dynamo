@@ -1446,6 +1446,18 @@ fn enforce_kimi_api_compliance(
     })
 }
 
+fn parse_chat_completion_request(
+    body: &[u8],
+    config: &crate::frontend_config::KimiApiComplianceConfig,
+) -> Result<NvCreateChatCompletionRequest, ErrorResponse> {
+    if !config.enabled() {
+        return parse_json_request("chat completions", body);
+    }
+    let mut request_json: serde_json::Value = parse_json_request("chat completions", body)?;
+    super::kimi_api_compliance::normalize_request_json(&mut request_json, config);
+    serde_json::from_value(request_json).map_err(json_deserialize_error)
+}
+
 fn apply_auto_tool_choice_override(
     mode: Option<AutoToolChoiceOverrideMode>,
     request: &mut NvCreateChatCompletionRequest,
@@ -1479,8 +1491,7 @@ async fn handler_chat_completions(
     reject_include_internal_content(&body)?;
     let normalized_body = normalize_bare_image_urls(&body);
     let body_ref: &[u8] = normalized_body.as_deref().unwrap_or_else(|| body.as_ref());
-    let mut request: NvCreateChatCompletionRequest =
-        parse_json_request("chat completions", body_ref)?;
+    let mut request = parse_chat_completion_request(body_ref, state.kimi_api_compliance_config())?;
     enforce_kimi_api_compliance(state.kimi_api_compliance_config(), &mut request)?;
     apply_auto_tool_choice_override(state.override_auto_tool_choice_to_required(), &mut request);
 
@@ -2364,7 +2375,10 @@ async fn chat_completions(
     }
 
     // Handle Rest of Validation Errors
-    if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
+    if let Err(err_response) = validate_chat_completion_fields(
+        &request,
+        state.kimi_api_compliance_config().enabled(),
+    ) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
@@ -2692,7 +2706,19 @@ pub fn validate_chat_completion_stream_options(
 pub fn validate_chat_completion_fields_generic(
     request: &NvCreateChatCompletionRequest,
 ) -> Result<(), ErrorResponse> {
-    request.validate().map_err(|e| {
+    validate_chat_completion_fields(request, false)
+}
+
+fn validate_chat_completion_fields(
+    request: &NvCreateChatCompletionRequest,
+    kimi_api_compliance: bool,
+) -> Result<(), ErrorResponse> {
+    let result = if kimi_api_compliance {
+        request.validate_with_kimi_api_compliance()
+    } else {
+        request.validate()
+    };
+    result.map_err(|e| {
         ErrorMessage::from_http_error(HttpError {
             code: 400,
             message: VALIDATION_PREFIX.to_string() + &e.to_string(),
@@ -4190,6 +4216,152 @@ mod tests {
         assert_eq!(body.0.code, 400);
         assert!(body.0.message.starts_with(VALIDATION_PREFIX));
         assert!(body.0.message.contains("thinking.type"));
+    }
+
+    #[test]
+    fn kimi_parser_defaults_dynamic_tool_system_content() {
+        let config = crate::frontend_config::KimiApiComplianceConfig::from_optional_flags(
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("valid Kimi config")
+        .expect("enabled flag creates Kimi config");
+        let body = br#"{
+            "model": "moonshotai/Kimi-K3",
+            "messages": [{
+                "role": "system",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }]
+            }]
+        }"#;
+
+        let request = parse_chat_completion_request(body, &config)
+            .expect("Kimi dynamic tool declaration may omit content");
+        let ChatCompletionRequestMessage::System(system) = &request.inner.messages[0] else {
+            panic!("expected system message");
+        };
+        assert!(matches!(
+            &system.content,
+            dynamo_protocols::types::ChatCompletionRequestSystemMessageContent::Text(content)
+                if content.is_empty()
+        ));
+
+        let _ = parse_chat_completion_request(
+            body,
+            &crate::frontend_config::KimiApiComplianceConfig::default(),
+        )
+        .expect_err("generic protocol still requires system content");
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_vendor_prompt_tokens_match_all_43_cases_without_gpu() {
+        #[derive(serde::Deserialize)]
+        struct PromptTokenCase {
+            id: String,
+            request: serde_json::Value,
+            expected_prompt_tokens: usize,
+        }
+
+        let Some(snapshot_dir) = std::env::var_os("K3_SNAPSHOT_DIR") else {
+            eprintln!("skipped: K3_SNAPSHOT_DIR unset");
+            return;
+        };
+        let snapshot_dir = std::path::PathBuf::from(snapshot_dir);
+        let mdc = crate::model_card::ModelDeploymentCard::load_from_disk(&snapshot_dir, None)
+            .expect("load real K3 model deployment card");
+        let preprocessor =
+            crate::preprocessor::OpenAIPreprocessor::new(mdc.clone()).expect("build preprocessor");
+        let renderer =
+            crate::preprocessor::prompt::kimi_k3::encoder::KimiK3Renderer::from_model_dir(
+                &snapshot_dir,
+            )
+            .expect("build real K3 renderer");
+        let config = crate::frontend_config::KimiApiComplianceConfig::from_optional_flags(
+            Some(true),
+            Some(131_072),
+            Some(vec!["enabled".to_string(), "disabled".to_string()]),
+            Some("max".to_string()),
+            Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            Some(vec![0.95]),
+        )
+        .expect("valid Kimi config")
+        .expect("enabled flag creates Kimi config");
+
+        let cases = include_str!("../../../testdata/kimi_k3_prompt_token_cases.jsonl");
+        let mut case_count = 0;
+        let mut mismatches = Vec::new();
+        for line in cases.lines().filter(|line| !line.trim().is_empty()) {
+            case_count += 1;
+            let mut case: PromptTokenCase =
+                serde_json::from_str(line).expect("valid prompt-token case");
+            case.request
+                .as_object_mut()
+                .expect("case request is an object")
+                .insert("model".to_string(), serde_json::json!(mdc.slug()));
+            let body = serde_json::to_vec(&case.request).expect("serialize request");
+            let mut request = parse_chat_completion_request(&body, &config)
+                .unwrap_or_else(|error| panic!("{} failed request parsing: {error:?}", case.id));
+            enforce_kimi_api_compliance(&config, &mut request)
+                .unwrap_or_else(|error| panic!("{} failed Kimi compliance: {error:?}", case.id));
+            apply_auto_tool_choice_override(Some(AutoToolChoiceOverrideMode::All), &mut request);
+            normalize_chat_reasoning_template_args(&mut request).unwrap_or_else(|error| {
+                panic!("{} failed reasoning normalization: {error:?}", case.id)
+            });
+            validate_chat_completion_required_fields(&request).unwrap_or_else(|error| {
+                panic!("{} failed required-field validation: {error:?}", case.id)
+            });
+            validate_chat_completion_stream_options(&request)
+                .unwrap_or_else(|error| panic!("{} failed stream validation: {error:?}", case.id));
+            validate_chat_completion_fields(&request, true)
+                .unwrap_or_else(|error| panic!("{} failed generic validation: {error:?}", case.id));
+
+            let (preprocessed, _, _) = preprocessor
+                .preprocess_request(&request, None)
+                .await
+                .unwrap_or_else(|error| panic!("{} failed K3 preprocessing: {error:#}", case.id));
+            let adjustment = renderer
+                .trailing_generation_prefill_token_count(&preprocessed.token_ids)
+                .unwrap_or_else(|error| {
+                    panic!("{} failed prompt usage adjustment: {error:#}", case.id)
+                });
+            let actual_prompt_tokens = preprocessed
+                .token_ids
+                .len()
+                .checked_sub(adjustment)
+                .expect("usage adjustment does not exceed rendered tokens");
+            if actual_prompt_tokens != case.expected_prompt_tokens {
+                mismatches.push(format!(
+                    "{}: expected {}, got {} (rendered {}, adjustment {})",
+                    case.id,
+                    case.expected_prompt_tokens,
+                    actual_prompt_tokens,
+                    preprocessed.token_ids.len(),
+                    adjustment,
+                ));
+            }
+        }
+
+        assert_eq!(case_count, 43, "fixture must contain exactly 43 cases");
+        assert!(
+            mismatches.is_empty(),
+            "{} of 43 prompt-token cases mismatched:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+        eprintln!("Kimi K3 prompt-token acceptance: 43/43");
     }
 
     #[test]

@@ -200,7 +200,7 @@ async fn k3_preprocess_marks_prompt_injected_reasoning() {
 }
 
 #[test]
-fn k3_renderer_detects_only_the_terminal_think_prefill() {
+fn k3_renderer_detects_the_terminal_generation_prefill() {
     let dir = synthetic_k3_dir();
     let mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).expect("load K3 MDC");
     let renderer = KimiK3Renderer::from_model_dir(dir.path()).expect("build renderer");
@@ -209,7 +209,7 @@ fn k3_renderer_detects_only_the_terminal_think_prefill() {
     let ids = renderer.render_to_ids(&request).expect("render ids");
     assert_eq!(
         renderer
-            .trailing_think_prefill_token_count(&ids)
+            .trailing_generation_prefill_token_count(&ids)
             .expect("detect think prefill"),
         7,
         "the synthetic byte-level tokenizer encodes open + 'think' + sep as 7 tokens"
@@ -221,10 +221,10 @@ fn k3_renderer_detects_only_the_terminal_think_prefill() {
     let ids = renderer.render_to_ids(&request).expect("render ids");
     assert_eq!(
         renderer
-            .trailing_think_prefill_token_count(&ids)
-            .expect("detect absent think prefill"),
-        0,
-        "instruct mode ends in the response channel, not the think channel"
+            .trailing_generation_prefill_token_count(&ids)
+            .expect("detect response prefill"),
+        10,
+        "the synthetic byte-level tokenizer encodes open + 'response' + sep as 10 tokens"
     );
 }
 

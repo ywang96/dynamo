@@ -22,6 +22,21 @@ use super::{KIMI_K3_BPE_PATTERN, load_k3_special_tokens};
 use crate::tokenizers::TikTokenTokenizer;
 use crate::tokenizers::traits::Encoder as _;
 
+fn remove_empty_tool_descriptions(tools: &mut Value) {
+    let Some(tools) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in tools {
+        let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if matches!(function.get("description"), Some(Value::String(description)) if description.is_empty())
+        {
+            function.remove("description");
+        }
+    }
+}
+
 /// Native K3 renderer: builds XTML segments and encodes them to token IDs.
 pub struct KimiK3Renderer {
     /// Specials-aware encoder: recognizes the XTML markers as single tokens.
@@ -99,29 +114,33 @@ impl KimiK3Renderer {
     pub fn render_to_ids(&self, req: &dyn OAIChatLikeRequest) -> Result<Vec<u32>> {
         let messages: Value = serde_json::to_value(req.messages())
             .context("Kimi K3 renderer: messages are not JSON-serializable")?;
-        let tools: Option<Value> = req
+        let mut tools: Option<Value> = req
             .tools()
             .map(|t| serde_json::to_value(t).context("Kimi K3 renderer: tools not serializable"))
             .transpose()?
             .filter(|t| !t.is_null());
+        if let Some(tools) = tools.as_mut() {
+            remove_empty_tool_descriptions(tools);
+        }
 
         let args = render_args_from_request(req)?;
         let segments = renderer::build_chat_segments(&messages, tools.as_ref(), &args)?;
         self.encode_segments(&segments)
     }
 
-    /// Return the number of token IDs occupied by the terminal think-channel
-    /// prefill, or zero when the rendered prompt does not end with that prefill.
+    /// Return the number of token IDs occupied by the terminal generation
+    /// prefill, or zero when the rendered prompt does not end with one.
     ///
     /// The count is derived with this renderer's tokenizer rather than assumed
     /// to be three, which keeps synthetic and alternate K3 tokenizers correct.
-    pub fn trailing_think_prefill_token_count(&self, ids: &[u32]) -> Result<usize> {
-        let think_prefill = self.encode_segments(&renderer::think_prefill_segments())?;
-        Ok(if ids.ends_with(&think_prefill) {
-            think_prefill.len()
-        } else {
-            0
-        })
+    pub fn trailing_generation_prefill_token_count(&self, ids: &[u32]) -> Result<usize> {
+        for channel in ["think", "response"] {
+            let prefill = self.encode_segments(&renderer::generation_prefill_segments(channel))?;
+            if ids.ends_with(&prefill) {
+                return Ok(prefill.len());
+            }
+        }
+        Ok(0)
     }
 
     /// Look up a special-token id (e.g. `<|open|>`), for tests and MM wiring.
@@ -286,6 +305,19 @@ mod tests {
         let ids = r.encode_segments(&segs).unwrap();
         assert_eq!(ids[0], 300);
         assert!(ids.len() >= 3); // marker + 'h' + 'i' at byte level
+    }
+
+    #[test]
+    fn k3_removes_only_empty_tool_descriptions() {
+        let mut tools = serde_json::json!([
+            {"function": {"name": "missing", "description": "", "parameters": {}}},
+            {"function": {"name": "present", "description": "keep", "parameters": {}}}
+        ]);
+
+        remove_empty_tool_descriptions(&mut tools);
+
+        assert!(tools[0]["function"].get("description").is_none());
+        assert_eq!(tools[1]["function"]["description"], "keep");
     }
 
     #[test]

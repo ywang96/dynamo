@@ -41,6 +41,16 @@ fn k3_snapshot_loads_and_markers_are_atomic() {
         3,
         "the K3 snapshot encodes the injected think prefill as three tokens"
     );
+    let response_ids = tokenizer
+        .encode("<|open|>response<|sep|>")
+        .expect("encode response prefill")
+        .token_ids()
+        .to_vec();
+    assert_eq!(
+        response_ids.len(),
+        3,
+        "the K3 snapshot encodes the injected response prefill as three tokens"
+    );
     assert!(
         ids.contains(&OPEN_ID),
         "expected atomic <|open|> id {OPEN_ID} in {ids:?}"

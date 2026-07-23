@@ -777,16 +777,17 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
     }
 }
 
-/// Implements `ValidateRequest` for `NvCreateChatCompletionRequest`,
-/// allowing us to validate the data.
-impl ValidateRequest for NvCreateChatCompletionRequest {
+impl NvCreateChatCompletionRequest {
     // `max_tokens` is deprecated upstream but still honored as a fallback in
     // `get_max_tokens` (max_completion_tokens.or(max_tokens)), so it must be validated.
     #[allow(deprecated)]
-    fn validate(&self) -> Result<(), anyhow::Error> {
+    fn validate_with_options(
+        &self,
+        allow_unparseable_tool_arguments: bool,
+    ) -> Result<(), anyhow::Error> {
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
         validate::validate_chat_template_args(self.chat_template_args.as_ref())?;
-        validate::validate_messages(&self.inner.messages)?;
+        validate::validate_messages(&self.inner.messages, allow_unparseable_tool_arguments)?;
         validate::validate_model(&self.inner.model)?;
         // none for store
         validate::validate_reasoning_effort(&self.inner.reasoning_effort)?;
@@ -832,6 +833,18 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_n_with_temperature(self.inner.n, self.inner.temperature)?;
 
         Ok(())
+    }
+
+    pub(crate) fn validate_with_kimi_api_compliance(&self) -> Result<(), anyhow::Error> {
+        self.validate_with_options(true)
+    }
+}
+
+/// Implements `ValidateRequest` for `NvCreateChatCompletionRequest`,
+/// allowing us to validate the data.
+impl ValidateRequest for NvCreateChatCompletionRequest {
+    fn validate(&self) -> Result<(), anyhow::Error> {
+        self.validate_with_options(false)
     }
 }
 
@@ -1469,6 +1482,40 @@ mod tests {
                 "unexpected error for {arguments:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn kimi_compliance_accepts_unparseable_tool_call_arguments() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{invalid json}"
+                        }
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        }))
+        .expect("Failed to deserialize request");
+
+        request
+            .validate_with_kimi_api_compliance()
+            .expect("Kimi renderer accepts unparseable arguments as a raw JSON block");
     }
 
     #[test]

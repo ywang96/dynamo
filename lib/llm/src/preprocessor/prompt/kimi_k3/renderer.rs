@@ -312,11 +312,11 @@ fn open_tag(segs: &mut Vec<Segment>, tag: &str, attrs: &[(&str, String)]) {
     push_control(segs, SEP);
 }
 
-/// The exact terminal prefill added when a generation prompt starts in K3's
-/// thinking channel.
-pub(super) fn think_prefill_segments() -> Vec<Segment> {
+/// The exact terminal prefill added when a generation prompt starts in a K3
+/// assistant channel.
+pub(super) fn generation_prefill_segments(channel: &str) -> Vec<Segment> {
     let mut segs = Vec::new();
-    open_tag(&mut segs, "think", &[]);
+    open_tag(&mut segs, channel, &[]);
     segs
 }
 
@@ -707,23 +707,25 @@ fn render_tool_declare(segs: &mut Vec<Segment>, tools: &Value, dynamic: bool) {
     end_of_msg(segs);
 }
 
-/// `_render_assistant_segments`: think (when kept + non-blank) + response +
+/// `_render_assistant_segments`: think (when kept) + response +
 /// tools channels, inside the already-opened assistant message.
 fn render_assistant(segs: &mut Vec<Segment>, message: &Map<String, Value>, keep_think: bool) {
     let reasoning = message
         .get("reasoning_content")
         .filter(|v| !v.is_null())
         .or_else(|| message.get("reasoning").filter(|v| !v.is_null()));
-    if keep_think && let Some(reasoning) = reasoning {
-        let text = match reasoning {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        if !text.trim().is_empty() {
-            open_tag(segs, "think", &[]);
-            append_text(segs, &text);
-            close_tag(segs, "think");
+    if keep_think {
+        open_tag(segs, "think", &[]);
+        if let Some(reasoning) = reasoning {
+            let text = match reasoning {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if !text.trim().is_empty() {
+                append_text(segs, &text);
+            }
         }
+        close_tag(segs, "think");
     }
 
     open_tag(segs, "response", &[]);
@@ -926,7 +928,8 @@ pub fn build_chat_segments(
                     attrs.push(("name", name.to_string()));
                 }
                 open_tag(&mut segs, "message", &attrs);
-                let keep_think = args.preserve_thinking || (message_index as isize) > last_idx;
+                let keep_think = args.thinking
+                    && (args.preserve_thinking || (message_index as isize) > last_idx);
                 render_assistant(&mut segs, obj, keep_think);
                 close_tag(&mut segs, "message");
                 end_of_msg(&mut segs);
@@ -1471,6 +1474,25 @@ mod tests {
     }
 
     #[test]
+    fn history_preserve_thinking_renders_empty_blocks() {
+        let segs = build(
+            json!([
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"},
+                {"role": "assistant", "reasoning_content": "", "content": "a2"},
+                {"role": "user", "content": "q3"}
+            ]),
+            None,
+            json!({"preserve_thinking": true, "add_generation_prompt": false}),
+        )
+        .unwrap();
+        let text: String = segs.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(text.matches("<|open|>think<|sep|>").count(), 2);
+        assert_eq!(text.matches("<|close|>think<|sep|>").count(), 2);
+    }
+
+    #[test]
     fn all_assistants_have_tool_calls_keeps_think() {
         // last_idx = -1 when no PLAIN assistant exists => all keep think.
         let segs = build(
@@ -1487,6 +1509,25 @@ mod tests {
         .unwrap();
         let text: String = segs.iter().map(|x| x.text.as_str()).collect();
         assert!(text.contains("kept think"));
+    }
+
+    #[test]
+    fn thinking_off_drops_tool_call_history_think() {
+        let segs = build(
+            json!([
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "reasoning_content": "must be dropped", "content": "",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                  "function": {"name": "t", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "r"}
+            ]),
+            None,
+            json!({"thinking": false, "add_generation_prompt": false}),
+        )
+        .unwrap();
+        let text: String = segs.iter().map(|x| x.text.as_str()).collect();
+        assert!(!text.contains("must be dropped"));
+        assert!(!text.contains("<|open|>think<|sep|>"));
     }
 
     #[test]

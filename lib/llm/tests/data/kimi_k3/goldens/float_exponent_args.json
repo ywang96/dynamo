@@ -113,6 +113,30 @@
    "allow_special": true
   },
   {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|close|>",
+   "allow_special": true
+  },
+  {
+   "text": "think",
+   "allow_special": false
+  },
+  {
+   "text": "<|sep|>",
+   "allow_special": true
+  },
+  {
+   "text": "<|open|>",
+   "allow_special": true
+  },
+  {
    "text": "response",
    "allow_special": false
   },
@@ -517,5 +541,5 @@
    "allow_special": true
   }
  ],
- "text": "<|open|>message role=\"user\"<|sep|>x<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"t\" index=\"1\"<|sep|><|open|>argument key=\"tiny\" type=\"number\"<|sep|>1e-07<|close|>argument<|sep|><|open|>argument key=\"sci\" type=\"number\"<|sep|>1.5e-05<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"t\" index=\"1\"<|sep|>ok<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>y<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+ "text": "<|open|>message role=\"user\"<|sep|>x<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"t\" index=\"1\"<|sep|><|open|>argument key=\"tiny\" type=\"number\"<|sep|>1e-07<|close|>argument<|sep|><|open|>argument key=\"sci\" type=\"number\"<|sep|>1.5e-05<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"t\" index=\"1\"<|sep|>ok<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>y<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
 }

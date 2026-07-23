@@ -26,12 +26,49 @@ impl KimiComplianceError {
     }
 }
 
+pub(crate) fn normalize_request_json(
+    request: &mut serde_json::Value,
+    config: &KimiApiComplianceConfig,
+) {
+    if !config.enabled() {
+        return;
+    }
+    let Some(messages) = request
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for message in messages {
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+        let is_dynamic_tool_message = message.get("role").and_then(serde_json::Value::as_str)
+            == Some("system")
+            && message.get("tools").is_some_and(|tools| !tools.is_null());
+        if is_dynamic_tool_message && !message.contains_key("content") {
+            message.insert(
+                "content".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+        }
+    }
+}
+
 pub(crate) fn apply(
     request: &mut NvCreateChatCompletionRequest,
     config: &KimiApiComplianceConfig,
 ) -> Result<(), KimiComplianceError> {
     if !config.enabled() {
         return Ok(());
+    }
+
+    let reasoning_effort_none = matches!(
+        request.inner.reasoning_effort.as_ref(),
+        Some(ReasoningEffort::None)
+    );
+    if reasoning_effort_none && request.thinking.is_none() {
+        request.thinking = Some(serde_json::json!({"type": "disabled"}));
     }
 
     let thinking = match request.thinking.as_ref() {
@@ -85,6 +122,8 @@ pub(crate) fn apply(
         if request.inner.reasoning_effort.is_none() && nested_effort.is_none() {
             request.inner.reasoning_effort = Some(configured_reasoning_effort(config)?);
         }
+    } else if reasoning_effort_none {
+        request.inner.reasoning_effort = None;
     } else if request.inner.reasoning_effort.is_some() {
         return Err(KimiComplianceError::new(
             "reasoning_effort",
@@ -144,7 +183,6 @@ pub(crate) fn apply(
     if request.thinking.is_none() {
         request.thinking = Some(serde_json::json!({"type": "enabled"}));
     }
-
     Ok(())
 }
 
@@ -352,6 +390,30 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_none_selects_non_thinking() {
+        let mut request = request(json!({"reasoning_effort": "none"}));
+
+        apply(&mut request, &enabled_config()).unwrap();
+
+        assert_eq!(request.inner.temperature, Some(0.6));
+        assert_eq!(request.inner.reasoning_effort, None);
+        assert_eq!(request.thinking, Some(json!({"type": "disabled"})));
+    }
+
+    #[test]
+    fn explicit_disabled_accepts_redundant_none_effort() {
+        let mut request = request(json!({
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "none"
+        }));
+
+        apply(&mut request, &enabled_config()).unwrap();
+
+        assert_eq!(request.inner.reasoning_effort, None);
+        assert_eq!(request.inner.temperature, Some(0.6));
+    }
+
+    #[test]
     fn disabled_thinking_rejects_top_level_reasoning_effort() {
         let mut request = request(json!({
             "thinking": {"type": "disabled"},
@@ -441,5 +503,27 @@ mod tests {
         apply(&mut request, &KimiApiComplianceConfig::default()).unwrap();
 
         assert_eq!(serde_json::to_value(&request).unwrap(), original);
+    }
+
+    #[test]
+    fn dynamic_tool_messages_get_empty_content_only_when_enabled() {
+        let original = json!({
+            "messages": [
+                {"role": "system", "tools": []},
+                {"role": "system", "content": "keep", "tools": []},
+                {"role": "system"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+
+        let mut enabled = original.clone();
+        normalize_request_json(&mut enabled, &enabled_config());
+        assert_eq!(enabled["messages"][0]["content"], "");
+        assert_eq!(enabled["messages"][1]["content"], "keep");
+        assert!(enabled["messages"][2].get("content").is_none());
+
+        let mut disabled = original.clone();
+        normalize_request_json(&mut disabled, &KimiApiComplianceConfig::default());
+        assert_eq!(disabled, original);
     }
 }
