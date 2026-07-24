@@ -262,11 +262,11 @@ mod tests {
     }
 
     #[test]
-    fn k3_auto_without_strict_tool_leaves_xgrammar_inactive() {
+    fn k3_auto_without_strict_tool_attaches_structural_tag() {
         let mut request = preprocessed_request();
 
         assert!(
-            !apply_kimi_k3_structural_tag(
+            apply_kimi_k3_structural_tag(
                 StructuralTagMode::On,
                 &ToolChoice::Auto,
                 &[tool("lookup", None)],
@@ -274,7 +274,14 @@ mod tests {
             )
             .unwrap()
         );
-        assert!(request.sampling_options.guided_decoding.is_none());
+        assert!(
+            request
+                .sampling_options
+                .guided_decoding
+                .unwrap()
+                .structural_tag
+                .is_some()
+        );
     }
 
     #[test]

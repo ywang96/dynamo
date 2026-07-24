@@ -64,8 +64,8 @@ xgrammar-structural-tag = { version = "=0.2.0" }
 dynamo-parsers-v2 = { version = "0.1.19" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.3.0" }
 fastokens = { version = "0.2.1" }
-vllm-parser = { git = "https://github.com/Inferact/mke.git", rev = "500522f6a6fbfea11e9aaf67949d61734fb0bae0" }
-vllm-tokenizer = { git = "https://github.com/Inferact/mke.git", rev = "500522f6a6fbfea11e9aaf67949d61734fb0bae0" }
+vllm-parser = { git = "https://github.com/Inferact/mke.git", rev = "58b81f7ea66ff063b62a0a563027a3fbfcd78a98" }
+vllm-tokenizer = { git = "https://github.com/Inferact/mke.git", rev = "58b81f7ea66ff063b62a0a563027a3fbfcd78a98" }
 # FxHashMap for the tiktoken special-token maps (same 1.x line as
 # dynamo-tokenizers, so the map type unifies across the from_file boundary).
 rustc-hash = "1"

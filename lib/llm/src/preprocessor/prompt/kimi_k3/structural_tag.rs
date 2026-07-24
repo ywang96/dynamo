@@ -24,11 +24,6 @@ pub fn build_kimi_k3_structural_tag(
     if tools.is_empty() || matches!(tool_choice, ToolChoice::None) {
         return Ok(None);
     }
-    if matches!(tool_choice, ToolChoice::Auto)
-        && !tools.iter().any(|tool| tool.strict == Some(true))
-    {
-        return Ok(None);
-    }
 
     let tool_choice = match tool_choice {
         ToolChoice::Auto => StructuralTagToolChoice::auto(),
@@ -42,7 +37,9 @@ pub fn build_kimi_k3_structural_tag(
                 name: tool.name.clone(),
                 description: None,
                 parameters: tool.parameters.clone(),
-                strict: tool.strict,
+                // KVV omits `strict`; K3 still expects its parameter schema to
+                // constrain arguments. Only an explicit false opts out.
+                strict: Some(tool.strict.unwrap_or(true)),
             }))
         })
         .collect::<Vec<_>>();

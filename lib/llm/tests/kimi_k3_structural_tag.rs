@@ -50,16 +50,42 @@ fn required_builds_a_mandatory_k3_tools_channel() {
 }
 
 #[test]
-fn auto_only_builds_for_strict_tools_and_keeps_tools_optional() {
-    let loose = [tool("loose", json!({"type": "object"}), None)];
-    assert!(build(ToolChoice::Auto, &loose).is_none());
+fn auto_builds_for_all_strict_values_and_keeps_tools_optional() {
+    for strict in [None, Some(true), Some(false)] {
+        let tools = [tool("lookup", json!({"type": "object"}), strict)];
+        let tag = build(ToolChoice::Auto, &tools).expect("auto must build a tag");
 
-    let strict = [tool("strict", json!({"type": "object"}), Some(true))];
-    let tag = build(ToolChoice::Auto, &strict).expect("strict auto must build a tag");
+        assert_eq!(tools_part(&tag)["type"], "optional");
+        assert_eq!(tools_part(&tag)["content"]["type"], "tag");
+        assert_eq!(tools_part(&tag)["content"]["begin"], "<|open|>tools<|sep|>");
+    }
+}
 
-    assert_eq!(tools_part(&tag)["type"], "optional");
-    assert_eq!(tools_part(&tag)["content"]["type"], "tag");
-    assert_eq!(tools_part(&tag)["content"]["begin"], "<|open|>tools<|sep|>");
+#[test]
+fn absent_strict_uses_parameters_but_explicit_false_opts_out() {
+    let parameters = json!({
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"]
+    });
+
+    for strict in [None, Some(true)] {
+        let tools = [tool("lookup", parameters.clone(), strict)];
+        let tag = build(ToolChoice::Auto, &tools).expect("auto must build a tag");
+        assert!(
+            serde_json::to_string(&tag)
+                .unwrap()
+                .contains(r#""required":["query"]"#)
+        );
+    }
+
+    let tools = [tool("lookup", parameters, Some(false))];
+    let tag = build(ToolChoice::Auto, &tools).expect("auto must build a tag");
+    assert!(
+        !serde_json::to_string(&tag)
+            .unwrap()
+            .contains(r#""required":["query"]"#)
+    );
 }
 
 #[test]

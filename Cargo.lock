@@ -10740,7 +10740,7 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/mke.git?rev=500522f6a6fbfea11e9aaf67949d61734fb0bae0#500522f6a6fbfea11e9aaf67949d61734fb0bae0"
+source = "git+https://github.com/Inferact/mke.git?rev=58b81f7ea66ff063b62a0a563027a3fbfcd78a98#58b81f7ea66ff063b62a0a563027a3fbfcd78a98"
 dependencies = [
  "easy-ext",
  "serde",
@@ -10755,7 +10755,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/mke.git?rev=500522f6a6fbfea11e9aaf67949d61734fb0bae0#500522f6a6fbfea11e9aaf67949d61734fb0bae0"
+source = "git+https://github.com/Inferact/mke.git?rev=58b81f7ea66ff063b62a0a563027a3fbfcd78a98#58b81f7ea66ff063b62a0a563027a3fbfcd78a98"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
