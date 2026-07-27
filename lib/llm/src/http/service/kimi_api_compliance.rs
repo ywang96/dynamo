@@ -136,10 +136,10 @@ pub(crate) fn apply(
     } else {
         NON_THINKING_TEMPERATURE
     };
-    validate_float(
-        "temperature",
+    validate_temperature(
         request.inner.temperature,
         expected_temperature,
+        config.temperature_restricted(),
     )?;
     if let Some(top_p) = request.inner.top_p {
         if !config
@@ -182,6 +182,23 @@ pub(crate) fn apply(
     }
     if request.thinking.is_none() {
         request.thinking = Some(serde_json::json!({"type": "enabled"}));
+    }
+    Ok(())
+}
+
+fn validate_temperature(
+    value: Option<f32>,
+    expected: f32,
+    restricted: bool,
+) -> Result<(), KimiComplianceError> {
+    if restricted {
+        return validate_float("temperature", value, expected);
+    }
+    if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(KimiComplianceError::new(
+            "temperature",
+            "must be between 0 and 1",
+        ));
     }
     Ok(())
 }
@@ -288,6 +305,7 @@ mod tests {
     }
 
     fn config(
+        temperature_restricted: bool,
         max_completion_tokens: Option<u32>,
         thinking_types: Option<Vec<&str>>,
         default_effort: Option<&str>,
@@ -296,6 +314,7 @@ mod tests {
     ) -> KimiApiComplianceConfig {
         KimiApiComplianceConfig::from_optional_flags(
             Some(true),
+            Some(temperature_restricted),
             max_completion_tokens,
             thinking_types.map(|values| values.into_iter().map(str::to_string).collect()),
             default_effort.map(str::to_string),
@@ -307,11 +326,16 @@ mod tests {
     }
 
     fn enabled_config() -> KimiApiComplianceConfig {
-        config(None, None, None, None, None)
+        config(false, None, None, None, None, None)
+    }
+
+    fn restricted_config() -> KimiApiComplianceConfig {
+        config(true, None, None, None, None, None)
     }
 
     fn narrowed_config() -> KimiApiComplianceConfig {
         config(
+            false,
             Some(131_072),
             Some(vec!["enabled"]),
             Some("max"),
@@ -334,6 +358,62 @@ mod tests {
         assert_eq!(request.inner.max_completion_tokens, Some(32_768));
         assert_eq!(request.inner.reasoning_effort, Some(ReasoningEffort::Max));
         assert_eq!(request.thinking, Some(json!({"type": "enabled"})));
+    }
+
+    #[test]
+    fn relaxed_temperature_range_is_preserved_for_both_modes() {
+        let config = enabled_config();
+
+        for thinking_type in ["enabled", "disabled"] {
+            for temperature in [0.0, 0.6, 1.0] {
+                let mut request = request(json!({
+                    "thinking": {"type": thinking_type},
+                    "temperature": temperature
+                }));
+
+                apply(&mut request, &config).unwrap();
+
+                assert_eq!(request.inner.temperature, Some(temperature));
+            }
+        }
+    }
+
+    #[test]
+    fn relaxed_temperature_range_rejects_out_of_bounds_for_both_modes() {
+        let config = enabled_config();
+
+        for thinking_type in ["enabled", "disabled"] {
+            for temperature in [-0.1, 1.1] {
+                let mut request = request(json!({
+                    "thinking": {"type": thinking_type},
+                    "temperature": temperature
+                }));
+
+                let error = apply(&mut request, &config).unwrap_err();
+
+                assert!(error.to_string().contains("between 0 and 1"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn restricted_temperature_uses_mode_defaults() {
+        let config = restricted_config();
+
+        for (thinking_type, accepted, rejected) in [("enabled", 1.0, 0.6), ("disabled", 0.6, 1.0)] {
+            let mut accepted_request = request(json!({
+                "thinking": {"type": thinking_type},
+                "temperature": accepted
+            }));
+            apply(&mut accepted_request, &config).unwrap();
+            assert_eq!(accepted_request.inner.temperature, Some(accepted));
+
+            let mut rejected_request = request(json!({
+                "thinking": {"type": thinking_type},
+                "temperature": rejected
+            }));
+            assert!(apply(&mut rejected_request, &config).is_err());
+        }
     }
 
     #[test]
@@ -370,7 +450,7 @@ mod tests {
     #[test]
     fn explicit_allowed_zero_top_p_is_preserved() {
         let mut request = request(json!({"top_p": 0.0}));
-        let config = config(None, None, None, None, Some(vec![0.0, 1.0]));
+        let config = config(false, None, None, None, None, Some(vec![0.0, 1.0]));
 
         apply(&mut request, &config).unwrap();
 
@@ -443,7 +523,6 @@ mod tests {
     #[test]
     fn explicit_sampling_values_are_validated() {
         for (payload, field) in [
-            (json!({"temperature": 0.6}), "temperature"),
             (json!({"top_p": 0.5}), "top_p"),
             (json!({"presence_penalty": 1.0}), "presence_penalty"),
             (json!({"frequency_penalty": -1.0}), "frequency_penalty"),

@@ -110,6 +110,7 @@ class FrontendConfig(RouterConfigBase, KvRouterConfigBase, AicPerfConfigBase):
     kimi_schema_validation_level: Optional[str]
 
     kimi_api_compliance: bool
+    kimi_temp_restrict: bool
     kimi_default_max_completion_tokens: int
     kimi_allowed_thinking_types: tuple[str, ...]
     kimi_default_reasoning_effort: str
@@ -524,6 +525,16 @@ class FrontendArgGroup(ArgGroup):
             help=(
                 "Enable Kimi API compliance defaults and parameter enforcement for "
                 "this frontend. Intended for Kimi-only deployments."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--kimi-temp-restrict",
+            env_var="DYN_KIMI_TEMP_RESTRICT",
+            default=False,
+            help=(
+                "Restrict Kimi temperature to the mode default: 1.0 for thinking "
+                "and 0.6 for non-thinking. When disabled, accept values from 0 to 1."
             ),
         )
         add_argument(

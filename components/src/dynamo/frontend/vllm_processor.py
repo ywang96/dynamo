@@ -994,6 +994,7 @@ class EngineFactory:
         block_size = self.config.kv_cache_block_size or 16
         kimi_compliance_config = KimiComplianceConfig(
             enabled=self.config.kimi_api_compliance,
+            temperature_restricted=self.config.kimi_temp_restrict,
             default_max_completion_tokens=self.config.kimi_default_max_completion_tokens,
             allowed_thinking_types=self.config.kimi_allowed_thinking_types,
             default_reasoning_effort=self.config.kimi_default_reasoning_effort,

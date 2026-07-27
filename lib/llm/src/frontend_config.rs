@@ -150,6 +150,7 @@ pub const KIMI_ALLOWED_TOP_P: &[f32] = &[0.95, 1.0];
 #[derive(Debug, Clone, PartialEq)]
 pub struct KimiApiComplianceConfig {
     enabled: bool,
+    temperature_restricted: bool,
     default_max_completion_tokens: u32,
     allowed_thinking_types: Vec<String>,
     default_reasoning_effort: String,
@@ -161,6 +162,7 @@ impl Default for KimiApiComplianceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            temperature_restricted: false,
             default_max_completion_tokens: KIMI_DEFAULT_MAX_COMPLETION_TOKENS,
             allowed_thinking_types: KIMI_ALLOWED_THINKING_TYPES
                 .iter()
@@ -180,6 +182,7 @@ impl KimiApiComplianceConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn from_optional_flags(
         enabled: Option<bool>,
+        temperature_restricted: Option<bool>,
         default_max_completion_tokens: Option<u32>,
         allowed_thinking_types: Option<Vec<String>>,
         default_reasoning_effort: Option<String>,
@@ -187,6 +190,7 @@ impl KimiApiComplianceConfig {
         allowed_top_p: Option<Vec<f32>>,
     ) -> Result<Option<Self>, String> {
         if enabled.is_none()
+            && temperature_restricted.is_none()
             && default_max_completion_tokens.is_none()
             && allowed_thinking_types.is_none()
             && default_reasoning_effort.is_none()
@@ -199,6 +203,8 @@ impl KimiApiComplianceConfig {
         let defaults = Self::default();
         let config = Self {
             enabled: enabled.unwrap_or(defaults.enabled),
+            temperature_restricted: temperature_restricted
+                .unwrap_or(defaults.temperature_restricted),
             default_max_completion_tokens: default_max_completion_tokens
                 .unwrap_or(defaults.default_max_completion_tokens),
             allowed_thinking_types: allowed_thinking_types
@@ -261,6 +267,10 @@ impl KimiApiComplianceConfig {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn temperature_restricted(&self) -> bool {
+        self.temperature_restricted
     }
 
     pub fn default_max_completion_tokens(&self) -> u32 {
@@ -469,6 +479,7 @@ mod tests {
     fn kimi_config_preserves_narrowed_values() {
         let config = KimiApiComplianceConfig::from_optional_flags(
             Some(true),
+            Some(true),
             Some(131_072),
             Some(vec!["enabled".into()]),
             Some("max".into()),
@@ -484,12 +495,18 @@ mod tests {
         assert_eq!(config.default_reasoning_effort(), "max");
         assert_eq!(config.allowed_reasoning_efforts(), &["max"]);
         assert_eq!(config.allowed_top_p(), &[0.95]);
+        assert!(config.temperature_restricted());
+    }
+
+    #[test]
+    fn kimi_temperature_restriction_defaults_to_relaxed() {
+        assert!(!KimiApiComplianceConfig::default().temperature_restricted());
     }
 
     #[test]
     fn kimi_config_returns_none_when_unspecified() {
         let config =
-            KimiApiComplianceConfig::from_optional_flags(None, None, None, None, None, None)
+            KimiApiComplianceConfig::from_optional_flags(None, None, None, None, None, None, None)
                 .expect("unspecified config is valid");
 
         assert_eq!(config, None);
@@ -500,6 +517,7 @@ mod tests {
         assert!(
             KimiApiComplianceConfig::from_optional_flags(
                 Some(true),
+                None,
                 Some(0),
                 None,
                 None,
@@ -511,6 +529,7 @@ mod tests {
         assert!(
             KimiApiComplianceConfig::from_optional_flags(
                 Some(true),
+                None,
                 None,
                 Some(vec!["disabled".into()]),
                 None,
@@ -524,6 +543,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                None,
                 Some("max".into()),
                 Some(vec!["high".into()]),
                 None,
@@ -533,6 +553,7 @@ mod tests {
         assert!(
             KimiApiComplianceConfig::from_optional_flags(
                 Some(true),
+                None,
                 None,
                 None,
                 None,

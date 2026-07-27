@@ -676,14 +676,17 @@ def test_session_affinity_ttl_rejects_out_of_range(ttl: int) -> None:
         config.validate()
 
 
-def test_frontend_kimi_compliance_flags_parse_and_validate() -> None:
+def test_frontend_kimi_compliance_flags_parse_and_validate(monkeypatch) -> None:
+    monkeypatch.delenv("DYN_KIMI_TEMP_RESTRICT", raising=False)
     parser = argparse.ArgumentParser()
     FrontendArgGroup().add_arguments(parser)
 
+    defaults = FrontendConfig.from_cli_args(parser.parse_args([]))
     config = FrontendConfig.from_cli_args(
         parser.parse_args(
             [
                 "--kimi-api-compliance",
+                "--kimi-temp-restrict",
                 "--kimi-default-max-completion-tokens",
                 "1024",
                 "--kimi-allowed-thinking-types",
@@ -699,12 +702,25 @@ def test_frontend_kimi_compliance_flags_parse_and_validate() -> None:
     )
     config.validate()
 
+    assert defaults.kimi_temp_restrict is False
     assert config.kimi_api_compliance is True
+    assert config.kimi_temp_restrict is True
     assert config.kimi_default_max_completion_tokens == 1024
     assert config.kimi_allowed_thinking_types == ("enabled", "disabled")
     assert config.kimi_default_reasoning_effort == "high"
     assert config.kimi_allowed_reasoning_efforts == ("low", "high", "max")
     assert config.kimi_allowed_top_p == (0.95, 1.0)
+
+    monkeypatch.setenv("DYN_KIMI_TEMP_RESTRICT", "true")
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+    env_config = FrontendConfig.from_cli_args(parser.parse_args([]))
+    negated_config = FrontendConfig.from_cli_args(
+        parser.parse_args(["--no-kimi-temp-restrict"])
+    )
+
+    assert env_config.kimi_temp_restrict is True
+    assert negated_config.kimi_temp_restrict is False
 
 
 def test_frontend_auto_tool_choice_override_flag() -> None:

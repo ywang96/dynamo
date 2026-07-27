@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +59,7 @@ KIMI_DEFAULT_REASONING_EFFORT = "max"
 @dataclass(frozen=True)
 class KimiComplianceConfig:
     enabled: bool = False
+    temperature_restricted: bool = False
     default_max_completion_tokens: int = KIMI_DEFAULT_MAX_COMPLETION_TOKENS
     allowed_thinking_types: tuple[str, ...] = KIMI_ALLOWED_THINKING_TYPES
     default_reasoning_effort: str | None = KIMI_DEFAULT_REASONING_EFFORT
@@ -76,6 +78,21 @@ def _nearly_equal(value: Any, expected: float) -> bool:
 def _validate_kimi_float(field: str, value: Any, expected: float) -> None:
     if value is not None and not _nearly_equal(value, expected):
         raise PreprocessError(f"Kimi request field {field} must be {expected}")
+
+
+def _validate_kimi_temperature(value: Any, expected: float, restricted: bool) -> None:
+    if restricted:
+        _validate_kimi_float("temperature", value, expected)
+        return
+    if value is None:
+        return
+    if (
+        not isinstance(value, int | float)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not 0.0 <= float(value) <= 1.0
+    ):
+        raise PreprocessError("Kimi request field temperature must be between 0 and 1")
 
 
 def _validate_kimi_top_p(value: Any, allowed_top_p: tuple[float, ...]) -> None:
@@ -270,10 +287,11 @@ def _apply_kimi_compliance(
         original_request, chat_template_kwargs, thinking_enabled
     )
 
-    _validate_kimi_float(
-        "temperature",
-        getattr(request_for_sampling, "temperature", None),
+    temperature = getattr(request_for_sampling, "temperature", None)
+    _validate_kimi_temperature(
+        temperature,
         expected_temperature,
+        config.temperature_restricted,
     )
     _validate_kimi_top_p(
         getattr(request_for_sampling, "top_p", None), config.allowed_top_p
@@ -296,7 +314,9 @@ def _apply_kimi_compliance(
     presence_penalty = getattr(request_for_sampling, "presence_penalty", None)
     frequency_penalty = getattr(request_for_sampling, "frequency_penalty", None)
     updates: dict[str, Any] = {
-        "temperature": expected_temperature,
+        "temperature": (
+            temperature if temperature is not None else expected_temperature
+        ),
         "top_p": (
             top_p if top_p is not None else _default_kimi_top_p(config.allowed_top_p)
         ),

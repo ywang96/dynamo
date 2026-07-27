@@ -294,6 +294,57 @@ class TestKimiCompliance:
         assert chat_template_kwargs["thinking_mode"] == "disabled"
         assert chat_template_kwargs["reasoning_effort"] is None
 
+    @pytest.mark.parametrize("thinking_type", ["enabled", "disabled"])
+    @pytest.mark.parametrize("temperature", [0.0, 0.6, 1.0])
+    def test_kimi_relaxed_temperature_preserves_explicit_value(
+        self, thinking_type, temperature
+    ):
+        request_for_sampling, _, _ = self._prepare(
+            {
+                "thinking": {"type": thinking_type},
+                "temperature": temperature,
+            }
+        )
+
+        assert request_for_sampling.temperature == temperature
+
+    @pytest.mark.parametrize("thinking_type", ["enabled", "disabled"])
+    @pytest.mark.parametrize("temperature", [-0.1, 1.1])
+    def test_kimi_relaxed_temperature_rejects_out_of_range_value(
+        self, thinking_type, temperature
+    ):
+        with pytest.raises(PreprocessError, match="between 0 and 1"):
+            self._prepare(
+                {
+                    "thinking": {"type": thinking_type},
+                    "temperature": temperature,
+                }
+            )
+
+    @pytest.mark.parametrize(
+        ("thinking_type", "accepted", "rejected"),
+        [
+            ("enabled", 1.0, 0.6),
+            ("disabled", 0.6, 1.0),
+        ],
+    )
+    def test_kimi_restricted_temperature_preserves_current_behavior(
+        self, thinking_type, accepted, rejected
+    ):
+        config = KimiComplianceConfig(enabled=True, temperature_restricted=True)
+
+        request_for_sampling, _, _ = self._prepare(
+            {"thinking": {"type": thinking_type}, "temperature": accepted},
+            config=config,
+        )
+        assert request_for_sampling.temperature == accepted
+
+        with pytest.raises(PreprocessError, match=f"must be {accepted}"):
+            self._prepare(
+                {"thinking": {"type": thinking_type}, "temperature": rejected},
+                config=config,
+            )
+
     def test_kimi_respects_rust_normalized_disabled_thinking(self):
         request_for_sampling, chat_template_kwargs, _ = self._prepare(
             {"chat_template_args": {"thinking": False, "thinking_mode": "disabled"}}
@@ -397,7 +448,6 @@ class TestKimiCompliance:
     @pytest.mark.parametrize(
         ("field", "value"),
         [
-            ("temperature", 0.9),
             ("top_p", 0.8),
             ("presence_penalty", 0.1),
             ("frequency_penalty", 0.1),

@@ -261,6 +261,7 @@ async def async_main():
         "kimi_schema_validation": config.kimi_schema_validation,
         "kimi_schema_validation_level": config.kimi_schema_validation_level,
         "kimi_api_compliance": config.kimi_api_compliance,
+        "kimi_temp_restrict": config.kimi_temp_restrict,
         "kimi_default_max_completion_tokens": config.kimi_default_max_completion_tokens,
         "kimi_allowed_thinking_types": config.kimi_allowed_thinking_types,
         "kimi_default_reasoning_effort": config.kimi_default_reasoning_effort,

@@ -4192,6 +4192,7 @@ mod tests {
     fn kimi_rejection_maps_to_openai_400() {
         let config = crate::frontend_config::KimiApiComplianceConfig::from_optional_flags(
             Some(true),
+            None,
             Some(131_072),
             Some(vec!["enabled".to_string()]),
             Some("max".to_string()),
@@ -4222,6 +4223,7 @@ mod tests {
     fn kimi_parser_defaults_dynamic_tool_system_content() {
         let config = crate::frontend_config::KimiApiComplianceConfig::from_optional_flags(
             Some(true),
+            None,
             None,
             None,
             None,
@@ -4287,6 +4289,7 @@ mod tests {
             .expect("build real K3 renderer");
         let config = crate::frontend_config::KimiApiComplianceConfig::from_optional_flags(
             Some(true),
+            None,
             Some(131_072),
             Some(vec!["enabled".to_string(), "disabled".to_string()]),
             Some("max".to_string()),
