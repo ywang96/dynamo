@@ -84,6 +84,20 @@ impl SequencePublisher for RuntimeSequencePublisher {
         );
     }
 
+    fn observe_waiting_requests(
+        &self,
+        worker: &WorkerWithDpRank,
+        worker_type: &str,
+        waiting_requests: usize,
+    ) {
+        WORKER_LOAD_METRICS.observe_waiting_requests(
+            worker.worker_id,
+            worker.dp_rank,
+            worker_type,
+            waiting_requests,
+        );
+    }
+
     fn observe_worker_registered(&self, worker: &WorkerWithDpRank, worker_type: &str) {
         self.worker_status_metrics
             .set_registered(worker.worker_id, worker.dp_rank, worker_type);
@@ -167,6 +181,49 @@ pub async fn create_multi_worker_sequences(
     );
 
     let arc = Arc::new(multi_worker);
+
+    // Worker-published load events carry backend queue depth. Keep that
+    // external signal alongside the router's own active-sequence projection
+    // so every frontend replica sees queues created by every other frontend.
+    let mut load_subscriber =
+        EventSubscriber::for_namespace(component.namespace(), KV_METRICS_SUBJECT)
+            .await?
+            .typed::<ActiveLoad>();
+    let load_tracker = Arc::clone(&arc);
+    let load_cancel = cancellation_token.child_token();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = load_cancel.cancelled() => break,
+                event = load_subscriber.next() => {
+                    let Some(event) = event else {
+                        tracing::debug!("worker load event stream closed");
+                        break;
+                    };
+                    let Ok((_envelope, load)) = event else {
+                        tracing::warn!(error = ?event, "failed to receive worker load event");
+                        continue;
+                    };
+                    let Some(waiting_requests) = load.waiting_requests else {
+                        continue;
+                    };
+                    let Ok(waiting_requests) = usize::try_from(waiting_requests) else {
+                        tracing::warn!(
+                            worker_id = load.worker_id,
+                            dp_rank = load.dp_rank,
+                            waiting_requests,
+                            "worker waiting-request count exceeds platform usize"
+                        );
+                        continue;
+                    };
+                    load_tracker.set_waiting_requests(
+                        WorkerWithDpRank::new(load.worker_id, load.dp_rank),
+                        waiting_requests,
+                    );
+                }
+            }
+        }
+    });
 
     if replica_sync {
         let subscriber = EventSubscriber::for_component(&component, ACTIVE_SEQUENCES_SUBJECT)

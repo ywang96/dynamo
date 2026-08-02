@@ -890,15 +890,22 @@ impl WorkerMetricsPublisher {
     /// * `dp_rank` - Data parallel rank of the worker (None defaults to 0)
     /// * `active_decode_blocks` - Scheduler-compatible active decode block count
     /// * `kv_used_blocks` - Authoritative total KV blocks currently in use
-    #[pyo3(signature = (dp_rank=None, active_decode_blocks=None, kv_used_blocks=None))]
+    /// * `waiting_requests` - Requests queued inside this backend rank
+    #[pyo3(signature = (dp_rank=None, active_decode_blocks=None, kv_used_blocks=None, waiting_requests=None))]
     fn publish(
         &self,
         dp_rank: Option<u32>,
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
+        waiting_requests: Option<u64>,
     ) -> PyResult<()> {
         self.inner
-            .publish(dp_rank, active_decode_blocks, kv_used_blocks)
+            .publish(
+                dp_rank,
+                active_decode_blocks,
+                kv_used_blocks,
+                waiting_requests,
+            )
             .map_err(to_pyerr)
     }
 }

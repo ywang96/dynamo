@@ -193,6 +193,7 @@ fn spawn_mocker_snapshot_loop(
                     publisher.publish(DP_RANK, ComponentSnapshot {
                         kv_used_blocks: kv_used_blocks.load(Ordering::Relaxed),
                         kv_total_blocks: 0,
+                        waiting_requests: None,
                         gpu_cache_usage: 0.0,
                         kv_cache_hit_rate: None,
                         dp_rank: DP_RANK,

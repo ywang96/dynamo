@@ -53,7 +53,8 @@ impl SnapshotPublisher {
 
     /// Push a snapshot for `dp_rank`. Atomically updates the per-rank
     /// `dynamo_component_*` gauges and emits the `kv_used_blocks` router
-    /// signal. Hot path — no allocation, no GIL acquisition.
+    /// and backend queue depth signals. Hot path — no allocation, no GIL
+    /// acquisition.
     ///
     /// Ranks not declared at construction are silently dropped (engine
     /// emitting for an unknown rank is a misconfiguration the framework
@@ -61,7 +62,12 @@ impl SnapshotPublisher {
     pub fn publish(&self, dp_rank: u32, snap: ComponentSnapshot) {
         self.gauges.update(&snap);
         if let Some(rp) = self.router_publishers.get(&dp_rank)
-            && let Err(e) = rp.publish(Some(dp_rank), None, Some(snap.kv_used_blocks))
+            && let Err(e) = rp.publish(
+                Some(dp_rank),
+                None,
+                Some(snap.kv_used_blocks),
+                snap.waiting_requests,
+            )
         {
             if self.warned_ranks.lock().insert(dp_rank) {
                 tracing::warn!(dp_rank, error = %e, "router signal publish failed; suppressing further");
@@ -102,6 +108,7 @@ mod tests {
             ComponentSnapshot {
                 kv_used_blocks: 5,
                 kv_total_blocks: 100,
+                waiting_requests: None,
                 gpu_cache_usage: 0.5,
                 kv_cache_hit_rate: Some(0.3),
                 dp_rank: 42,
@@ -123,6 +130,7 @@ mod tests {
             ComponentSnapshot {
                 kv_used_blocks: 7,
                 kv_total_blocks: 100,
+                waiting_requests: None,
                 gpu_cache_usage: 0.07,
                 kv_cache_hit_rate: Some(0.25),
                 dp_rank: 0,

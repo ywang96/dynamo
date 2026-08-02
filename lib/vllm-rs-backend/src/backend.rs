@@ -550,6 +550,7 @@ impl MetricsRank {
             dynamo_backend_common::ComponentSnapshot {
                 kv_used_blocks,
                 kv_total_blocks: self.total_kv_blocks,
+                waiting_requests: None,
                 gpu_cache_usage: usage as f32,
                 kv_cache_hit_rate,
                 dp_rank: self.dp_rank,

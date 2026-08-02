@@ -1491,6 +1491,11 @@ impl PySnapshotPublisher {
     fn publish(&self, py: Python<'_>, dp_rank: u32, snapshot: &Bound<'_, PyAny>) -> PyResult<()> {
         let kv_used_blocks: u64 = snapshot.getattr("kv_used_blocks")?.extract()?;
         let kv_total_blocks: u64 = snapshot.getattr("kv_total_blocks")?.extract()?;
+        let waiting_requests: Option<u64> = match snapshot.getattr("waiting_requests") {
+            Ok(v) if v.is_none() => None,
+            Ok(v) => v.extract().ok(),
+            Err(_) => None,
+        };
         let gpu_cache_usage: f32 = snapshot.getattr("gpu_cache_usage")?.extract()?;
         let kv_cache_hit_rate: Option<f32> = match snapshot.getattr("kv_cache_hit_rate") {
             Ok(v) if v.is_none() => None,
@@ -1500,6 +1505,7 @@ impl PySnapshotPublisher {
         let snap = ComponentSnapshot {
             kv_used_blocks,
             kv_total_blocks,
+            waiting_requests,
             gpu_cache_usage,
             kv_cache_hit_rate,
             dp_rank,

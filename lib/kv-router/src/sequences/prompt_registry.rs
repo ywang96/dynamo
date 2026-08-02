@@ -29,6 +29,8 @@ use crate::protocols::WorkerWithDpRank;
 pub struct WorkerLoadProjection {
     pub active_prefill_tokens: usize,
     pub active_decode_blocks: usize,
+    /// Requests reported as waiting inside the backend for this rank.
+    pub waiting_requests: usize,
     /// Request blocks not already shared with active sequences on this worker.
     ///
     /// These blocks may still exist in an inactive cache; this field describes
@@ -175,6 +177,10 @@ pub(super) struct PromptRegistry {
     // never existed atomically and make a suboptimal routing choice.
     membership: PromptMembershipTrie,
     loads: RwLock<WorkerLoadTable>,
+    // Backend queue depth is reported independently from router-owned request
+    // lifecycle updates. Keep it outside WorkerLoadSnapshot so a local
+    // sequence mutation cannot overwrite a newer backend report.
+    waiting_requests: RwLock<FxHashMap<WorkerWithDpRank, usize>>,
     #[cfg(test)]
     cleanup_attempts: AtomicUsize,
 }
@@ -184,6 +190,7 @@ impl Default for PromptRegistry {
         Self {
             membership: PromptMembershipTrie::new(),
             loads: RwLock::new(WorkerLoadTable::default()),
+            waiting_requests: RwLock::new(FxHashMap::default()),
             #[cfg(test)]
             cleanup_attempts: AtomicUsize::new(0),
         }
@@ -264,6 +271,7 @@ impl PromptRegistry {
         for removed in &change.removed {
             self.membership.remove_worker(removed.worker);
             self.loads.write().remove(removed.worker);
+            self.waiting_requests.write().remove(&removed.worker);
         }
 
         for &worker in &change.added {
@@ -324,6 +332,7 @@ impl PromptRegistry {
         let query_len = token_sequence.map_or(0, |query| query.len());
         let matched_depth = self.membership.compute_overlap_depths(token_sequence);
         let loads = self.loads.read();
+        let waiting_requests = self.waiting_requests.read();
         let mut projections = FxHashMap::with_capacity_and_hasher(loads.len(), FxBuildHasher);
 
         for (worker, load) in loads.iter() {
@@ -333,12 +342,24 @@ impl PromptRegistry {
                 WorkerLoadProjection {
                     active_prefill_tokens: load.active_tokens(decay_now),
                     active_decode_blocks: load.active_blocks,
+                    waiting_requests: waiting_requests.get(&worker).copied().unwrap_or(0),
                     additional_active_blocks: query_len.saturating_sub(overlap_depth),
                 },
             );
         }
 
         projections
+    }
+
+    /// Store a backend queue report when this rank is part of the local routing
+    /// topology.
+    pub(super) fn set_waiting_requests(&self, worker: WorkerWithDpRank, count: usize) -> bool {
+        let loads = self.loads.read();
+        if !loads.entries.contains_key(&worker) {
+            return false;
+        }
+        self.waiting_requests.write().insert(worker, count);
+        true
     }
 
     pub(super) fn active_blocks(&self) -> HashMap<WorkerWithDpRank, usize> {

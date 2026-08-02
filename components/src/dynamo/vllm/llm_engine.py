@@ -132,11 +132,15 @@ class _UnifiedStatLogger(StatLoggerBase):
                 hit_rate = float(hits) / float(queries)
         publisher = self._factory.snapshot_publisher
         if publisher is not None:
+            waiting_requests = int(
+                getattr(scheduler_stats, "num_waiting_reqs", 0)
+            ) + int(getattr(scheduler_stats, "num_skipped_waiting_reqs", 0))
             publisher.publish(
                 self.dp_rank,
                 ComponentSnapshot(
                     kv_used_blocks=int(total * usage),
                     kv_total_blocks=total,
+                    waiting_requests=waiting_requests,
                     gpu_cache_usage=usage,
                     kv_cache_hit_rate=hit_rate,
                     dp_rank=self.dp_rank,

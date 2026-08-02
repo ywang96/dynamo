@@ -506,6 +506,8 @@ pub struct Metrics {
 pub struct ComponentSnapshot {
     pub kv_used_blocks: u64,
     pub kv_total_blocks: u64,
+    /// Number of requests queued inside this backend rank, if available.
+    pub waiting_requests: Option<u64>,
     /// Fractional cache usage, 0.0..1.0.
     pub gpu_cache_usage: f32,
     /// Fractional prefix cache hit rate, 0.0..1.0.

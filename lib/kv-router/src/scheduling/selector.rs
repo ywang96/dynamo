@@ -205,17 +205,23 @@ impl DefaultWorkerSelector {
         let adjusted_prefill_blocks = raw_prefill_blocks - overlap_credit_blocks;
         let prefill_cost_blocks = weights.prefill_load_scale * adjusted_prefill_blocks;
         let worker_load = worker_load.unwrap_or_default();
-        let decode_cost_blocks = worker_load.potential_decode_blocks() as f64;
+        // Treat each backend-queued request as one additional unit of decode
+        // load. This intentionally remains independent from prompt block size:
+        // queue depth is the only reliable differentiator when short prompts
+        // round down to zero active blocks or output block tracking is disabled.
+        let waiting_request_cost = worker_load.waiting_requests as f64;
+        let active_decode_cost_blocks = worker_load.potential_decode_blocks() as f64;
+        let decode_cost_blocks = active_decode_cost_blocks + waiting_request_cost;
         let logit = prefill_cost_blocks + decode_cost_blocks;
 
         if shared_beyond > 0 {
             tracing::debug!(
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks, \
                  {shared_beyond} shared blocks beyond device (multiplier={shared_cache_multiplier:.2}): {logit:.3} \
-                 = prefill_load_scale * adjusted_prefill_blocks + decode_blocks \
-                 = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {decode_cost_blocks:.3} \
+                 = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + waiting_requests \
+                 = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {active_decode_cost_blocks:.3} + {waiting_request_cost:.0} \
                  (raw_prefill_blocks: {raw_prefill_blocks:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, \
-                 overlap_credit_decay: {overlap_credit_decay:.3})",
+                 overlap_credit_decay: {overlap_credit_decay:.3}, waiting_requests: {waiting_request_cost:.0})",
                 worker.worker_id,
                 worker.dp_rank,
                 shared_cache_multiplier = weights.shared_cache_multiplier,
@@ -224,10 +230,10 @@ impl DefaultWorkerSelector {
         } else {
             tracing::debug!(
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks: {logit:.3} \
-                 = prefill_load_scale * adjusted_prefill_blocks + decode_blocks \
-                 = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {decode_cost_blocks:.3} \
+                 = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + waiting_requests \
+                 = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {active_decode_cost_blocks:.3} + {waiting_request_cost:.0} \
                  (raw_prefill_blocks: {raw_prefill_blocks:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, \
-                 overlap_credit_decay: {overlap_credit_decay:.3})",
+                 overlap_credit_decay: {overlap_credit_decay:.3}, waiting_requests: {waiting_request_cost:.0})",
                 worker.worker_id,
                 worker.dp_rank,
                 prefill_load_scale = weights.prefill_load_scale
@@ -573,6 +579,41 @@ mod tests {
             assert_eq!(result.0, worker, "Should return the only available worker");
             assert_eq!(result.1, logit, "Should return the selected worker's logit");
         }
+    }
+
+    #[test]
+    fn test_selector_avoids_worker_with_deeper_backend_queue() {
+        let queued_worker = WorkerWithDpRank::from_worker_id(0);
+        let idle_worker = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (queued_worker.worker_id, TaintedWorkerConfig::default()),
+            (idle_worker.worker_id, TaintedWorkerConfig::default()),
+        ]);
+        let mut request = base_request(16);
+        request.worker_loads.insert(
+            queued_worker,
+            crate::sequences::WorkerLoadProjection {
+                waiting_requests: 8,
+                ..Default::default()
+            },
+        );
+        request.worker_loads.insert(
+            idle_worker,
+            crate::sequences::WorkerLoadProjection::default(),
+        );
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, idle_worker);
     }
 
     #[test]
@@ -1328,6 +1369,7 @@ mod tests {
             crate::sequences::WorkerLoadProjection {
                 active_prefill_tokens: 16,
                 active_decode_blocks: 2,
+                waiting_requests: 0,
                 additional_active_blocks: 3,
             },
         );

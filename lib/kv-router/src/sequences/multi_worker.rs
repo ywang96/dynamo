@@ -73,6 +73,15 @@ pub trait SequencePublisher: Send + Sync {
         tokens: usize,
     );
 
+    /// Record backend-reported queue depth in a per-worker gauge.
+    fn observe_waiting_requests(
+        &self,
+        _worker: &WorkerWithDpRank,
+        _worker_type: &str,
+        _waiting_requests: usize,
+    ) {
+    }
+
     /// Observe that a worker/dp_rank is currently registered in the router.
     fn observe_worker_registered(&self, _worker: &WorkerWithDpRank, _worker_type: &str) {}
 
@@ -342,6 +351,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             active_decode_blocks: Some(active_blocks as u64),
             active_prefill_tokens: Some(active_tokens as u64),
             kv_used_blocks: None,
+            waiting_requests: None,
         }
     }
 
@@ -708,6 +718,18 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         }
 
         result
+    }
+
+    /// Update the latest backend-reported queue depth for a worker rank.
+    ///
+    /// This state is deliberately independent from router-owned active
+    /// sequence tracking because backend queues can include requests assigned
+    /// by other frontend replicas.
+    pub fn set_waiting_requests(&self, worker: WorkerWithDpRank, count: usize) {
+        if self.prompt_registry.set_waiting_requests(worker, count) {
+            self.publisher
+                .observe_waiting_requests(&worker, self.worker_type, count);
+        }
     }
 
     /// Query all workers for their current number of active blocks.
@@ -1642,6 +1664,7 @@ mod tests {
             &prefill_token_deltas,
             decay_now,
         );
+        sequences.set_waiting_requests(worker_a, 7);
         let projections = sequences.project_worker_loads(Some(&prompt), decay_now);
 
         assert_eq!(actual.0, expected.0);
@@ -1651,6 +1674,7 @@ mod tests {
             Some(WorkerLoadProjection {
                 active_prefill_tokens: 0,
                 active_decode_blocks: 2,
+                waiting_requests: 7,
                 additional_active_blocks: 1,
             })
         );
@@ -1659,6 +1683,7 @@ mod tests {
             Some(WorkerLoadProjection {
                 active_prefill_tokens: 12,
                 active_decode_blocks: 3,
+                waiting_requests: 0,
                 additional_active_blocks: 2,
             })
         );

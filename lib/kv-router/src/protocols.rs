@@ -549,10 +549,10 @@ pub struct WorkerSelectionResult {
     pub cached_tokens: usize,
 }
 
-/// Active load metrics for a worker, used for overload detection.
+/// Active load metrics for a worker, used for routing and overload detection.
 ///
-/// Published by workers (with `kv_used_blocks`) and by the scheduler (with
-/// `active_decode_blocks` and `active_prefill_tokens`).
+/// Published by workers (with `kv_used_blocks` and `waiting_requests`) and by
+/// the scheduler (with `active_decode_blocks` and `active_prefill_tokens`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ActiveLoad {
     pub worker_id: WorkerId,
@@ -568,6 +568,13 @@ pub struct ActiveLoad {
     /// backend KV occupancy used by overload detection.
     #[serde(default)]
     pub kv_used_blocks: Option<u64>,
+    /// Number of requests queued inside the backend for this rank.
+    ///
+    /// This is published by workers only. Routers use it to avoid continuing
+    /// to assign work to a rank whose backend queue is already deeper than its
+    /// peers, including when block-based load signals are tied.
+    #[serde(default)]
+    pub waiting_requests: Option<u64>,
 }
 
 /// A [`LocalBlockHash`] is a hash computed from the token IDs, optional multimodal metadata,
@@ -2020,6 +2027,16 @@ mod tests {
         assert_eq!(load.potential_prefill_tokens, 16);
         assert_eq!(load.potential_decode_blocks, 4);
         assert_eq!(load.active_requests, 0);
+    }
+
+    #[test]
+    fn test_active_load_defaults_waiting_requests_for_older_publishers() {
+        let load =
+            serde_json::from_str::<ActiveLoad>(r#"{"worker_id":1,"dp_rank":0,"kv_used_blocks":4}"#)
+                .unwrap();
+
+        assert_eq!(load.kv_used_blocks, Some(4));
+        assert_eq!(load.waiting_requests, None);
     }
 
     #[test]

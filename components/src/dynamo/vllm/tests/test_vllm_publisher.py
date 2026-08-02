@@ -12,7 +12,7 @@ the chat-shaped pipeline.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -125,3 +125,30 @@ def test_factory_default_is_chat_path(monkeypatch):
     assert constructed[0]["endpoint"] is endpoint
     assert constructed[0]["dp_rank"] == 3
     assert constructed[0]["component_gauges"] is component_gauges
+
+
+@pytest.mark.asyncio
+async def test_stat_logger_publishes_total_waiting_requests(monkeypatch):
+    worker_publisher = Mock()
+    worker_publisher.create_endpoint = AsyncMock()
+    monkeypatch.setattr(
+        publisher_mod, "WorkerMetricsPublisher", lambda: worker_publisher
+    )
+
+    logger = DynamoStatLoggerPublisher(endpoint=SimpleNamespace(), dp_rank=4)
+    await logger._endpoint_task
+    logger.set_num_gpu_block(100)
+    logger.record(
+        SimpleNamespace(
+            kv_cache_usage=0.25,
+            num_waiting_reqs=7,
+            num_skipped_waiting_reqs=3,
+        ),
+        iteration_stats=None,
+    )
+
+    worker_publisher.publish.assert_called_once_with(
+        4,
+        kv_used_blocks=25,
+        waiting_requests=10,
+    )

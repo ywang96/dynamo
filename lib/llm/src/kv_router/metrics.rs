@@ -280,6 +280,7 @@ impl RouterWorkerStatusMetrics {
 pub struct WorkerLoadMetrics {
     pub active_decode_blocks: IntGaugeVec,
     pub active_prefill_tokens: IntGaugeVec,
+    pub waiting_requests: IntGaugeVec,
 }
 
 impl WorkerLoadMetrics {
@@ -300,6 +301,20 @@ impl WorkerLoadMetrics {
         self.active_prefill_tokens
             .with_label_values(labels)
             .set(active_tokens as i64);
+    }
+
+    pub fn observe_waiting_requests(
+        &self,
+        worker_id: u64,
+        dp_rank: u32,
+        worker_type: &str,
+        waiting_requests: usize,
+    ) {
+        let worker_id_str = worker_id.to_string();
+        let dp_rank_str = dp_rank.to_string();
+        self.waiting_requests
+            .with_label_values(&[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type])
+            .set(waiting_requests as i64);
     }
 }
 
@@ -328,6 +343,18 @@ pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(|| W
         &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
     )
     .expect("Failed to create worker_active_prefill_tokens gauge"),
+    waiting_requests: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_WAITING_REQUESTS
+            ),
+            "Requests waiting inside each backend worker rank",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_waiting_requests gauge"),
 });
 
 /// Register the worker load gauges with the given Prometheus registry.
@@ -338,6 +365,7 @@ pub fn register_worker_load_metrics(
     let m = &*WORKER_LOAD_METRICS;
     registry.register(Box::new(m.active_decode_blocks.clone()))?;
     registry.register(Box::new(m.active_prefill_tokens.clone()))?;
+    registry.register(Box::new(m.waiting_requests.clone()))?;
     Ok(())
 }
 
@@ -858,6 +886,18 @@ mod tests {
                 &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
             )
             .unwrap(),
+            waiting_requests: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_WAITING_REQUESTS
+                    ),
+                    "Requests waiting inside each backend worker rank",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.active_decode_blocks.clone()))
@@ -865,8 +905,12 @@ mod tests {
         registry
             .register(Box::new(metrics.active_prefill_tokens.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.waiting_requests.clone()))
+            .unwrap();
 
         metrics.observe(123, 0, "decode", 42, 100);
+        metrics.observe_waiting_requests(123, 0, "decode", 7);
 
         let output = gather_pef(&registry);
         let expected = "\
@@ -876,6 +920,9 @@ dynamo_frontend_worker_active_decode_blocks{dp_rank=\"0\",worker_id=\"123\",work
 # HELP dynamo_frontend_worker_active_prefill_tokens Active prefill tokens queued per worker
 # TYPE dynamo_frontend_worker_active_prefill_tokens gauge
 dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 100
+# HELP dynamo_frontend_worker_waiting_requests Requests waiting inside each backend worker rank
+# TYPE dynamo_frontend_worker_waiting_requests gauge
+dynamo_frontend_worker_waiting_requests{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 7
 ";
         assert_eq!(
             output, expected,

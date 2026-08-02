@@ -41,6 +41,7 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
         let _ = m.active_decode_blocks.remove_label_values(labels);
         let _ = m.active_prefill_tokens.remove_label_values(labels);
+        let _ = m.waiting_requests.remove_label_values(labels);
         let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(labels);
@@ -848,6 +849,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 dp_rank,
                                 active_decode_blocks = ?active_load.active_decode_blocks,
                                 kv_used_blocks = ?active_load.kv_used_blocks,
+                                waiting_requests = ?active_load.waiting_requests,
                                 active_prefill_tokens = ?active_load.active_prefill_tokens,
                                 total_blocks = ?total_blocks,
                                 active_decode_blocks_threshold = ?cfg.active_decode_blocks_threshold,
@@ -1168,6 +1170,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1187,6 +1190,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1199,6 +1203,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1211,6 +1216,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1229,6 +1235,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1241,6 +1248,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1259,6 +1267,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1271,6 +1280,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1289,6 +1299,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1301,6 +1312,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1339,6 +1351,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                waiting_requests: None,
             },
             Some(0.6),
         );
@@ -1357,6 +1370,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                waiting_requests: None,
             },
             Some(0.6),
         );

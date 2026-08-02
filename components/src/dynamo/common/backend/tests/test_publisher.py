@@ -52,6 +52,7 @@ def test_source_descriptors_carry_payload_and_defaults():
     )
     assert snap.dp_rank == 0
     assert snap.kv_cache_hit_rate is None
+    assert snap.waiting_requests is None
 
 
 class _MinimalEngine(LLMEngine):
@@ -102,6 +103,8 @@ def test_vllm_stat_logger_pushes_component_snapshot_to_publisher():
     logger.record(
         SimpleNamespace(
             kv_cache_usage=0.25,
+            num_waiting_reqs=5,
+            num_skipped_waiting_reqs=2,
             prefix_cache_stats=SimpleNamespace(hits=3, queries=4),
         ),
         iteration_stats=None,
@@ -113,6 +116,7 @@ def test_vllm_stat_logger_pushes_component_snapshot_to_publisher():
     assert snapshot == ComponentSnapshot(
         kv_used_blocks=25,
         kv_total_blocks=100,
+        waiting_requests=7,
         gpu_cache_usage=0.25,
         kv_cache_hit_rate=0.75,
         dp_rank=3,
