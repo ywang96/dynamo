@@ -204,11 +204,13 @@ pub fn validate_response_format(
                 anyhow::bail!("`response_format.json_schema.name` cannot be empty");
             }
 
-            // Validate schema presence
-            if json_schema.schema.is_none() {
+            let Some(schema) = json_schema.schema.as_ref() else {
                 anyhow::bail!(
                     "`response_format.json_schema.schema` is required when `response_format.type` is `json_schema`"
                 );
+            };
+            if !schema.is_object() {
+                anyhow::bail!("`response_format.json_schema.schema` must be a JSON object");
             }
             Ok(())
         }
@@ -906,12 +908,38 @@ pub fn validate_chat_template_args(
 mod tests {
     use std::collections::HashMap;
 
+    use dynamo_protocols::types::{ResponseFormat, ResponseFormatJsonSchema};
     use serde_json::json;
 
     use super::*;
 
     fn unknown_fields() -> HashMap<String, serde_json::Value> {
         HashMap::from([("experimental_field".to_string(), json!("value"))])
+    }
+
+    fn json_schema_response_format(schema: serde_json::Value) -> Option<ResponseFormat> {
+        Some(ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema {
+                name: "test".to_string(),
+                description: None,
+                schema: Some(schema),
+                strict: None,
+            },
+        })
+    }
+
+    #[test]
+    fn validate_response_format_rejects_non_object_json_schema() {
+        let err = validate_response_format(&json_schema_response_format(json!("x"))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`response_format.json_schema.schema` must be a JSON object"
+        );
+    }
+
+    #[test]
+    fn validate_response_format_accepts_object_json_schema() {
+        validate_response_format(&json_schema_response_format(json!({"type": "object"}))).unwrap();
     }
 
     #[test]
