@@ -30,6 +30,7 @@ MSG_CONTAINS_ERROR = "This message contains an 400error."
 MSG_CONTAINS_STATUS_ERROR = "This message contains a 415 status error."
 MSG_CONTAINS_INVALID_ARGUMENT = "This message contains an invalid argument."
 MSG_CONTAINS_INTERNAL_ERROR = "This message contains an internal server error."
+MSG_CONTAINS_VLLM_VALIDATION = "This message triggers a vllm validation error."
 
 
 class _StatusLikeError(Exception):
@@ -39,6 +40,29 @@ class _StatusLikeError(Exception):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.message = message
+
+
+class _VLLMClientError(Exception):
+    """Mimics vllm.exceptions.VLLMClientError (vLLM 0.25+).
+
+    vLLM re-parented its client-facing errors off ValueError onto this
+    hierarchy (vllm-project/vllm#49665). The class name and module are what
+    the Rust bridge matches on, so set them to look like the real thing.
+    """
+
+
+_VLLMClientError.__name__ = "VLLMClientError"
+_VLLMClientError.__qualname__ = "VLLMClientError"
+_VLLMClientError.__module__ = "vllm.exceptions"
+
+
+class _VLLMValidationError(_VLLMClientError):
+    """Mimics vllm.exceptions.VLLMValidationError (e.g. context-length)."""
+
+
+_VLLMValidationError.__name__ = "VLLMValidationError"
+_VLLMValidationError.__qualname__ = "VLLMValidationError"
+_VLLMValidationError.__module__ = "vllm.exceptions"
 
 
 pytestmark = [
@@ -74,6 +98,8 @@ class MockHttpEngine:
             raise _StatusLikeError(status=415, message=MSG_CONTAINS_STATUS_ERROR)
         elif MSG_CONTAINS_INVALID_ARGUMENT.lower() in user_message.lower():
             raise ValueError(MSG_CONTAINS_INVALID_ARGUMENT)
+        elif MSG_CONTAINS_VLLM_VALIDATION.lower() in user_message.lower():
+            raise _VLLMValidationError(MSG_CONTAINS_VLLM_VALIDATION)
         elif MSG_CONTAINS_INTERNAL_ERROR.lower() in user_message.lower():
             raise RuntimeError("Simulated internal error")
 
@@ -192,6 +218,12 @@ async def test_chat_completion_success(http_server):
             MSG_CONTAINS_INVALID_ARGUMENT,
             400,
             f"ValueError: {MSG_CONTAINS_INVALID_ARGUMENT}",
+            "Bad Request",
+        ),
+        (
+            MSG_CONTAINS_VLLM_VALIDATION,
+            400,
+            f"VLLMValidationError: {MSG_CONTAINS_VLLM_VALIDATION}",
             "Bad Request",
         ),
         (

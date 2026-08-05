@@ -30,7 +30,7 @@ use crate::PyAsyncRequestStream;
 use dynamo_runtime::pipeline::ManyIn;
 
 use super::context::{Context, callable_accepts_kwarg};
-use super::errors::{extract_http_like_error, py_exception_to_backend_error};
+use super::errors::{extract_http_like_error, is_vllm_client_error, py_exception_to_backend_error};
 use crate::python_payload::{PythonPayload, PythonResponseItem};
 
 /// Add bindings from this crate to the provided module
@@ -387,7 +387,11 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
                 .build();
         }
 
-        let backend_err = if error.is_instance_of::<pyo3::exceptions::PyValueError>(py)
+        let backend_err = if is_vllm_client_error(py, &error) {
+            // vLLM's client-caused (4xx) errors — no longer `ValueError`
+            // subclasses since vllm-project/vllm#49665.
+            BackendError::InvalidArgument
+        } else if error.is_instance_of::<pyo3::exceptions::PyValueError>(py)
             || error.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
         {
             BackendError::InvalidArgument

@@ -158,3 +158,28 @@ pub fn extract_http_like_error(py: Python<'_>, err: &PyErr) -> Option<(u16, Stri
     let message = value.getattr("message").ok()?.extract::<String>().ok()?;
     Some((code, message))
 }
+
+/// Detect vLLM's client-caused (4xx) error hierarchy by name.
+///
+/// vLLM 0.25+ (vllm-project/vllm#49665) re-parented `VLLMValidationError`
+/// and friends from `ValueError` onto a dedicated hierarchy (`VLLMError` →
+/// `VLLMClientError`), so the `PyValueError` fallback in the engine/backend
+/// exception mapping no longer classifies them as
+/// `BackendError::InvalidArgument` and they degrade to `BackendUnknown`
+/// (HTTP 500) — e.g. a prompt exceeding the model's context length. The
+/// bridge cannot import vLLM, so walk the exception type's MRO for a class
+/// named `VLLMClientError` defined in a `vllm*` module. These errors are
+/// caused by the client request, so callers should map them to
+/// `BackendError::InvalidArgument`, mirroring the HTTP 400 vLLM's own
+/// serving layer returns.
+pub fn is_vllm_client_error(py: Python<'_>, err: &PyErr) -> bool {
+    err.get_type(py).mro().iter().any(|base| {
+        base.getattr("__name__")
+            .and_then(|n| n.extract::<String>())
+            .is_ok_and(|name| name == "VLLMClientError")
+            && base
+                .getattr("__module__")
+                .and_then(|m| m.extract::<String>())
+                .is_ok_and(|module| module.starts_with("vllm"))
+    })
+}

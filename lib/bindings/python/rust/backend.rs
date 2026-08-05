@@ -42,7 +42,7 @@ use pythonize::{depythonize, pythonize};
 
 use crate::ModelInput;
 use crate::context::Context as PyContext;
-use crate::errors::{extract_http_like_error, py_exception_to_backend_error};
+use crate::errors::{extract_http_like_error, is_vllm_client_error, py_exception_to_backend_error};
 use crate::llm::kv::KvEventPublisher as PyKvEventPublisher;
 use crate::llm::preprocessor::{MediaDecoder, MediaFetcher};
 use crate::to_pyerr;
@@ -1613,7 +1613,11 @@ fn py_err_to_dynamo(err: PyErr) -> DynamoError {
             let json_msg = serde_json::json!({ "message": message, "code": code }).to_string();
             return (backend, json_msg);
         }
-        let backend = if err.is_instance_of::<pyo3::exceptions::PyValueError>(py)
+        let backend = if is_vllm_client_error(py, &err) {
+            // vLLM's client-caused (4xx) errors — no longer `ValueError`
+            // subclasses since vllm-project/vllm#49665.
+            BackendError::InvalidArgument
+        } else if err.is_instance_of::<pyo3::exceptions::PyValueError>(py)
             || err.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
         {
             BackendError::InvalidArgument
