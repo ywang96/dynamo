@@ -185,18 +185,13 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
     .to_string()
 }
 
-/// Classify error for metrics based on status code and message
-fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+/// Classify errors for metrics from the HTTP status code. Human-readable
+/// messages are not a stable API and must not determine client/server attribution.
+fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
     match code {
-        StatusCode::BAD_REQUEST => {
-            // 400
-            if message.starts_with("Validation:") {
-                ErrorType::Validation
-            } else {
-                ErrorType::Internal
-            }
-        }
-        StatusCode::NOT_FOUND => ErrorType::NotFound, // 404
+        // A 400 is a client/request error regardless of human-readable message text.
+        StatusCode::BAD_REQUEST => ErrorType::Validation, // 400
+        StatusCode::NOT_FOUND => ErrorType::NotFound,     // 404
         StatusCode::NOT_IMPLEMENTED => ErrorType::NotImplemented, // 501
         StatusCode::TOO_MANY_REQUESTS => ErrorType::Overload, // 429
         StatusCode::SERVICE_UNAVAILABLE => ErrorType::Unavailable, // 503
@@ -205,13 +200,13 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
         _ if code.as_u16() == 529 => ErrorType::Overload, // 529
         _ if code.as_u16() == 499 => ErrorType::Cancelled, // 499 Client Closed Request
         _ if code.is_client_error() => ErrorType::Validation, // other 4xx
-        _ => ErrorType::Internal,                     // everything else
+        _ => ErrorType::Internal,                         // everything else
     }
 }
 
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
-    classify_error_for_metrics(response.0, &response.1.message)
+    classify_error_for_metrics(response.0)
 }
 
 /// Match `InvalidArgument` at top-level OR under `Backend()`.
@@ -5026,8 +5021,7 @@ mod tests {
     #[test]
     fn test_cancelled_error_metrics_classification() {
         // HTTP 499 should be classified as Cancelled for metrics
-        let error_type =
-            classify_error_for_metrics(StatusCode::from_u16(499).unwrap(), "cancelled request");
+        let error_type = classify_error_for_metrics(StatusCode::from_u16(499).unwrap());
         assert_eq!(
             error_type,
             ErrorType::Cancelled,
@@ -6232,44 +6226,38 @@ mod tests {
 
     #[test]
     fn test_classify_error_for_metrics_validation() {
-        // 400 with "Validation:" prefix to validation
-        let error_type =
-            classify_error_for_metrics(StatusCode::BAD_REQUEST, "Validation: Invalid parameter");
+        let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST);
         assert_eq!(error_type, ErrorType::Validation);
-
-        // 400 WITHOUT "Validation:" to internal (fallback)
-        let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST, "Some other error");
-        assert_eq!(error_type, ErrorType::Internal);
     }
 
     #[test]
     fn test_classify_error_for_metrics_status_codes() {
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_FOUND, "Model not found"),
+            classify_error_for_metrics(StatusCode::NOT_FOUND),
             ErrorType::NotFound
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED, "Feature not supported"),
+            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED),
             ErrorType::NotImplemented
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
+            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE, "Unavailable"),
+            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE),
             ErrorType::Unavailable
         );
         assert_eq!(
-            classify_error_for_metrics(overload_status_code(), "Overloaded"),
+            classify_error_for_metrics(overload_status_code()),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR, "Panic"),
+            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR),
             ErrorType::Internal
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::GATEWAY_TIMEOUT, "request-plane timeout"),
+            classify_error_for_metrics(StatusCode::GATEWAY_TIMEOUT),
             ErrorType::ResponseTimeout
         );
     }
@@ -6278,20 +6266,20 @@ mod tests {
     fn test_classify_error_for_metrics_client_errors() {
         // Other 4xx errors should be classified as validation
         assert_eq!(
-            classify_error_for_metrics(StatusCode::UNAUTHORIZED, "Unauthorized"),
+            classify_error_for_metrics(StatusCode::UNAUTHORIZED),
             ErrorType::Validation
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::FORBIDDEN, "Forbidden"),
+            classify_error_for_metrics(StatusCode::FORBIDDEN),
             ErrorType::Validation
         );
     }
 
     #[test]
-    fn test_extract_error_type_from_response_validation() {
+    fn test_extract_error_type_from_unprefixed_vllm_validation_response() {
         let response = ErrorMessage::from_http_error(HttpError {
             code: 400,
-            message: "Validation: bad input".to_string(),
+            message: "VLLMValidationError: prompt exceeds maximum context length".to_string(),
         });
         assert_eq!(
             extract_error_type_from_response(&response),
