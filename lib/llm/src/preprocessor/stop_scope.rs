@@ -103,6 +103,16 @@ struct CandidateScan {
     template: Option<NvCreateChatCompletionStreamResponse>,
     /// Candidate was terminated by a frontend stop match.
     stopped: bool,
+    /// End frame synthesized at stop-match time, withheld until the engine
+    /// reports this candidate's final per-candidate usage.
+    ///
+    /// A stop match closes the candidate before the engine has finished, so
+    /// the token counts are not known yet. The engine's own finish frame —
+    /// the only frame that carries them — is suppressed further down, so the
+    /// end frame waits here to collect `choice_usage` from it (P0.4). If the
+    /// engine never provides one, `flush_all` releases the frame as-is so the
+    /// candidate is always closed.
+    pending_end: Option<Frame>,
 }
 
 struct ScanState {
@@ -220,6 +230,24 @@ impl ScanState {
         for index in indexes {
             self.flush_held(index, &mut outs);
         }
+        // Release any end frame still withheld for per-candidate usage. The
+        // engine never produced a finish frame for these candidates, so the
+        // counts are unavailable — but the candidate must still be closed, so
+        // emit the end frame rather than lose it.
+        let mut withheld: Vec<u32> = self
+            .candidates
+            .iter()
+            .filter(|(_, scan)| scan.pending_end.is_some())
+            .map(|(index, _)| *index)
+            .collect();
+        withheld.sort_unstable();
+        for index in withheld {
+            if let Some(scan) = self.candidates.get_mut(&index)
+                && let Some(end) = scan.pending_end.take()
+            {
+                outs.push(end);
+            }
+        }
         outs
     }
 
@@ -258,11 +286,25 @@ impl ScanState {
 
         // Suppressed candidate: swallow the frame, keep its accounting.
         if scan.stopped {
+            let choice_usage = data.choice_usage.take();
             self.carry.stash(
                 data.inner.usage.take(),
                 data.nvext.take(),
                 data.llm_metrics.take(),
             );
+            // This suppressed frame is the engine's own finish frame for the
+            // candidate — the only one that knows the final per-candidate
+            // token counts. Release the withheld end frame now so it carries
+            // them, instead of dropping the counts with the frame (P0.4).
+            if choice_usage.is_some() {
+                let scan = self.candidates.get_mut(&index).expect("entry created");
+                if let Some(mut end) = scan.pending_end.take() {
+                    if let Some(end_data) = end.data.as_mut() {
+                        end_data.choice_usage = choice_usage;
+                    }
+                    return vec![end];
+                }
+            }
             return Vec::new();
         }
 
@@ -306,9 +348,14 @@ impl ScanState {
             if pos > 0 {
                 outs.push(Self::content_frame(&template, index, combined[..pos].to_string()));
             }
-            outs.push(Self::end_frame(&template, index));
+            let end = Self::end_frame(&template, index);
             let scan = self.candidates.get_mut(&index).expect("entry created");
             scan.stopped = true;
+            // Withhold the end frame: its per-candidate usage is only known
+            // once the engine reaches its own finish frame, which the branch
+            // above suppresses. Released there, or by `flush_all` if the
+            // engine never reports one.
+            scan.pending_end = Some(end);
             // The original frame's accounting must survive even though its
             // content is replaced by the truncated emission.
             self.carry.stash(
@@ -588,5 +635,137 @@ mod tests {
         assert_eq!(c1, "hit no match here more");
         assert_eq!(rows.iter().filter(|r| r.2.is_some()).count(), 2);
         assert!(!cancelled, "never cancels; drains to natural finish");
+    }
+
+    /// Run the scanner and return the raw end frames (finish_reason set) so
+    /// per-candidate usage can be asserted on.
+    fn run_raw(frames: Vec<Frame>, stops: &[&str], n: usize) -> Vec<Frame> {
+        let ctx = Arc::new(MockContext(AtomicBool::new(false)));
+        block_on(
+            scan_content_stop(
+                stream::iter(frames),
+                stops.iter().map(|s| s.to_string()).collect(),
+                n,
+                ctx,
+            )
+            .collect::<Vec<_>>(),
+        )
+    }
+
+    fn usage(prompt: u32, completion: u32) -> dynamo_protocols::types::CompletionUsage {
+        dynamo_protocols::types::CompletionUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            ..Default::default()
+        }
+    }
+
+    fn end_frames(out: &[Frame]) -> Vec<&NvCreateChatCompletionStreamResponse> {
+        out.iter()
+            .filter_map(|f| f.data.as_ref())
+            .filter(|d| {
+                d.inner
+                    .choices
+                    .first()
+                    .is_some_and(|c| c.finish_reason.is_some())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stop_end_frame_carries_engine_choice_usage() {
+        // P0.4: a candidate closed by a stop sequence must still deliver
+        // choices[0].usage on its end frame. The counts are only known once
+        // the engine reaches its own finish frame — which this stage
+        // suppresses — so the end frame is withheld until then.
+        let mut engine_finish = frame(0, None, None, None, Some(FinishReason::Length));
+        engine_finish.data.as_mut().unwrap().choice_usage = Some(usage(23, 2));
+
+        let out = run_raw(
+            vec![
+                frame(0, Some(Role::Assistant), Some(""), None, None),
+                frame(0, None, Some("hello STOPWORD world"), None, None),
+                engine_finish,
+            ],
+            &["STOPWORD"],
+            1,
+        );
+
+        let ends = end_frames(&out);
+        assert_eq!(ends.len(), 1, "exactly one end frame closes the candidate");
+        let end = ends[0];
+        assert_eq!(
+            end.inner.choices[0].finish_reason,
+            Some(FinishReason::Stop),
+            "stop-sequence termination reports finish_reason=stop"
+        );
+        let carried = end
+            .choice_usage
+            .as_ref()
+            .expect("end frame must carry choices[0].usage after a stop match");
+        assert_eq!(carried.prompt_tokens, 23);
+        assert_eq!(carried.completion_tokens, 2);
+        assert_eq!(carried.total_tokens, 25);
+        // The end frame's delta stays empty regardless.
+        assert!(end.inner.choices[0].delta.content.is_none());
+    }
+
+    #[test]
+    fn stop_end_frame_emitted_even_without_engine_usage() {
+        // Fallback: if the engine never reports per-candidate usage, the end
+        // frame must still be released so the candidate is closed — withholding
+        // it forever would truncate the stream.
+        let out = run_raw(
+            vec![
+                frame(0, Some(Role::Assistant), Some(""), None, None),
+                frame(0, None, Some("hello STOPWORD world"), None, None),
+            ],
+            &["STOPWORD"],
+            1,
+        );
+
+        let ends = end_frames(&out);
+        assert_eq!(
+            ends.len(),
+            1,
+            "end frame is emitted even when no usage ever arrives"
+        );
+        assert_eq!(
+            ends[0].inner.choices[0].finish_reason,
+            Some(FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn stop_end_frame_follows_truncated_content() {
+        // Ordering: the truncated content increment must still precede the end
+        // frame even though the end frame is now withheld.
+        let mut engine_finish = frame(0, None, None, None, Some(FinishReason::Length));
+        engine_finish.data.as_mut().unwrap().choice_usage = Some(usage(10, 5));
+
+        let out = run_raw(
+            vec![
+                frame(0, None, Some("keep me STOPWORD drop me"), None, None),
+                engine_finish,
+            ],
+            &["STOPWORD"],
+            1,
+        );
+
+        let texts: Vec<String> = out
+            .iter()
+            .filter_map(|f| f.data.as_ref())
+            .filter_map(|d| d.inner.choices.first())
+            .filter_map(|c| match &c.delta.content {
+                Some(ChatCompletionMessageContent::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.concat(), "keep me ", "content truncated at the stop");
+
+        let ends = end_frames(&out);
+        assert_eq!(ends.len(), 1);
+        assert!(ends[0].choice_usage.is_some(), "usage rides the end frame");
     }
 }
