@@ -104,6 +104,7 @@ struct ChoiceState {
     choice_index: u32,
     parser_name: &'static str,
     parser: Box<dyn UnifiedParser>,
+    allow_tool_calls: bool,
     parser_failed: bool,
     emitted_tool_calls: bool,
     pending_logprobs: Option<ChatChoiceLogprobs>,
@@ -111,11 +112,17 @@ struct ChoiceState {
 }
 
 impl ChoiceState {
-    fn new(parser: Box<dyn UnifiedParser>, choice_index: u32, parser_name: &'static str) -> Self {
+    fn new(
+        parser: Box<dyn UnifiedParser>,
+        choice_index: u32,
+        parser_name: &'static str,
+        allow_tool_calls: bool,
+    ) -> Self {
         Self {
             choice_index,
             parser_name,
             parser,
+            allow_tool_calls,
             parser_failed: false,
             emitted_tool_calls: false,
             pending_logprobs: None,
@@ -196,10 +203,11 @@ impl ChoiceState {
             UnifiedParserEvent::Reasoning(reasoning) => {
                 choice.delta.reasoning_content = Some(reasoning);
             }
-            UnifiedParserEvent::ToolCall(call) => {
+            UnifiedParserEvent::ToolCall(call) if self.allow_tool_calls => {
                 let chunk = self.tool_call_chunk(call)?;
                 choice.delta.tool_calls = Some(vec![chunk]);
             }
+            UnifiedParserEvent::ToolCall(_) => return None,
         }
         Some(choice)
     }
@@ -245,6 +253,7 @@ impl ChoiceState {
 struct UnifiedOutputProcessor {
     parser_spec: UnifiedParserSpec,
     tools: Arc<Vec<Tool>>,
+    allow_tool_calls: bool,
     tokenizer: DynTokenizer,
     prompt_token_ids: Arc<Vec<u32>>,
     choices: HashMap<u32, ChoiceState>,
@@ -256,6 +265,7 @@ impl UnifiedOutputProcessor {
     fn new(
         parser_spec: UnifiedParserSpec,
         tools: Vec<Tool>,
+        allow_tool_calls: bool,
         tokenizer: DynTokenizer,
         prompt_token_ids: Vec<u32>,
     ) -> anyhow::Result<Self> {
@@ -264,6 +274,7 @@ impl UnifiedOutputProcessor {
         Ok(Self {
             parser_spec,
             tools: Arc::new(tools),
+            allow_tool_calls,
             tokenizer,
             prompt_token_ids: Arc::new(prompt_token_ids),
             choices: HashMap::new(),
@@ -297,6 +308,7 @@ impl UnifiedOutputProcessor {
             parser,
             choice_index,
             self.parser_spec.name,
+            self.allow_tool_calls,
         ))
     }
 
@@ -383,6 +395,11 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
         output.append(state.finish());
     }
 
+    if !state.allow_tool_calls {
+        source.delta.tool_calls = None;
+        source.delta.function_call = None;
+    }
+
     let mut emitted = output
         .events
         .into_iter()
@@ -421,7 +438,13 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
         first.logprobs = state.pending_logprobs.take();
     }
     if let Some(mut finish_reason) = finish_reason {
-        if finish_reason == FinishReason::Stop && state.emitted_tool_calls {
+        if matches!(
+            finish_reason,
+            FinishReason::ToolCalls | FinishReason::FunctionCall
+        ) && !state.allow_tool_calls
+        {
+            finish_reason = FinishReason::Stop;
+        } else if finish_reason == FinishReason::Stop && state.emitted_tool_calls {
             finish_reason = FinishReason::ToolCalls;
         }
         emitted
@@ -500,6 +523,7 @@ fn unified_output_stream<S>(
     input: S,
     parser_spec: UnifiedParserSpec,
     tools: &[ChatCompletionTool],
+    allow_tool_calls: bool,
     tokenizer: Arc<dyn DynamoTokenizer>,
     prompt_token_ids: &[u32],
 ) -> anyhow::Result<UnifiedOutputStream>
@@ -510,6 +534,7 @@ where
     let mut processor = UnifiedOutputProcessor::new(
         parser_spec,
         convert_tools(tools),
+        allow_tool_calls,
         tokenizer,
         prompt_token_ids.to_vec(),
     )?;

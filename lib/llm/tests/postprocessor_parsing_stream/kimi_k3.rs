@@ -290,3 +290,69 @@ async fn does_not_emit_incomplete_tool_call() {
     assert!(recovered.contains("Par"));
     assert_eq!(finish_reasons, [FinishReason::Stop]);
 }
+
+#[tokio::test]
+async fn tool_choice_none_suppresses_model_emitted_tool_calls() {
+    let preprocessor = build_preprocessor();
+    let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "messages": [{"role": "user", "content": "Answer without using a tool."}],
+        "model": "moonshotai/Kimi-K3-Instruct",
+        "stream": true,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}}
+                }
+            }
+        }],
+        "tool_choice": "none"
+    }))
+    .unwrap();
+    let violating_output = concat!(
+        "answer",
+        "<|close|>response<|sep|><|open|>tools<|sep|>",
+        "<|open|>call tool=\"get_weather\" index=\"1\"<|sep|>",
+        "<|open|>argument key=\"city\" type=\"string\"<|sep|>Paris",
+        "<|close|>argument<|sep|><|close|>call<|sep|>",
+        "<|close|>tools<|sep|><|close|>message<|sep|>"
+    );
+
+    let output = preprocessor
+        .postprocessor_parsing_stream_with_prompt_tokens(
+            stream::iter(
+                [mock_content_chunk(violating_output), mock_final_chunk()]
+                    .into_iter()
+                    .map(Annotated::from_data),
+            ),
+            &request,
+            false,
+            false,
+            &[1, 4, 2],
+        )
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut content = String::new();
+    let mut tool_calls = 0;
+    let mut finish_reasons = Vec::new();
+    for response in output {
+        if let Some(data) = response.data {
+            for choice in data.inner.choices {
+                if let Some(delta) = choice.delta.content {
+                    content.push_str(get_text(&delta));
+                }
+                tool_calls += choice.delta.tool_calls.map_or(0, |calls| calls.len());
+                finish_reasons.extend(choice.finish_reason);
+            }
+        }
+    }
+
+    assert_eq!(content, "answer");
+    assert_eq!(tool_calls, 0);
+    assert_eq!(finish_reasons, [FinishReason::Stop]);
+    assert!(!content.contains("<|"));
+}

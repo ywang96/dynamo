@@ -30,6 +30,7 @@ pub(in crate::preprocessor) fn is_selected(
 pub(in crate::preprocessor) fn output_stream<S>(
     input: S,
     tools: &[ChatCompletionTool],
+    allow_tool_calls: bool,
     tokenizer: Arc<dyn DynamoTokenizer>,
     prompt_token_ids: &[u32],
 ) -> anyhow::Result<UnifiedOutputStream>
@@ -43,6 +44,7 @@ where
             create: KimiK3UnifiedParser::create,
         },
         tools,
+        allow_tool_calls,
         tokenizer,
         prompt_token_ids,
     )

@@ -2220,10 +2220,17 @@ impl OpenAIPreprocessor {
             self.tool_call_parser.as_deref(),
         ) {
             let effective_tools = request.effective_tools();
+            // K3 still needs its unified parser to strip XTML and recover normal
+            // content for `none`; only tool-call emission is disabled.
+            let allow_tool_calls = !matches!(
+                request.inner.tool_choice.as_ref(),
+                Some(ChatCompletionToolChoiceOption::None)
+            );
             let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
                 unified::kimi_k3::output_stream(
                     stream,
                     &effective_tools,
+                    allow_tool_calls,
                     self.tokenizer.clone(),
                     prompt_token_ids,
                 )?;
