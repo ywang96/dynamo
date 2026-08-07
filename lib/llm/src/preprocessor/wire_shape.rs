@@ -289,7 +289,7 @@ fn shape_frame(
     // increments (empty text, empty tool-call list) are treated as absent —
     // the spec forbids empty increment frames. Scoped so the mutable borrow
     // ends before `data` is used as an immutable frame template below.
-    let (reasoning, content, tool_calls, function_call, refusal, finish_reason, logprobs) = {
+    let (reasoning, content, tool_calls, function_call, refusal, finish_reason, mut logprobs) = {
         let choice = &mut data.inner.choices[0];
         choice.delta.role = None;
         (
@@ -329,7 +329,10 @@ fn shape_frame(
                 index,
                 delta,
                 finish_reason: None,
-                logprobs: None,
+                // The parser attaches the generated-token logprobs to its first
+                // emitted event. Preserve that ownership when reasoning is the
+                // first shaped increment, and move the payload exactly once.
+                logprobs: logprobs.take(),
             },
         ));
         reasoning_open.insert(index);
@@ -372,10 +375,10 @@ fn shape_frame(
             ChatChoiceStream {
                 index,
                 delta,
-                // Logprobs describe the generated tokens; keep them on the
-                // content increment they belong to.
+                // If reasoning did not consume the generated-token logprobs,
+                // move them to this content/function/refusal increment.
                 finish_reason: None,
-                logprobs,
+                logprobs: logprobs.take(),
             },
         ));
     }
@@ -393,13 +396,15 @@ fn shape_frame(
                     tool_calls: Some(vec![normalized]),
                     ..empty_delta()
                 };
+                // A tool-call-only parser event can own generated-token
+                // logprobs; attach them to only its first normalized chunk.
                 outputs.push(frame_from_template(
                     &data,
                     ChatChoiceStream {
                         index,
                         delta,
                         finish_reason: None,
-                        logprobs: None,
+                        logprobs: logprobs.take(),
                     },
                 ));
             }
@@ -506,6 +511,21 @@ mod tests {
         bare(response)
     }
 
+    fn with_logprobs(mut frame: Frame, token: &str, logprob: f32) -> Frame {
+        let token = token.to_string();
+        frame.data.as_mut().unwrap().inner.choices[0].logprobs =
+            Some(dynamo_protocols::types::ChatChoiceLogprobs {
+                content: Some(vec![dynamo_protocols::types::ChatCompletionTokenLogprob {
+                    token: token.clone(),
+                    logprob,
+                    bytes: Some(token.into_bytes()),
+                    top_logprobs: vec![],
+                }]),
+                refusal: None,
+            });
+        frame
+    }
+
     fn collect(frames: Vec<Frame>) -> Vec<NvCreateChatCompletionStreamResponse> {
         block_on(
             shape_chat_stream(stream::iter(frames))
@@ -561,6 +581,65 @@ mod tests {
         assert_eq!(
             end.inner.choices[0].finish_reason,
             Some(FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn preserves_logprobs_on_reasoning_increment() {
+        let out = collect(vec![with_logprobs(
+            frame(0, Some(Role::Assistant), None, Some("Thinking"), None),
+            "Thinking",
+            -0.25,
+        )]);
+
+        assert_eq!(out.len(), 2);
+        assert_is_first_frame(&out[0], 0);
+        assert!(out[0].inner.choices[0].logprobs.is_none());
+
+        let reasoning = &out[1].inner.choices[0];
+        assert_eq!(
+            reasoning.delta.reasoning_content.as_deref(),
+            Some("Thinking")
+        );
+        let logprobs = reasoning
+            .logprobs
+            .as_ref()
+            .and_then(|logprobs| logprobs.content.as_ref())
+            .expect("reasoning token logprobs");
+        assert_eq!(logprobs.len(), 1);
+        assert_eq!(logprobs[0].token, "Thinking");
+        assert_eq!(logprobs[0].logprob, -0.25);
+
+        let json = serde_json::to_value(&out[1]).unwrap();
+        assert_eq!(
+            json["choices"][0]["logprobs"]["content"][0]["logprob"],
+            -0.25
+        );
+    }
+
+    #[test]
+    fn mixed_increment_emits_logprobs_once_on_first_increment() {
+        let out = collect(vec![with_logprobs(
+            frame(
+                0,
+                Some(Role::Assistant),
+                Some("Answer"),
+                Some("Thinking"),
+                None,
+            ),
+            "ThinkingAnswer",
+            -0.5,
+        )]);
+
+        assert_eq!(out.len(), 4);
+        assert!(out[1].inner.choices[0].logprobs.is_some());
+        assert!(out[2].inner.choices[0].logprobs.is_none());
+        assert!(out[3].inner.choices[0].logprobs.is_none());
+        assert_eq!(
+            out.iter()
+                .filter(|response| response.inner.choices[0].logprobs.is_some())
+                .count(),
+            1
         );
     }
 
@@ -666,6 +745,46 @@ mod tests {
             delta(&out[2]).tool_calls.as_ref().map(|calls| calls.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn preserves_logprobs_on_first_tool_call_increment() {
+        #[allow(deprecated)]
+        let tool_chunk = ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: Some("call_1".to_string()),
+            r#type: Some(dynamo_protocols::types::FunctionType::Function),
+            function: Some(dynamo_protocols::types::FunctionCallStream {
+                name: Some("get_weather".to_string()),
+                arguments: Some("{\"city\":\"SF\"}".to_string()),
+            }),
+        };
+        let mut tool_frame = frame(0, Some(Role::Assistant), None, None, None);
+        tool_frame.data.as_mut().unwrap().inner.choices[0].delta.tool_calls =
+            Some(vec![tool_chunk]);
+
+        let out = collect(vec![with_logprobs(tool_frame, "<tool_call>", -0.75)]);
+
+        assert_eq!(out.len(), 3);
+        assert_is_first_frame(&out[0], 0);
+        assert!(out[0].inner.choices[0].logprobs.is_none());
+        assert_eq!(
+            delta(&out[1]).tool_calls.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            delta(&out[2]).tool_calls.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert!(out[2].inner.choices[0].logprobs.is_none());
+        let logprobs = out[1].inner.choices[0]
+            .logprobs
+            .as_ref()
+            .and_then(|logprobs| logprobs.content.as_ref())
+            .expect("tool-call token logprobs");
+        assert_eq!(logprobs.len(), 1);
+        assert_eq!(logprobs[0].token, "<tool_call>");
+        assert_eq!(logprobs[0].logprob, -0.75);
     }
 
     #[test]
