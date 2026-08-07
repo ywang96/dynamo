@@ -24,5 +24,7 @@ msgspec>=0.19.0
 # transceiver. The nixl-cu13 wheel is harmless if KVBM is disabled.
 nixl==1.0.1
 nixl-cu13==1.0.1
+# Keep aligned with requirements.common.txt for Dynamo's shared ImageLoader.
+pillow-heif==1.5.0
 # Required by ai_dynamo_runtime (companion to msgspec above).
 uvloop>=0.21.0
