@@ -11,8 +11,11 @@ from io import BytesIO
 from typing import Any, Dict, Final, List
 from urllib.parse import urlparse
 
+# pi-heif, not pillow-heif: the decode-only build of the same project, which
+# omits the GPL-2.0 x265 encoder that our license policy denies. Identical API,
+# and Dynamo only ever decodes HEIF here.
+from pi_heif import register_heif_opener
 from PIL import Image
-from pillow_heif import register_heif_opener
 
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.runtime import run_async

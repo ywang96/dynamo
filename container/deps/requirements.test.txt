@@ -30,6 +30,13 @@ mypy==1.18.2
 nats-py==2.12.0
 openai==2.32.0  # for Fault Tolerance migration tests
 pandas-stubs>=1.3.0
+# HEIF *encoding*, used only to synthesize fixtures in
+# components/src/dynamo/common/tests/multimodal/test_image_loader.py. The
+# runtime dependency is pi-heif (decode-only); pillow-heif bundles the
+# GPL-2.0 x265 encoder that container/compliance/policy/licenses.toml denies,
+# so it must stay test-only -- the compliance scan runs against pre_runtime,
+# which never installs this file.
+pillow-heif==1.5.0
 psutil<=7.0.0  # System package, may vary by platform (was >=5.0.0)
 # Required by pyproject.toml warning filters (pydantic.warnings.PydanticDeprecatedSince20)
 pydantic>=2.11.4,<2.13

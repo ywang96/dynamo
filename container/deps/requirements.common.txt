@@ -30,7 +30,16 @@ opentelemetry-exporter-otlp<=1.38.0
 opentelemetry-sdk<=1.38.0
 # Dynamo images use Pillow 12, so unlike vLLM's Pillow 10-compatible 0.22 pin,
 # Dynamo can use the current 1.x HEIF/HEIC decoder.
-pillow-heif==1.5.0
+#
+# pi-heif, NOT pillow-heif: pillow-heif's wheels bundle the x265 encoder and are
+# classified GPL-2.0-only, which container/compliance/policy/licenses.toml denies
+# (the licenses stage fails the build on it). pi-heif is the same project's
+# decode-only distribution -- same API, libde265 only, no x265 -- and is
+# LGPL-3.0, which the policy allows. Dynamo only decodes HEIF, so the encoder is
+# not needed here; the tests that *encode* a HEIF fixture depend on pillow-heif
+# via requirements.test.txt, which the compliance scan does not see (it always
+# runs against the pre_runtime stage).
+pi-heif==1.4.0
 prometheus_client==0.23.1
 protobuf>=5.29.5,<7.0.0
 pydantic>=2.11.4,<2.13

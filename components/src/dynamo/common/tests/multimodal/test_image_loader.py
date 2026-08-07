@@ -20,7 +20,6 @@ import base64
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
-import pillow_heif
 import pytest
 from PIL import Image
 
@@ -299,7 +298,17 @@ def _make_image_bytes(image_format: str) -> bytes:
 
 
 def _make_heif_sequence_bytes() -> bytes:
-    """Create a two-frame HEIF sequence without using Pillow's plugin."""
+    """Create a two-frame HEIF sequence without using Pillow's plugin.
+
+    Encoding needs pillow-heif: the runtime dependency is pi-heif, the
+    decode-only build of the same project, which ships no encoder. pillow-heif
+    is therefore a test-only dependency (requirements.test.txt) and must not be
+    imported at module scope -- it is absent from the runtime image, whose
+    license policy denies its bundled GPL-2.0 x265 encoder.
+    """
+    pillow_heif = pytest.importorskip(
+        "pillow_heif", reason="HEIF encoding is test-only; see requirements.test.txt"
+    )
     primary = Image.new("RGB", (8, 6), color="red")
     secondary = Image.new("RGB", (8, 6), color="blue")
     heif_file = pillow_heif.from_pillow(primary)
