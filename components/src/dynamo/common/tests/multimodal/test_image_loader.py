@@ -443,3 +443,67 @@ async def test_cache_is_lru_not_fifo(loader: ImageLoader) -> None:
     assert "https://example.com/b.png" not in loader._image_cache
     assert "https://example.com/c.png" in loader._image_cache
     assert "https://example.com/d.png" in loader._image_cache
+
+
+async def test_load_image_batch_bounds_concurrency() -> None:
+    """load_image_batch must never have more than fetch_concurrency images
+    fetching+decoding at once.
+
+    Regression test: the batch previously did
+    ``asyncio.gather(*[self.load_image(u) for u in urls])`` with no bound, so a
+    request with N images materialised N decoded RGB bitmaps in host memory
+    simultaneously. A 1000-image request OOM-killed a 200Gi prefill worker
+    (cgroup SIGKILL, exit 137). DYN_MM_IMAGE_MAX_BYTES does not help -- it caps
+    the ENCODED payload, while the decoded form is what accumulates.
+    """
+    limit = 4
+    total = 40
+    in_flight = 0
+    peak = 0
+
+    loader = ImageLoader(
+        cache_size=1,  # tiny cache so every url is a real fetch, not a cache hit
+        url_policy=_permissive_policy(),
+        fetch_concurrency=limit,
+    )
+
+    async def _tracking_fetch(url: str, *args, **kwargs) -> bytes:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.005)  # hold the slot so overlap is observable
+            return _make_image_bytes("PNG")
+        finally:
+            in_flight -= 1
+
+    items = [{URL_VARIANT_KEY: f"http://example.com/{i}.png"} for i in range(total)]
+    with patch(_FETCH_BYTES_PATH, side_effect=_tracking_fetch):
+        results = await loader.load_image_batch(items)
+
+    assert len(results) == total
+    assert peak <= limit, f"peak in-flight {peak} exceeded fetch_concurrency {limit}"
+
+
+async def test_load_image_batch_preserves_order_under_bound() -> None:
+    """Bounding concurrency must not reorder results w.r.t. image_mm_items."""
+    loader = ImageLoader(
+        cache_size=1,
+        url_policy=_permissive_policy(),
+        fetch_concurrency=2,
+    )
+    sizes = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7)]
+
+    async def _sized_fetch(url: str, *args, **kwargs) -> bytes:
+        idx = int(url.rsplit("/", 1)[-1].split(".")[0])
+        buffer = BytesIO()
+        Image.new("RGB", sizes[idx], color="red").save(buffer, format="PNG")
+        # later items return faster, so an unordered impl would visibly reorder
+        await asyncio.sleep((len(sizes) - idx) * 0.001)
+        return buffer.getvalue()
+
+    items = [{URL_VARIANT_KEY: f"http://example.com/{i}.png"} for i in range(len(sizes))]
+    with patch(_FETCH_BYTES_PATH, side_effect=_sized_fetch):
+        results = await loader.load_image_batch(items)
+
+    assert [im.size for im in results] == sizes
