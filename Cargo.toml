@@ -64,8 +64,15 @@ xgrammar-structural-tag = { version = "=0.2.0" }
 dynamo-parsers-v2 = { version = "0.1.19" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.3.0" }
 fastokens = { version = "0.2.1" }
-vllm-parser = { git = "https://github.com/Inferact/mke.git", rev = "58b81f7ea66ff063b62a0a563027a3fbfcd78a98" }
-vllm-tokenizer = { git = "https://github.com/Inferact/mke.git", rev = "58b81f7ea66ff063b62a0a563027a3fbfcd78a98" }
+# Inferact/mke is archived (last push 2026-07-31); K3 parser/tokenizer work
+# now lands in Inferact/vllm-internal, which carries both crates under the same
+# package names. Pinned at vllm-internal#343 (fix/k3-optional-response-channel),
+# which is k3-dev plus "[Kimi K3] Let the tools channel open without a response
+# channel" — the K3 structural tag no longer requires a response channel before
+# the tools channel, so `think -> tools` stops being ungrammatical. Repin to a
+# k3-dev rev once #343 merges.
+vllm-parser = { git = "https://github.com/Inferact/vllm-internal.git", rev = "543825654a1af6192dbda53582e8c30754af54ea" }
+vllm-tokenizer = { git = "https://github.com/Inferact/vllm-internal.git", rev = "543825654a1af6192dbda53582e8c30754af54ea" }
 # FxHashMap for the tiktoken special-token maps (same 1.x line as
 # dynamo-tokenizers, so the map type unifies across the from_file boundary).
 rustc-hash = "1"

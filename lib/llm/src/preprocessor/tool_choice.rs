@@ -227,6 +227,34 @@ mod tests {
     }
 
     #[test]
+    fn k3_none_attaches_response_only_structural_tag() {
+        let mut request = preprocessed_request();
+
+        let applied = apply_kimi_k3_structural_tag(
+            StructuralTagMode::On,
+            &ToolChoice::None,
+            &[tool("lookup", None)],
+            &mut request,
+        )
+        .unwrap();
+
+        assert!(applied);
+        let structural_tag = request
+            .sampling_options
+            .guided_decoding
+            .unwrap()
+            .structural_tag
+            .unwrap();
+        let elements = structural_tag["format"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3);
+        assert!(
+            elements
+                .iter()
+                .all(|element| element["begin"] != "<|open|>tools<|sep|>")
+        );
+    }
+
+    #[test]
     fn k3_named_is_rejected_even_when_structural_tags_are_disabled() {
         let mut request = preprocessed_request();
 

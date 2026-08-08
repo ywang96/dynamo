@@ -21,14 +21,15 @@ pub fn build_kimi_k3_structural_tag(
     if matches!(tool_choice, ToolChoice::Named(_)) {
         bail!("named tool choice is not supported for Kimi K3");
     }
-    if tools.is_empty() || matches!(tool_choice, ToolChoice::None) {
+    if tools.is_empty() {
         return Ok(None);
     }
 
     let tool_choice = match tool_choice {
+        ToolChoice::None => StructuralTagToolChoice::none(),
         ToolChoice::Auto => StructuralTagToolChoice::auto(),
         ToolChoice::Required => StructuralTagToolChoice::required(),
-        ToolChoice::None | ToolChoice::Named(_) => unreachable!("handled above"),
+        ToolChoice::Named(_) => unreachable!("handled above"),
     };
     let tools = tools
         .iter()

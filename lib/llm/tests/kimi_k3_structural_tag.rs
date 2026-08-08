@@ -135,9 +135,21 @@ fn argument_formats_use_mke_typed_and_raw_json_channels() {
 }
 
 #[test]
-fn none_and_empty_tools_do_not_build_a_constraint() {
+fn none_builds_a_response_only_constraint() {
     let tools = [tool("lookup", json!({"type": "object"}), Some(true))];
 
-    assert!(build(ToolChoice::None, &tools).is_none());
+    let tag = build(ToolChoice::None, &tools).expect("none must build a ban tag");
+    let elements = tag["format"]["elements"].as_array().unwrap();
+
+    assert_eq!(elements.len(), 3);
+    assert!(
+        elements
+            .iter()
+            .all(|element| element["begin"] != "<|open|>tools<|sep|>")
+    );
+}
+
+#[test]
+fn empty_tools_do_not_build_a_constraint() {
     assert!(build(ToolChoice::Required, &[]).is_none());
 }

@@ -69,6 +69,24 @@ impl vllm_tokenizer::Tokenizer for VllmTokenizerAdapter {
             .map_err(|error| TokenizerError(format!("{error:#}")))
     }
 
+    fn encode_ordinary(&self, _text: &str) -> vllm_tokenizer::Result<Vec<u32>> {
+        // The contract is `encode(text, false)` with every added, special, and
+        // control-token matcher bypassed. Dynamo's `Encoder` exposes only
+        // `encode(&str)`, which always applies those matchers, so there is no
+        // faithful delegation: returning matched IDs would let prompt text forge
+        // control tokens (K3 XTML markers in particular).
+        //
+        // This adapter only backs the unified output parser, and `vllm-parser`
+        // has no `encode_ordinary` call site outside its own test doubles, so
+        // this is unreachable today. Fail loudly rather than silently
+        // mis-encoding if that ever changes.
+        Err(TokenizerError(
+            "encode_ordinary is not supported by the Dynamo tokenizer adapter: \
+             Dynamo's Encoder cannot bypass special-token matching"
+                .to_string(),
+        ))
+    }
+
     fn decode(
         &self,
         token_ids: &[u32],
