@@ -117,6 +117,100 @@ impl vllm_tokenizer::Tokenizer for VllmTokenizerAdapter {
     }
 }
 
+/// Complete Kimi K3 XTML channel markers that must never reach the client
+/// inside `reasoning_content`.
+///
+/// By the time the unified parser emits a `Reasoning` event it has already
+/// consumed the markers that delimit the think channel, so anything
+/// marker-shaped still present is noise the model wrote *inside* its own
+/// reasoning -- typically a drafted turn ending such as
+/// `<|close|>response<|sep|><|close|>message<|sep|>`. Measured on the BEAM 1M
+/// benchmark against a K3 endpoint: 9 of 117 answers (7.7%) carried that exact
+/// sequence in `reasoning_content`; `content` was unaffected.
+const K3_REASONING_NOISE: &[&str] = &[
+    "<|open|>think<|sep|>",
+    "<|close|>think<|sep|>",
+    "<|open|>response<|sep|>",
+    "<|close|>response<|sep|>",
+    "<|open|>tools<|sep|>",
+    "<|close|>tools<|sep|>",
+    "<|close|>call<|sep|>",
+    "<|close|>argument<|sep|>",
+    "<|close|>json<|sep|>",
+    "<|close|>message<|sep|>",
+    "<|end_of_msg|>",
+];
+
+/// Strips [`K3_REASONING_NOISE`] from a streamed reasoning channel.
+///
+/// Stateful on purpose: a marker arrives split across deltas (one token at a
+/// time in the worst case), so a per-delta match would pass every fragment
+/// through. Text whose tail is a proper prefix of some marker is held back
+/// until the next delta decides it, and [`Self::flush`] releases whatever is
+/// still pending when the turn ends.
+#[derive(Default)]
+struct ReasoningNoiseFilter {
+    pending: String,
+}
+
+impl ReasoningNoiseFilter {
+    /// Longest suffix of `text` that is a proper prefix of some marker.
+    fn held_suffix_len(text: &str) -> usize {
+        let mut hold = 0;
+        for marker in K3_REASONING_NOISE {
+            // Proper prefixes only: a *complete* marker is removed by
+            // `earliest_marker`, never held. Inclusive range -- `1..max` is
+            // empty when only one byte has arrived, which would let a lone
+            // leading `<` escape and defeat the whole hold-back.
+            let max = (marker.len() - 1).min(text.len());
+            for take in 1..=max {
+                if text.is_char_boundary(text.len() - take)
+                    && text[text.len() - take..] == marker[..take]
+                {
+                    hold = hold.max(take);
+                }
+            }
+        }
+        hold
+    }
+
+    fn earliest_marker(text: &str) -> Option<(usize, usize)> {
+        K3_REASONING_NOISE
+            .iter()
+            .filter_map(|marker| text.find(marker).map(|at| (at, marker.len())))
+            .min_by_key(|(at, _)| *at)
+    }
+
+    fn push(&mut self, delta: &str) -> String {
+        self.pending.push_str(delta);
+        let mut out = String::new();
+        while let Some((at, len)) = Self::earliest_marker(&self.pending) {
+            out.push_str(&self.pending[..at]);
+            self.pending.drain(..at + len);
+        }
+        let hold = Self::held_suffix_len(&self.pending);
+        let split = self.pending.len() - hold;
+        out.push_str(&self.pending[..split]);
+        self.pending.drain(..split);
+        out
+    }
+
+    /// Release whatever is still held when the turn ends.
+    ///
+    /// What remains is by construction a proper prefix of some marker, so two
+    /// or more bytes is marker debris the model was mid-way through and is
+    /// dropped -- bounded by the longest marker. A single `<` is far more
+    /// likely to be real text than the start of a marker, so it is kept.
+    fn flush(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.len() >= 2 {
+            String::new()
+        } else {
+            pending
+        }
+    }
+}
+
 /// One choice's parser and wire-emission state.
 struct ChoiceState {
     choice_index: u32,
@@ -126,6 +220,7 @@ struct ChoiceState {
     emitted_tool_calls: bool,
     pending_logprobs: Option<ChatChoiceLogprobs>,
     finished: bool,
+    reasoning_noise: Option<ReasoningNoiseFilter>,
 }
 
 impl ChoiceState {
@@ -138,6 +233,9 @@ impl ChoiceState {
             emitted_tool_calls: false,
             pending_logprobs: None,
             finished: false,
+            // K3 is the only parser whose channel markers can appear inside a
+            // reasoning delta; leave every other parser's stream untouched.
+            reasoning_noise: (parser_name == "kimi_k3").then(ReasoningNoiseFilter::default),
         }
     }
 
@@ -189,7 +287,12 @@ impl ChoiceState {
         }
 
         match self.parser.finish() {
-            Ok(output) => output,
+            Ok(mut output) => {
+                if let Some(filter) = self.reasoning_noise.as_mut() {
+                    output.push_reasoning(filter.flush());
+                }
+                output
+            }
             Err(error) => {
                 tracing::warn!(
                     choice_index = self.choice_index,
@@ -212,6 +315,15 @@ impl ChoiceState {
                 choice.delta.content = Some(ChatCompletionMessageContent::Text(text));
             }
             UnifiedParserEvent::Reasoning(reasoning) => {
+                let reasoning = match self.reasoning_noise.as_mut() {
+                    Some(filter) => filter.push(&reasoning),
+                    None => reasoning,
+                };
+                // Everything in this delta was marker or held back; emitting an
+                // empty reasoning delta would be a visible no-op chunk.
+                if reasoning.is_empty() {
+                    return None;
+                }
                 choice.delta.reasoning_content = Some(reasoning);
             }
             UnifiedParserEvent::ToolCall(call) => {
@@ -543,4 +655,76 @@ where
             yield emitted;
         }
     }))
+}
+
+#[cfg(test)]
+mod reasoning_noise_tests {
+    use super::{K3_REASONING_NOISE, ReasoningNoiseFilter};
+
+    /// Feed `text` through the filter in fixed-size chunks (0 = one shot).
+    fn run(text: &str, chunk: usize) -> String {
+        let mut filter = ReasoningNoiseFilter::default();
+        let mut out = String::new();
+        if chunk == 0 {
+            out.push_str(&filter.push(text));
+        } else {
+            let chars: Vec<char> = text.chars().collect();
+            for piece in chars.chunks(chunk) {
+                out.push_str(&filter.push(&piece.iter().collect::<String>()));
+            }
+        }
+        out.push_str(&filter.flush());
+        out
+    }
+
+    /// The shape reported from production and reproduced by BEAM 1M: the model
+    /// drafts a turn ending inside its own reasoning.
+    #[test]
+    fn strips_drafted_turn_end_at_every_chunk_size() {
+        let text = "在工作目录里的项目任务，都可以直接告诉我。\
+                    <|close|>response<|sep|><|close|>message<|sep|>\
+                    想让我帮您做点什么，直接说就行。\
+                    <|close|>response<|sep|><|close|>message<|sep|>";
+        let want = "在工作目录里的项目任务，都可以直接告诉我。想让我帮您做点什么，直接说就行。";
+        for chunk in [0usize, 1, 2, 3, 5, 7, 11] {
+            assert_eq!(run(text, chunk), want, "chunk {chunk}");
+        }
+    }
+
+    /// Every marker, split every way, must be removed and nothing else lost.
+    #[test]
+    fn strips_every_marker_without_touching_surrounding_text() {
+        for marker in K3_REASONING_NOISE {
+            let text = format!("head{marker}tail");
+            for chunk in [0usize, 1, 2, 3, 7] {
+                assert_eq!(run(&text, chunk), "headtail", "{marker} at chunk {chunk}");
+            }
+        }
+    }
+
+    /// Ordinary reasoning must pass through byte-identical.
+    #[test]
+    fn leaves_plain_reasoning_untouched() {
+        let text = "The user asks who I am. Respond briefly. 1 < 2 and a|b.";
+        for chunk in [0usize, 1, 3, 7] {
+            assert_eq!(run(text, chunk), text, "chunk {chunk}");
+        }
+    }
+
+    /// A dangling partial marker at end of turn is dropped (bounded debris),
+    /// but a lone `<` is kept -- far more likely to be real text.
+    #[test]
+    fn drops_dangling_marker_debris_but_keeps_a_lone_angle() {
+        assert_eq!(run("answer<|close|>mess", 0), "answer");
+        assert_eq!(run("compare 5 <", 0), "compare 5 <");
+    }
+
+    /// No panic and no lost bytes on adversarial marker soup.
+    #[test]
+    fn never_panics_on_marker_soup() {
+        let soup = "<|<||>>|<|close|><|sep|>x<|open|>y<|end_of_msg|<|close|>message<|sep|";
+        for chunk in [0usize, 1, 2, 3, 5] {
+            let _ = run(soup, chunk);
+        }
+    }
 }
