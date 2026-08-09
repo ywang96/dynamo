@@ -20,7 +20,6 @@ import base64
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
-import pillow_heif
 import pytest
 from PIL import Image
 
@@ -298,33 +297,6 @@ def _make_image_bytes(image_format: str) -> bytes:
     return buffer.getvalue()
 
 
-def _make_heif_sequence_bytes() -> bytes:
-    """Create a two-frame HEIF sequence without using Pillow's plugin."""
-    primary = Image.new("RGB", (8, 6), color="red")
-    secondary = Image.new("RGB", (8, 6), color="blue")
-    heif_file = pillow_heif.from_pillow(primary)
-    heif_file.add_from_pillow(secondary)
-
-    buffer = BytesIO()
-    heif_file.save(buffer, quality=-1)
-    encoded = bytearray(buffer.getvalue())
-    assert encoded[4:8] == b"ftyp"
-    encoded[8:12] = b"msf1"
-    return bytes(encoded)
-
-
-async def test_open_image_sync_decodes_primary_heif_frame_as_rgb() -> None:
-    """HEIF sequences preserve the single-image contract by loading frame zero."""
-    image = ImageLoader._open_image_sync(BytesIO(_make_heif_sequence_bytes()))
-
-    assert image.size == (8, 6)
-    assert image.mode == "RGB"
-    red, green, blue = image.getpixel((0, 0))
-    assert red > 250
-    assert green < 5
-    assert blue < 5
-
-
 async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
     """Fetching a URL that returns an unsupported image format (e.g. SVG) should raise
     HttpStatusError with status 415, not 500."""
@@ -335,7 +307,7 @@ async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
         assert exc_info.value.status == 415
 
 
-@pytest.mark.parametrize("image_format", ["BMP", "TIFF"])
+@pytest.mark.parametrize("image_format", ["GIF", "BMP", "TIFF"])
 async def test_identifiable_blocked_format_raises_415(
     loader: ImageLoader, image_format: str
 ) -> None:

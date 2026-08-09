@@ -12,7 +12,6 @@ from typing import Any, Dict, Final, List
 from urllib.parse import urlparse
 
 from PIL import Image
-from pillow_heif import register_heif_opener
 
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.runtime import run_async
@@ -31,8 +30,6 @@ from ..http.url_validator import (
 )
 
 logger = logging.getLogger(__name__)
-
-register_heif_opener()
 
 # Constants for multimodal data variants
 URL_VARIANT_KEY: Final = "Url"
@@ -130,12 +127,11 @@ class ImageLoader:
                 raise _UnsupportedImageFormatError("Unsupported image format: SVG")
 
             image = Image.open(image_data)
-            if image.format not in ("JPEG", "PNG", "WEBP", "GIF", "HEIF"):
+            if image.format not in ("JPEG", "PNG", "WEBP", "GIF"):
                 raise _UnsupportedImageFormatError(
                     f"Unsupported image format: {image.format}"
                 )
-            # Image.open() is lazy. Converting forces the current primary frame's
-            # pixel decode while preserving Dynamo's single-image contract.
+            # Image.open() is lazy — convert() forces the actual pixel decode.
             return image.convert("RGB")
         except _UnsupportedImageFormatError:
             raise

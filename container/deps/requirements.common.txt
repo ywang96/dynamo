@@ -28,9 +28,6 @@ nvtx==0.2.14
 opentelemetry-api<=1.38.0  # Pinned for tracing support
 opentelemetry-exporter-otlp<=1.38.0
 opentelemetry-sdk<=1.38.0
-# Dynamo images use Pillow 12, so unlike vLLM's Pillow 10-compatible 0.22 pin,
-# Dynamo can use the current 1.x HEIF/HEIC decoder.
-pillow-heif==1.5.0
 prometheus_client==0.23.1
 protobuf>=5.29.5,<7.0.0
 pydantic>=2.11.4,<2.13

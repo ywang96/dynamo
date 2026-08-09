@@ -90,7 +90,6 @@ repos:
         - pytest-asyncio
         - tomli
         - pydantic
-        - pillow-heif==1.5.0
         - filelock
         - pyyaml
         - prometheus_client>=0.23.1
