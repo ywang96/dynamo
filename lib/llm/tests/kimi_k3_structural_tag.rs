@@ -150,6 +150,26 @@ fn none_builds_a_response_only_constraint() {
 }
 
 #[test]
-fn empty_tools_do_not_build_a_constraint() {
+fn no_tools_still_constrains_the_response_channel() {
+    // The turn grammar is what stops the model from stopping with an empty
+    // response channel, so a request that never mentions tools needs it too.
+    for tool_choice in [ToolChoice::Auto, ToolChoice::None] {
+        let tag = build(tool_choice, &[]).expect("no-tools requests must be constrained");
+        let elements = tag["format"]["elements"].as_array().unwrap();
+
+        assert_eq!(elements[0]["content"]["value"], "<|open|>response<|sep|>");
+        assert_eq!(elements[1]["end"], "<|close|>response<|sep|>");
+        assert!(
+            !serde_json::to_string(&tag)
+                .unwrap()
+                .contains("<|open|>tools<|sep|>")
+        );
+    }
+}
+
+#[test]
+fn required_without_tools_stays_unconstrained() {
+    // A mandatory tools channel over zero tools is unsatisfiable; an
+    // unconstrained turn beats one the model cannot complete.
     assert!(build(ToolChoice::Required, &[]).is_none());
 }

@@ -13,7 +13,14 @@ use xgrammar_structural_tag::{
     build_structural_tag,
 };
 
-/// Build the K3 XTML constraint when the request's tool policy needs one.
+/// Build the K3 XTML constraint for the request's tool policy.
+///
+/// Requests without tools are constrained too. The tag is a whole-turn channel
+/// grammar, and what it buys on a no-tools request is the part that has nothing
+/// to do with tool calling: the model cannot end the turn without opening the
+/// response channel. Leaving those requests unconstrained is why a plain chat
+/// completion can answer inside `reasoning_content` and then stop with empty
+/// `content` -- 49 of 700 rows on the 2026-08-08 BEAM run.
 pub fn build_kimi_k3_structural_tag(
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
@@ -21,7 +28,11 @@ pub fn build_kimi_k3_structural_tag(
     if matches!(tool_choice, ToolChoice::Named(_)) {
         bail!("named tool choice is not supported for Kimi K3");
     }
-    if tools.is_empty() {
+    // `required` with no tools has nothing to require, and the builder rejects
+    // it (`Error::RequiredWithoutTools`). Keep returning an unconstrained
+    // request rather than turning a contradictory one into a 400 it did not
+    // get before.
+    if tools.is_empty() && matches!(tool_choice, ToolChoice::Required) {
         return Ok(None);
     }
 
