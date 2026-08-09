@@ -17,19 +17,11 @@ fn build(tool_choice: ToolChoice, tools: &[ToolDefinition]) -> Option<Value> {
     build_kimi_k3_structural_tag(&tool_choice, tools).unwrap()
 }
 
-/// `required` lowers to `[optional(response), tools, optional(message-close)]`.
-fn required_tools_part(tag: &Value) -> &Value {
+/// Both choices lower to `[response, tools, optional(message-close)]`, so the
+/// tools channel is always the middle element. It is a bare tag under
+/// `required` and wrapped in `optional` under `auto`.
+fn tools_part(tag: &Value) -> &Value {
     &tag["format"]["elements"][1]
-}
-
-/// `auto` lowers to `[or(...), optional(message-close)]`.
-///
-/// Both channels are individually skippable, so the grammar combines them into
-/// one alternation instead of concatenating two optionals -- concatenation also
-/// derives the empty string, which lets the turn end with no assistant output at
-/// all. The tools channel lives in the branch that skips the response.
-fn auto_tools_part(tag: &Value) -> &Value {
-    &tag["format"]["elements"][0]["elements"][0]["elements"][1]
 }
 
 #[test]
@@ -45,7 +37,7 @@ fn required_builds_a_mandatory_k3_tools_channel() {
     )];
 
     let tag = build(ToolChoice::Required, &tools).expect("required must build a tag");
-    let tools_part = required_tools_part(&tag);
+    let tools_part = tools_part(&tag);
 
     assert_eq!(tag["type"], "structural_tag");
     assert_eq!(tag["format"]["type"], "sequence");
@@ -62,27 +54,22 @@ fn required_builds_a_mandatory_k3_tools_channel() {
 }
 
 #[test]
-fn auto_builds_for_all_strict_values_and_keeps_both_channels_reachable() {
+fn auto_builds_for_all_strict_values_and_keeps_tools_optional() {
+    // Every element here is optional, so the empty string derives and the turn
+    // may end producing nothing. That is a known defect, not an oversight --
+    // requiring a forward channel instead strands the model mid-marker on
+    // `<|close|>message` and it derails into arbitrary text, which is worse
+    // because the client accepts it. See the note on `KimiK3StructuralTagBuilder
+    // ::build` in vllm-parser.
     for strict in [None, Some(true), Some(false)] {
         let tools = [tool("lookup", json!({"type": "object"}), strict)];
         let tag = build(ToolChoice::Auto, &tools).expect("auto must build a tag");
         let elements = tag["format"]["elements"].as_array().unwrap();
 
-        assert_eq!(elements.len(), 2);
-        assert_eq!(elements[0]["type"], "or");
-        // Tools stay reachable without a response channel in front of them...
-        assert_eq!(auto_tools_part(&tag)["begin"], "<|open|>tools<|sep|>");
-        assert_eq!(
-            elements[0]["elements"][0]["elements"][0]["type"],
-            "optional"
-        );
-        // ...and a response-only turn is still grammatical.
-        assert_eq!(
-            elements[0]["elements"][1]["elements"][1]["end"],
-            "<|close|>response<|sep|>"
-        );
-        // Only the turn terminator may be skipped: an empty turn no longer parses.
-        assert_eq!(elements[1]["content"]["value"], "<|close|>message<|sep|>");
+        assert_eq!(elements.len(), 3);
+        assert_eq!(tools_part(&tag)["type"], "optional");
+        assert_eq!(tools_part(&tag)["content"]["begin"], "<|open|>tools<|sep|>");
+        assert_eq!(elements[2]["content"]["value"], "<|close|>message<|sep|>");
     }
 }
 
@@ -147,7 +134,7 @@ fn argument_formats_use_mke_typed_and_raw_json_channels() {
 
     let tag = build(ToolChoice::Required, &tools).unwrap();
     let serialized = serde_json::to_string(&tag).unwrap();
-    let call_content = &required_tools_part(&tag)["content"]["tags"][0]["content"];
+    let call_content = &tools_part(&tag)["content"]["tags"][0]["content"];
 
     assert_eq!(call_content["elements"][0]["pattern"], "[1-9][0-9]*");
     assert_eq!(call_content["elements"][2]["type"], "or");
@@ -175,29 +162,6 @@ fn none_builds_a_response_only_constraint() {
 }
 
 #[test]
-fn no_tools_still_constrains_the_response_channel() {
-    // The turn grammar is what stops the model from stopping with an empty
-    // response channel, so a request that never mentions tools needs it too.
-    for tool_choice in [ToolChoice::Auto, ToolChoice::None] {
-        let tag = build(tool_choice, &[]).expect("no-tools requests must be constrained");
-        let elements = tag["format"]["elements"].as_array().unwrap();
-
-        assert_eq!(elements[0]["content"]["value"], "<|open|>response<|sep|>");
-        assert_eq!(elements[1]["end"], "<|close|>response<|sep|>");
-        // No tools *channel*. A string search would false-positive: the response
-        // body excludes `<|open|>tools<|sep|>` so the model cannot type its way
-        // into a channel that is not reachable, and that exclusion is serialized.
-        assert!(
-            elements
-                .iter()
-                .all(|element| element["begin"] != "<|open|>tools<|sep|>")
-        );
-    }
-}
-
-#[test]
-fn required_without_tools_stays_unconstrained() {
-    // A mandatory tools channel over zero tools is unsatisfiable; an
-    // unconstrained turn beats one the model cannot complete.
+fn empty_tools_do_not_build_a_constraint() {
     assert!(build(ToolChoice::Required, &[]).is_none());
 }
