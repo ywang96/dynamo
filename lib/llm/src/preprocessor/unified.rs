@@ -5,7 +5,8 @@
 
 pub(super) mod kimi_k3;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::{Stream, StreamExt as _};
+use serde::de::{DeserializeSeed, Deserializer as _, Error as _, MapAccess, SeqAccess, Visitor};
 use uuid::Uuid;
 use vllm_parser::tool::{Tool, ToolCallDelta};
 use vllm_parser::unified::{UnifiedParser, UnifiedParserEvent, UnifiedParserOutput};
@@ -165,10 +167,17 @@ enum K3TagMatch {
 #[derive(Default)]
 struct K3StructuralTagFilter {
     pending: String,
+    /// The current source delta either completed a structural tag or shared
+    /// bytes with an unresolved candidate. Its token logprobs can no longer be
+    /// aligned safely with client-visible text and must be dropped.
+    logprobs_tainted: bool,
 }
 
 impl K3StructuralTagFilter {
     fn push(&mut self, delta: &str) -> String {
+        if !self.pending.is_empty() {
+            self.logprobs_tainted = true;
+        }
         self.pending.push_str(delta);
         let mut out = String::new();
         loop {
@@ -183,6 +192,7 @@ impl K3StructuralTagFilter {
             }
             match classify_k3_structural_tag(&self.pending) {
                 K3TagMatch::Complete(len) => {
+                    self.logprobs_tainted = true;
                     self.pending.drain(..len);
                 }
                 K3TagMatch::Prefix => break,
@@ -193,11 +203,18 @@ impl K3StructuralTagFilter {
                 }
             }
         }
+        if !self.pending.is_empty() {
+            self.logprobs_tainted = true;
+        }
         out
     }
 
     fn flush(&mut self) -> String {
         std::mem::take(&mut self.pending)
+    }
+
+    fn take_logprobs_tainted(&mut self) -> bool {
+        std::mem::take(&mut self.logprobs_tainted)
     }
 }
 
@@ -357,43 +374,157 @@ fn contains_complete_k3_structural_tag(mut text: &str) -> bool {
     false
 }
 
-fn validate_k3_json_strings(value: &serde_json::Value) -> Result<(), &'static str> {
-    match value {
-        serde_json::Value::String(text) => {
-            if contains_complete_k3_structural_tag(text) {
-                return Err("structural tag in an argument string value");
-            }
-            Ok(())
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                validate_k3_json_strings(value)?;
-            }
-            Ok(())
-        }
-        serde_json::Value::Object(values) => {
-            if values
-                .keys()
-                .any(|key| contains_complete_k3_structural_tag(key))
-            {
-                return Err("structural tag in an argument key");
-            }
-            for value in values.values() {
-                validate_k3_json_strings(value)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+#[derive(Clone, Copy)]
+struct K3JsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for K3JsonValueSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(K3JsonValueVisitor)
     }
 }
 
-fn validate_k3_tool_arguments(arguments: &str) -> Result<(), &'static str> {
-    let value: serde_json::Value =
-        serde_json::from_str(arguments).map_err(|_| "invalid arguments JSON")?;
-    if !value.is_object() {
-        return Err("arguments JSON is not an object");
+struct K3JsonValueVisitor;
+
+impl<'de> Visitor<'de> for K3JsonValueVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without K3 structural tags")
     }
-    validate_k3_json_strings(&value)
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if contains_complete_k3_structural_tag(value) {
+            return Err(E::custom("structural tag in an argument string value"));
+        }
+        Ok(())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while values.next_element_seed(K3JsonValueSeed)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, values: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        validate_k3_json_map(values)
+    }
+}
+
+fn validate_k3_json_map<'de, A>(mut values: A) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+{
+    let mut keys = HashSet::new();
+    while let Some(key) = values.next_key::<String>()? {
+        if contains_complete_k3_structural_tag(&key) {
+            return Err(A::Error::custom("structural tag in an argument key"));
+        }
+        if !keys.insert(key.clone()) {
+            return Err(A::Error::custom(format!("duplicate argument key {key:?}")));
+        }
+        values.next_value_seed(K3JsonValueSeed)?;
+    }
+    Ok(())
+}
+
+struct K3JsonObjectVisitor;
+
+impl<'de> Visitor<'de> for K3JsonObjectVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object-shaped arguments JSON value")
+    }
+
+    fn visit_map<A>(self, values: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        validate_k3_json_map(values)
+    }
+}
+
+fn validate_k3_tool_arguments(arguments: &str) -> Result<(), String> {
+    let mut deserializer = serde_json::Deserializer::from_str(arguments);
+    deserializer
+        .deserialize_map(K3JsonObjectVisitor)
+        .map_err(|error| error.to_string())?;
+    deserializer.end().map_err(|error| error.to_string())
+}
+
+fn k3_logprobs_contain_structural_tag(logprobs: &ChatChoiceLogprobs) -> bool {
+    [&logprobs.content, &logprobs.refusal]
+        .into_iter()
+        .filter_map(Option::as_ref)
+        .any(|tokens| {
+            let sampled = tokens
+                .iter()
+                .map(|token| token.token.as_str())
+                .collect::<String>();
+            contains_complete_k3_structural_tag(&sampled)
+        })
+}
+
+fn k3_tool_recovery_should_be_suppressed(error: &dyn fmt::Display, recovered: &str) -> bool {
+    let reason = error.to_string().to_ascii_lowercase();
+    reason.contains("kimi k3 call")
+        || reason.contains("tool call")
+        || [
+            "<|open|>tools",
+            "<|close|>tools",
+            "<|open|>call",
+            "<|close|>call",
+            "<|open|>argument",
+            "<|close|>argument",
+            "<|open|>json",
+            "<|close|>json",
+        ]
+        .iter()
+        .any(|marker| recovered.contains(marker))
 }
 
 #[derive(Default)]
@@ -423,7 +554,9 @@ struct ChoiceState {
     parser_name: &'static str,
     parser: Box<dyn UnifiedParser>,
     parser_failed: bool,
+    suppress_parser_fallback: bool,
     emitted_tool_calls: bool,
+    suppressed_tool_calls: bool,
     pending_logprobs: Option<ChatChoiceLogprobs>,
     finished: bool,
     k3_output_filters: Option<K3OutputFilters>,
@@ -436,7 +569,9 @@ impl ChoiceState {
             parser_name,
             parser,
             parser_failed: false,
+            suppress_parser_fallback: false,
             emitted_tool_calls: false,
+            suppressed_tool_calls: false,
             pending_logprobs: None,
             finished: false,
             // K3 is the only parser whose XTML tags need containment. Keep
@@ -462,8 +597,25 @@ impl ChoiceState {
         }
     }
 
+    fn take_pending_logprobs(&mut self) -> Option<ChatChoiceLogprobs> {
+        let logprobs = self.pending_logprobs.take()?;
+        if self.parser_name == "kimi_k3" && k3_logprobs_contain_structural_tag(&logprobs) {
+            tracing::warn!(
+                choice_index = self.choice_index,
+                parser = self.parser_name,
+                "dropping K3 logprobs containing structural tags"
+            );
+            return None;
+        }
+        Some(logprobs)
+    }
+
     fn process_delta(&mut self, delta: String) -> UnifiedParserOutput {
         if self.parser_failed {
+            if self.suppress_parser_fallback {
+                self.pending_logprobs = None;
+                return UnifiedParserOutput::default();
+            }
             let mut output = UnifiedParserOutput::default();
             output.push_text(delta);
             return output;
@@ -479,7 +631,18 @@ impl ChoiceState {
             );
             self.parser_failed = true;
             let recovered = self.parser.reset();
-            if recovered.is_empty() && output.events.is_empty() {
+            let suppress_recovery = self.parser_name == "kimi_k3"
+                && k3_tool_recovery_should_be_suppressed(&error, &recovered);
+            if suppress_recovery {
+                self.pending_logprobs = None;
+                self.suppressed_tool_calls = true;
+                self.suppress_parser_fallback = true;
+                tracing::warn!(
+                    choice_index = self.choice_index,
+                    parser = self.parser_name,
+                    "suppressing K3 tool-protocol parser recovery"
+                );
+            } else if recovered.is_empty() && output.events.is_empty() {
                 output.push_text(delta);
             } else {
                 output.push_text(recovered);
@@ -503,8 +666,22 @@ impl ChoiceState {
                     "unified parser finish failed; recovering buffered text"
                 );
                 self.parser_failed = true;
+                let recovered = self.parser.reset();
                 let mut output = UnifiedParserOutput::default();
-                output.push_text(self.parser.reset());
+                if self.parser_name == "kimi_k3"
+                    && k3_tool_recovery_should_be_suppressed(&error, &recovered)
+                {
+                    self.pending_logprobs = None;
+                    self.suppressed_tool_calls = true;
+                    self.suppress_parser_fallback = true;
+                    tracing::warn!(
+                        choice_index = self.choice_index,
+                        parser = self.parser_name,
+                        "suppressing incomplete K3 tool call at end of stream"
+                    );
+                } else {
+                    output.push_text(recovered);
+                }
                 output
             }
         }
@@ -514,20 +691,36 @@ impl ChoiceState {
         let mut choice = empty_choice(self.choice_index);
         match event {
             UnifiedParserEvent::Text(text) => {
-                let (text, as_parts) = match self.k3_output_filters.as_mut() {
-                    Some(filters) => (filters.content.push(&text), filters.content_as_parts),
-                    None => (text, false),
+                let (text, as_parts, tainted_logprobs) = match self.k3_output_filters.as_mut() {
+                    Some(filters) => {
+                        let text = filters.content.push(&text);
+                        (
+                            text,
+                            filters.content_as_parts,
+                            filters.content.take_logprobs_tainted(),
+                        )
+                    }
+                    None => (text, false, false),
                 };
+                if tainted_logprobs {
+                    self.pending_logprobs = None;
+                }
                 if text.is_empty() {
                     return None;
                 }
                 choice.delta.content = Some(response_text(text, as_parts));
             }
             UnifiedParserEvent::Reasoning(reasoning) => {
-                let reasoning = match self.k3_output_filters.as_mut() {
-                    Some(filters) => filters.reasoning.push(&reasoning),
-                    None => reasoning,
+                let (reasoning, tainted_logprobs) = match self.k3_output_filters.as_mut() {
+                    Some(filters) => {
+                        let reasoning = filters.reasoning.push(&reasoning);
+                        (reasoning, filters.reasoning.take_logprobs_tainted())
+                    }
+                    None => (reasoning, false),
                 };
+                if tainted_logprobs {
+                    self.pending_logprobs = None;
+                }
                 if reasoning.is_empty() {
                     return None;
                 }
@@ -539,6 +732,18 @@ impl ChoiceState {
             }
         }
         Some(choice)
+    }
+
+    fn filter_passthrough_reasoning(&mut self, reasoning: String) -> Option<String> {
+        let Some(filters) = self.k3_output_filters.as_mut() else {
+            return Some(reasoning);
+        };
+        let reasoning = filters.reasoning.push(&reasoning);
+        let tainted_logprobs = filters.reasoning.take_logprobs_tainted();
+        if tainted_logprobs {
+            self.pending_logprobs = None;
+        }
+        (!reasoning.is_empty()).then_some(reasoning)
     }
 
     /// Release incomplete candidate tags without sending them through the
@@ -597,6 +802,10 @@ impl ChoiceState {
                 }
             }
         }
+        let tainted_logprobs = filters.content.take_logprobs_tainted();
+        if tainted_logprobs {
+            self.pending_logprobs = None;
+        }
         filtered
     }
 
@@ -605,6 +814,10 @@ impl ChoiceState {
         call: ToolCallDelta,
     ) -> Option<ChatCompletionMessageToolCallChunk> {
         let Ok(index) = u32::try_from(call.tool_index) else {
+            if self.parser_name == "kimi_k3" {
+                self.suppressed_tool_calls = true;
+                self.pending_logprobs = None;
+            }
             tracing::warn!(
                 choice_index = self.choice_index,
                 tool_index = call.tool_index,
@@ -612,16 +825,25 @@ impl ChoiceState {
             );
             return None;
         };
-        if self.parser_name == "kimi_k3"
-            && let Err(reason) = validate_k3_tool_arguments(&call.arguments)
-        {
-            tracing::warn!(
-                choice_index = self.choice_index,
-                tool_index = call.tool_index,
-                reason,
-                "suppressing unsafe K3 tool call"
-            );
-            return None;
+        if self.parser_name == "kimi_k3" {
+            let unsafe_name = call
+                .name
+                .as_deref()
+                .is_some_and(contains_complete_k3_structural_tag);
+            let invalid_arguments = validate_k3_tool_arguments(&call.arguments).err();
+            if unsafe_name || invalid_arguments.is_some() {
+                self.suppressed_tool_calls = true;
+                self.pending_logprobs = None;
+                tracing::warn!(
+                    choice_index = self.choice_index,
+                    tool_index = call.tool_index,
+                    reason = invalid_arguments
+                        .as_deref()
+                        .unwrap_or("structural tag in tool name"),
+                    "suppressing unsafe K3 tool call"
+                );
+                return None;
+            }
         }
         if call.name.is_none() && call.arguments.is_empty() {
             return None;
@@ -634,6 +856,20 @@ impl ChoiceState {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("call-{}", Uuid::new_v4()))
         });
+        if self.parser_name == "kimi_k3"
+            && id
+                .as_deref()
+                .is_some_and(contains_complete_k3_structural_tag)
+        {
+            self.suppressed_tool_calls = true;
+            self.pending_logprobs = None;
+            tracing::warn!(
+                choice_index = self.choice_index,
+                tool_index = call.tool_index,
+                "suppressing K3 tool call with structural tag in id"
+            );
+            return None;
+        }
         self.emitted_tool_calls = true;
 
         Some(ChatCompletionMessageToolCallChunk {
@@ -765,7 +1001,7 @@ impl UnifiedOutputProcessor {
                 .collect::<Vec<_>>();
             choices.extend(state.flush_output_filters());
             if let Some(first) = choices.first_mut() {
-                first.logprobs = state.pending_logprobs.take();
+                first.logprobs = state.take_pending_logprobs();
             }
             emitted.extend(choices);
             state.finished = true;
@@ -794,7 +1030,7 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
         content => source.delta.content = content,
     }
     if let Some(reasoning) = source.delta.reasoning_content.take() {
-        output.push_reasoning(reasoning);
+        source.delta.reasoning_content = state.filter_passthrough_reasoning(reasoning);
     }
     if finish_reason.is_some() {
         output.append(state.finish());
@@ -811,6 +1047,8 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
     // machine and the complete-JSON/tag validation in `tool_call_chunk`.
     if state.parser_name == "kimi_k3" {
         if source.delta.tool_calls.take().is_some() {
+            state.suppressed_tool_calls = true;
+            state.pending_logprobs = None;
             tracing::warn!(
                 choice_index,
                 parser = state.parser_name,
@@ -819,6 +1057,8 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
         }
         #[allow(deprecated)]
         if source.delta.function_call.take().is_some() {
+            state.suppressed_tool_calls = true;
+            state.pending_logprobs = None;
             tracing::warn!(
                 choice_index,
                 parser = state.parser_name,
@@ -850,8 +1090,14 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
             if first.delta.tool_calls.is_none() {
                 first.delta.tool_calls = source.delta.tool_calls.take();
             }
-            if first.delta.reasoning_content.is_none() {
-                first.delta.reasoning_content = source.delta.reasoning_content.take();
+            if let Some(reasoning) = source.delta.reasoning_content.take() {
+                if let Some(parsed) = first.delta.reasoning_content.as_mut() {
+                    let mut combined = reasoning;
+                    combined.push_str(parsed);
+                    *parsed = combined;
+                } else {
+                    first.delta.reasoning_content = Some(reasoning);
+                }
             }
         }
         let has_remaining_delta = source.delta.role.is_some()
@@ -876,11 +1122,19 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
         emitted.push(empty_choice(choice_index));
     }
     if let Some(first) = emitted.first_mut() {
-        first.logprobs = state.pending_logprobs.take();
+        first.logprobs = state.take_pending_logprobs();
     }
     if let Some(mut finish_reason) = finish_reason {
         if finish_reason == FinishReason::Stop && state.emitted_tool_calls {
             finish_reason = FinishReason::ToolCalls;
+        } else if state.suppressed_tool_calls
+            && !state.emitted_tool_calls
+            && matches!(
+                finish_reason,
+                FinishReason::ToolCalls | FinishReason::FunctionCall
+            )
+        {
+            finish_reason = FinishReason::Stop;
         }
         emitted
             .last_mut()
@@ -987,16 +1241,20 @@ where
 
 #[cfg(test)]
 mod k3_output_containment_tests {
+    use std::sync::Arc;
+
     use dynamo_protocols::types::{
-        ChatCompletionMessageToolCallChunk, ChatCompletionResponseContentPart,
+        ChatChoiceLogprobs, ChatCompletionMessageToolCallChunk, ChatCompletionResponseContentPart,
         ChatCompletionResponseContentPartText, ChatCompletionStreamResponseDeltaFunctionCall,
-        FinishReason, FunctionCallStream, FunctionType,
+        ChatCompletionTokenLogprob, FinishReason, FunctionCallStream, FunctionType,
     };
     use vllm_parser::tool::{Tool, ToolCallDelta};
     use vllm_parser::unified::{
-        UnifiedParser, UnifiedParserError, UnifiedParserEvent, UnifiedParserOutput,
+        KimiK3UnifiedParser, UnifiedParser, UnifiedParserError, UnifiedParserEvent,
+        UnifiedParserOutput,
     };
     use vllm_tokenizer::DynTokenizer;
+    use vllm_tokenizer::test_utils::TestTokenizer;
 
     use super::{
         ChatCompletionMessageContent, ChoiceState, K3_FIXED_STRUCTURAL_TAGS, K3OutputFilters,
@@ -1019,6 +1277,32 @@ mod k3_output_containment_tests {
                     _ => None,
                 })
                 .collect(),
+        }
+    }
+
+    fn actual_k3_parser() -> KimiK3UnifiedParser {
+        let tokenizer = TestTokenizer::new()
+            .with_special_token("<|open|>", 256)
+            .with_special_token("<|close|>", 257)
+            .with_special_token("<|sep|>", 258)
+            .with_special_token("<|end_of_msg|>", 259);
+        KimiK3UnifiedParser::new(&[], Arc::new(tokenizer)).unwrap()
+    }
+
+    fn token_logprobs(tokens: &[&str]) -> ChatChoiceLogprobs {
+        ChatChoiceLogprobs {
+            content: Some(
+                tokens
+                    .iter()
+                    .map(|token| ChatCompletionTokenLogprob {
+                        token: (*token).to_string(),
+                        logprob: -0.25,
+                        bytes: Some(token.as_bytes().to_vec()),
+                        top_logprobs: Vec::new(),
+                    })
+                    .collect(),
+            ),
+            refusal: None,
         }
     }
 
@@ -1146,6 +1430,13 @@ mod k3_output_containment_tests {
             )
             .is_err()
         );
+
+        let overwritten_fixed = r#"{"command":"<|close|>message<|sep|>","command":"echo safe"}"#;
+        assert!(validate_k3_tool_arguments(overwritten_fixed).is_err());
+        let overwritten_dynamic =
+            r#"{"command":"<|open|>message role=\"user\"<|sep|>","command":"echo safe"}"#;
+        assert!(validate_k3_tool_arguments(overwritten_dynamic).is_err());
+        assert!(validate_k3_tool_arguments(r#"{"x":1,"x":2}"#).is_err());
     }
 
     struct FailingParser {
@@ -1183,6 +1474,51 @@ mod k3_output_containment_tests {
             _tokenizer: DynTokenizer,
         ) -> vllm_parser::unified::Result<Box<dyn UnifiedParser>> {
             unreachable!("test parser is constructed directly")
+        }
+
+        fn parse_into(
+            &mut self,
+            _delta: &str,
+            _output: &mut UnifiedParserOutput,
+        ) -> vllm_parser::unified::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EchoParser;
+
+    impl UnifiedParser for EchoParser {
+        fn create(
+            _tools: &[Tool],
+            _tokenizer: DynTokenizer,
+        ) -> vllm_parser::unified::Result<Box<dyn UnifiedParser>> {
+            unreachable!("test parser is constructed directly")
+        }
+
+        fn parse_into(
+            &mut self,
+            delta: &str,
+            output: &mut UnifiedParserOutput,
+        ) -> vllm_parser::unified::Result<()> {
+            output.push_text(delta.to_string());
+            Ok(())
+        }
+    }
+
+    struct ToolIdParser {
+        id: String,
+    }
+
+    impl UnifiedParser for ToolIdParser {
+        fn create(
+            _tools: &[Tool],
+            _tokenizer: DynTokenizer,
+        ) -> vllm_parser::unified::Result<Box<dyn UnifiedParser>> {
+            unreachable!("test parser is constructed directly")
+        }
+
+        fn tool_call_id(&self, _tool_index: usize) -> Option<&str> {
+            Some(&self.id)
         }
 
         fn parse_into(
@@ -1284,6 +1620,20 @@ mod k3_output_containment_tests {
     }
 
     #[test]
+    fn suppressed_passthrough_tool_call_normalizes_separate_terminal_reason() {
+        let mut state = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
+        assert!(process_choice(passthrough_tool_delta(), &mut state).is_empty());
+
+        let mut terminal = empty_choice(0);
+        terminal.finish_reason = Some(FinishReason::ToolCalls);
+        let emitted = process_choice(terminal, &mut state);
+
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].delta.tool_calls.is_none());
+        assert_eq!(emitted[0].finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn non_k3_preserves_passthrough_tool_fields() {
         let source = passthrough_tool_delta();
@@ -1329,6 +1679,51 @@ mod k3_output_containment_tests {
                 ))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn actual_k3_parser_drops_incomplete_tool_body_at_terminal_eof() {
+        let parser = actual_k3_parser();
+        let mut state = ChoiceState::new(Box::new(parser), 0, "kimi_k3");
+        let mut source = empty_choice(0);
+        source.delta.content = Some(ChatCompletionMessageContent::Text(
+            "<|open|>tools<|sep|>\
+             <|open|>call tool=\"Bash\" index=\"1\"<|sep|>\
+             <|open|>argument key=\"command\" type=\"string\"<|sep|>\
+             pytest -q<|close|>argument<|sep|>"
+                .to_string(),
+        ));
+        source.finish_reason = Some(FinishReason::Length);
+
+        let emitted = process_choice(source, &mut state);
+
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].delta.content.is_none());
+        assert!(emitted[0].delta.reasoning_content.is_none());
+        assert!(emitted[0].delta.tool_calls.is_none());
+        assert_eq!(emitted[0].finish_reason, Some(FinishReason::Length));
+        assert!(state.suppressed_tool_calls);
+    }
+
+    #[test]
+    fn actual_k3_parser_drops_malformed_complete_tool_body_on_parse_failure() {
+        let parser = actual_k3_parser();
+        let mut state = ChoiceState::new(Box::new(parser), 0, "kimi_k3");
+        let output = state.process_delta(
+            "<|open|>tools<|sep|>\
+             <|open|>call tool=\"Bash\" index=\"1\"<|sep|>\
+             not-an-argument<|close|>call<|sep|>"
+                .to_string(),
+        );
+
+        assert!(output.events.is_empty());
+        assert!(state.parser_failed);
+        assert!(state.suppressed_tool_calls);
+
+        state.append_logprobs(Some(token_logprobs(&["pytest", " -q"])));
+        let followup = state.process_delta("pytest -q".to_string());
+        assert!(followup.events.is_empty());
+        assert!(state.pending_logprobs.is_none());
     }
 
     struct SplitFinishParser;
@@ -1401,6 +1796,77 @@ mod k3_output_containment_tests {
     }
 
     #[test]
+    fn non_k3_mixed_delta_and_logprobs_remain_byte_identical() {
+        let tag = "<|close|>response<|sep|>";
+        let expected_logprobs = token_logprobs(&["<|close|>", "response", "<|sep|>"]);
+        let mut source = empty_choice(0);
+        source.delta.content = Some(ChatCompletionMessageContent::Text(tag.to_string()));
+        source.delta.reasoning_content = Some(tag.to_string());
+        source.logprobs = Some(expected_logprobs.clone());
+        let mut state = ChoiceState::new(Box::new(EchoParser), 0, "other");
+
+        let emitted = process_choice(source, &mut state);
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            emitted[0].delta.content,
+            Some(ChatCompletionMessageContent::Text(tag.to_string()))
+        );
+        assert_eq!(emitted[0].delta.reasoning_content.as_deref(), Some(tag));
+        assert_eq!(emitted[0].logprobs, Some(expected_logprobs));
+    }
+
+    #[test]
+    fn k3_mixed_delta_keeps_reasoning_and_content_in_the_same_choice() {
+        let mut source = empty_choice(0);
+        source.delta.content = Some(ChatCompletionMessageContent::Text("answer".to_string()));
+        source.delta.reasoning_content = Some("thought".to_string());
+        let mut state = ChoiceState::new(Box::new(EchoParser), 0, "kimi_k3");
+
+        let emitted = process_choice(source, &mut state);
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            emitted[0].delta.reasoning_content.as_deref(),
+            Some("thought")
+        );
+        assert_eq!(
+            emitted[0].delta.content,
+            Some(ChatCompletionMessageContent::Text("answer".to_string()))
+        );
+    }
+
+    #[test]
+    fn marker_split_across_held_prefix_drops_all_owned_logprobs() {
+        let mut state = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
+        state.append_logprobs(Some(token_logprobs(&["<|close|>", "res"])));
+        assert!(
+            state
+                .event_choice(UnifiedParserEvent::Text("<|close|>res".to_string()))
+                .is_none()
+        );
+        assert!(state.pending_logprobs.is_none());
+
+        state.append_logprobs(Some(token_logprobs(&["ponse", "<|sep|>", "safe"])));
+        let choice = state
+            .event_choice(UnifiedParserEvent::Text("ponse<|sep|>safe".to_string()))
+            .unwrap();
+
+        assert_eq!(
+            choice.delta.content,
+            Some(ChatCompletionMessageContent::Text("safe".to_string()))
+        );
+        assert!(state.take_pending_logprobs().is_none());
+    }
+
+    #[test]
+    fn complete_structural_tag_in_sampled_logprobs_is_dropped() {
+        let mut state = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
+        state.append_logprobs(Some(token_logprobs(&["<|close|>", "message", "<|sep|>"])));
+        assert!(state.take_pending_logprobs().is_none());
+    }
+
+    #[test]
     fn invalid_k3_tool_call_is_suppressed_before_emission() {
         let parser = FailingParser {
             recovered: String::new(),
@@ -1416,5 +1882,35 @@ mod k3_output_containment_tests {
                 .is_none()
         );
         assert!(!state.emitted_tool_calls);
+    }
+
+    #[test]
+    fn k3_tool_call_name_and_parser_id_cannot_carry_structural_tags() {
+        let mut unsafe_name = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
+        assert!(
+            unsafe_name
+                .tool_call_chunk(ToolCallDelta {
+                    tool_index: 0,
+                    name: Some("<|end_of_msg|>".to_string()),
+                    arguments: "{}".to_string(),
+                })
+                .is_none()
+        );
+        assert!(unsafe_name.suppressed_tool_calls);
+
+        let parser = ToolIdParser {
+            id: "Bash:<|end_of_msg|>".to_string(),
+        };
+        let mut unsafe_id = ChoiceState::new(Box::new(parser), 0, "kimi_k3");
+        assert!(
+            unsafe_id
+                .tool_call_chunk(ToolCallDelta {
+                    tool_index: 0,
+                    name: Some("Bash".to_string()),
+                    arguments: "{}".to_string(),
+                })
+                .is_none()
+        );
+        assert!(unsafe_id.suppressed_tool_calls);
     }
 }
