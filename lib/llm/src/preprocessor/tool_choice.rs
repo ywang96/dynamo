@@ -77,6 +77,7 @@ impl OpenAIPreprocessor {
                 self.runtime_config.structural_tag_mode,
                 &convert_tool_choice(tool_choice),
                 &convert_tools(&tools),
+                prompt_injected_reasoning,
                 common_request,
             );
         }
@@ -111,10 +112,15 @@ impl OpenAIPreprocessor {
     }
 }
 
+/// `prompt_injected_reasoning` is K3's effective thinking flag: the renderer
+/// ends the prompt at `<|open|>think<|sep|>` when it is set and
+/// `<|open|>response<|sep|>` when it is not. The grammar needs it to know which
+/// marker the model still owes -- see `build_kimi_k3_structural_tag`.
 fn apply_kimi_k3_structural_tag(
     structural_tag_mode: StructuralTagMode,
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
+    prompt_injected_reasoning: bool,
     common_request: &mut PreprocessedRequest,
 ) -> Result<bool, DynamoError> {
     if matches!(tool_choice, ToolChoice::Named(_)) {
@@ -127,8 +133,9 @@ fn apply_kimi_k3_structural_tag(
         return Ok(false);
     }
 
-    let Some(structural_tag) = build_kimi_k3_structural_tag(tool_choice, tools)
-        .map_err(|err| invalid_argument(err.to_string()))?
+    let Some(structural_tag) =
+        build_kimi_k3_structural_tag(tool_choice, tools, prompt_injected_reasoning)
+            .map_err(|err| invalid_argument(err.to_string()))?
     else {
         return Ok(false);
     };
@@ -213,6 +220,7 @@ mod tests {
             StructuralTagMode::On,
             &ToolChoice::Required,
             &[tool("lookup", None)],
+            true,
             &mut request,
         )
         .unwrap();
@@ -234,6 +242,7 @@ mod tests {
             StructuralTagMode::On,
             &ToolChoice::None,
             &[tool("lookup", None)],
+            true,
             &mut request,
         )
         .unwrap();
@@ -262,6 +271,7 @@ mod tests {
             StructuralTagMode::Off,
             &ToolChoice::Named("second".into()),
             &[tool("first", None), tool("second", None)],
+            true,
             &mut request,
         )
         .unwrap_err();
@@ -282,6 +292,7 @@ mod tests {
                 StructuralTagMode::Off,
                 &ToolChoice::Required,
                 &[tool("lookup", None)],
+            true,
                 &mut request,
             )
             .unwrap()
@@ -298,6 +309,7 @@ mod tests {
                 StructuralTagMode::On,
                 &ToolChoice::Auto,
                 &[tool("lookup", None)],
+            true,
                 &mut request,
             )
             .unwrap()
@@ -337,6 +349,7 @@ mod tests {
                 StructuralTagMode::On,
                 &convert_tool_choice(request.inner.tool_choice.as_ref().unwrap()),
                 &convert_tools(&request.effective_tools()),
+            true,
                 &mut preprocessed,
             )
             .unwrap()

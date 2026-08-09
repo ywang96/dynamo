@@ -13,13 +13,21 @@ fn tool(name: &str, parameters: Value, strict: Option<bool>) -> ToolDefinition {
     }
 }
 
+/// Build with thinking on, which is K3's default and the production shape: the
+/// prompt prefix ends at `<|open|>think<|sep|>`, so the model still owes
+/// `<|open|>response<|sep|>`.
 fn build(tool_choice: ToolChoice, tools: &[ToolDefinition]) -> Option<Value> {
-    build_kimi_k3_structural_tag(&tool_choice, tools).unwrap()
+    build_kimi_k3_structural_tag(&tool_choice, tools, true).unwrap()
 }
 
-/// Both choices lower to `[response, tools, optional(message-close)]`, so the
-/// tools channel is always the middle element. It is a bare tag under
-/// `required` and wrapped in `optional` under `auto`.
+/// Build with thinking off: the prompt prefix already opened the response
+/// channel.
+fn build_without_thinking(tool_choice: ToolChoice, tools: &[ToolDefinition]) -> Option<Value> {
+    build_kimi_k3_structural_tag(&tool_choice, tools, false).unwrap()
+}
+
+/// Under `required` the lowering is `[optional(response), tools,
+/// optional(message-close)]`, so the tools channel is the middle element.
 fn tools_part(tag: &Value) -> &Value {
     &tag["format"]["elements"][1]
 }
@@ -54,23 +62,48 @@ fn required_builds_a_mandatory_k3_tools_channel() {
 }
 
 #[test]
-fn auto_builds_for_all_strict_values_and_keeps_tools_optional() {
-    // Every element here is optional, so the empty string derives and the turn
-    // may end producing nothing. That is a known defect, not an oversight --
-    // requiring a forward channel instead strands the model mid-marker on
-    // `<|close|>message` and it derails into arbitrary text, which is worse
-    // because the client accepts it. See the note on `KimiK3StructuralTagBuilder
-    // ::build` in vllm-parser.
+fn auto_requires_a_forward_channel_but_keeps_tools_reachable() {
+    // With thinking on the turn cannot end without opening a channel, and both
+    // branches start at a marker so `<|close|>` is masked outright rather than
+    // three tokens into `<|close|>message<|sep|>`.
     for strict in [None, Some(true), Some(false)] {
         let tools = [tool("lookup", json!({"type": "object"}), strict)];
         let tag = build(ToolChoice::Auto, &tools).expect("auto must build a tag");
         let elements = tag["format"]["elements"].as_array().unwrap();
 
-        assert_eq!(elements.len(), 3);
-        assert_eq!(tools_part(&tag)["type"], "optional");
-        assert_eq!(tools_part(&tag)["content"]["begin"], "<|open|>tools<|sep|>");
-        assert_eq!(elements[2]["content"]["value"], "<|close|>message<|sep|>");
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0]["type"], "or");
+        assert_eq!(elements[1]["content"]["value"], "<|close|>message<|sep|>");
+
+        // `or([sequence[optional(response), tools], response])`.
+        let branches = elements[0]["elements"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        assert_eq!(
+            branches[0]["elements"][0]["content"]["elements"][0]["value"],
+            "<|open|>response<|sep|>"
+        );
+        assert_eq!(branches[0]["elements"][1]["begin"], "<|open|>tools<|sep|>");
+        assert_eq!(branches[1]["elements"][0]["value"], "<|open|>response<|sep|>");
     }
+}
+
+#[test]
+fn auto_without_thinking_keeps_the_permissive_shape() {
+    // The prompt already opened the response channel, so its marker stays
+    // optional and there is no marker to anchor a requirement on. Unchanged
+    // from before the forward-channel fix.
+    let tools = [tool("lookup", json!({"type": "object"}), None)];
+    let tag = build_without_thinking(ToolChoice::Auto, &tools).expect("auto must build a tag");
+    let elements = tag["format"]["elements"].as_array().unwrap();
+
+    assert_eq!(elements.len(), 3);
+    assert_eq!(
+        elements[0]["content"]["elements"][0]["content"]["value"],
+        "<|open|>response<|sep|>"
+    );
+    assert_eq!(tools_part(&tag)["type"], "optional");
+    assert_eq!(tools_part(&tag)["content"]["begin"], "<|open|>tools<|sep|>");
+    assert_eq!(elements[2]["content"]["value"], "<|close|>message<|sep|>");
 }
 
 #[test]
@@ -164,4 +197,53 @@ fn none_builds_a_response_only_constraint() {
 #[test]
 fn empty_tools_do_not_build_a_constraint() {
     assert!(build(ToolChoice::Required, &[]).is_none());
+    assert!(build_without_thinking(ToolChoice::Required, &[]).is_none());
+}
+
+/// Every marker a branch may legally begin with, in grammar order. A mandatory
+/// element ends the walk: nothing after it can be the first thing emitted.
+fn first_markers(format: &Value, out: &mut Vec<String>) {
+    match format["type"].as_str() {
+        Some("sequence") => {
+            for element in format["elements"].as_array().unwrap() {
+                first_markers(element, out);
+                if element["type"] != "optional" {
+                    return;
+                }
+            }
+        }
+        Some("or") => {
+            for element in format["elements"].as_array().unwrap() {
+                first_markers(element, out);
+            }
+        }
+        Some("optional") => first_markers(&format["content"], out),
+        Some("const_string") => out.push(format["value"].as_str().unwrap().to_string()),
+        Some("tag") => out.push(format["begin"].as_str().unwrap().to_string()),
+        other => out.push(format!("<free text: {}>", other.unwrap_or("?"))),
+    }
+}
+
+#[test]
+fn a_thinking_turn_can_only_start_at_a_channel_open_marker() {
+    // The regression this guards: with an optional response-open marker the
+    // response body's free text is reachable at the first constrained position,
+    // so a model reaching for `<|close|>message<|sep|>` commits
+    // `<|close|>message` before `<|sep|>` is masked -- `any_text_excluding`
+    // masks only the token that COMPLETES an excluded string -- and strands
+    // mid-marker. Anchoring every branch at a marker moves the mask onto
+    // `<|close|>` itself.
+    let tools = [tool("lookup", json!({"type": "object"}), None)];
+    for choice in [ToolChoice::Auto, ToolChoice::Required, ToolChoice::None] {
+        let tag = build(choice, &tools).expect("must build a tag");
+        let mut markers = Vec::new();
+        first_markers(&tag["format"], &mut markers);
+
+        assert!(
+            markers
+                .iter()
+                .all(|m| m == "<|open|>response<|sep|>" || m == "<|open|>tools<|sep|>"),
+            "only channel-open markers may start the turn, got {markers:?} for {tag}"
+        );
+    }
 }
