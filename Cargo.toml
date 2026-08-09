@@ -72,8 +72,8 @@ fastokens = { version = "0.2.1" }
 # `<|close|>think<|sep|>` with empty content. #343's "tools channel without a
 # response channel" fix is included unchanged. Repin to a k3-dev rev once #352
 # merges.
-vllm-parser = { git = "https://github.com/Inferact/vllm-internal.git", rev = "f245e410297b5c2fb2c561a4df7d4ba0a1b95699" }
-vllm-tokenizer = { git = "https://github.com/Inferact/vllm-internal.git", rev = "f245e410297b5c2fb2c561a4df7d4ba0a1b95699" }
+vllm-parser = { git = "https://github.com/Inferact/vllm-internal.git", rev = "43e3d08971f096fb61787f2411c24fe477b949b4" }
+vllm-tokenizer = { git = "https://github.com/Inferact/vllm-internal.git", rev = "43e3d08971f096fb61787f2411c24fe477b949b4" }
 # FxHashMap for the tiktoken special-token maps (same 1.x line as
 # dynamo-tokenizers, so the map type unifies across the from_file boundary).
 rustc-hash = "1"

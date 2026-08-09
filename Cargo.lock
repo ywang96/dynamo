@@ -4158,7 +4158,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -7288,7 +7288,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7325,7 +7325,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10740,7 +10740,7 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-internal.git?rev=f245e410297b5c2fb2c561a4df7d4ba0a1b95699#f245e410297b5c2fb2c561a4df7d4ba0a1b95699"
+source = "git+https://github.com/Inferact/vllm-internal.git?rev=43e3d08971f096fb61787f2411c24fe477b949b4#43e3d08971f096fb61787f2411c24fe477b949b4"
 dependencies = [
  "easy-ext",
  "serde",
@@ -10755,7 +10755,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-internal.git?rev=f245e410297b5c2fb2c561a4df7d4ba0a1b95699#f245e410297b5c2fb2c561a4df7d4ba0a1b95699"
+source = "git+https://github.com/Inferact/vllm-internal.git?rev=43e3d08971f096fb61787f2411c24fe477b949b4#43e3d08971f096fb61787f2411c24fe477b949b4"
 dependencies = [
  "base64 0.22.1",
  "fastokens",

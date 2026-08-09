@@ -613,15 +613,24 @@ enum K3Channel {
 impl K3OutputFilters {
     /// Note which channel output is about to be written to.
     ///
-    /// The first channel seen is not a transition: in non-thinking mode the
-    /// prompt already ends at `<|open|>response<|sep|>`, so no marker preceded
-    /// the first generated text and a leading channel name there is prose.
+    /// A change of channel means the parser consumed a complete marker to get
+    /// here, so a channel name at that boundary is the tail of a second,
+    /// malformed one.
+    ///
+    /// The first channel is a transition only when it is `Reasoning`. Thinking
+    /// mode is the only way generation starts there — the prompt ends at
+    /// `<|open|>think<|sep|>` — so a leading `response<|sep|>` in reasoning is
+    /// unambiguously the marker the model failed to form. A stream that opens
+    /// on `Content` is the non-thinking shape, where the prompt already ended
+    /// at `<|open|>response<|sep|>`; no marker preceded that text and a leading
+    /// channel name there is prose.
     fn enter(&mut self, channel: K3Channel) {
-        if self
+        let first = self.last_channel.is_none();
+        let switched = self
             .last_channel
             .replace(channel)
-            .is_some_and(|last| last != channel)
-        {
+            .is_some_and(|last| last != channel);
+        if switched || (first && channel == K3Channel::Reasoning) {
             match channel {
                 K3Channel::Reasoning => self.reasoning.at_channel_start = true,
                 K3Channel::Content => self.content.at_channel_start = true,
@@ -1568,12 +1577,46 @@ mod k3_output_containment_tests {
     }
 
     #[test]
-    fn first_channel_is_not_treated_as_a_transition() {
+    fn a_stream_opening_on_content_is_not_a_transition() {
         // A non-thinking prompt ends at `<|open|>response<|sep|>`, so the first
         // generated text was never preceded by a marker in the output stream.
         let mut filters = K3OutputFilters::default();
         filters.enter(K3Channel::Content);
         assert_eq!(filters.content.push("response<|sep|>"), "response<|sep|>");
+    }
+
+    #[test]
+    fn a_stream_opening_on_reasoning_strips_a_bare_channel_open() {
+        // Generation only starts in reasoning in thinking mode, where the
+        // prompt ends at `<|open|>think<|sep|>`. A leading `response<|sep|>`
+        // there is the marker the model failed to form -- observed in a user
+        // session on 2026-08-09 as reasoning consisting of a bare channel name.
+        for chunk in [0usize, 1, 3, 7] {
+            let mut filters = K3OutputFilters::default();
+            filters.enter(K3Channel::Reasoning);
+            let text = "response<|sep|>weighing the options";
+            let mut out = String::new();
+            if chunk == 0 {
+                out.push_str(&filters.reasoning.push(text));
+            } else {
+                let chars: Vec<char> = text.chars().collect();
+                for piece in chars.chunks(chunk) {
+                    out.push_str(&filters.reasoning.push(&piece.iter().collect::<String>()));
+                }
+            }
+            out.push_str(&filters.reasoning.flush());
+            assert_eq!(out, "weighing the options", "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn a_stream_opening_on_reasoning_keeps_ordinary_prose() {
+        let mut filters = K3OutputFilters::default();
+        filters.enter(K3Channel::Reasoning);
+        assert_eq!(
+            filters.reasoning.push("response times look fine to me"),
+            "response times look fine to me"
+        );
     }
 
     #[test]
