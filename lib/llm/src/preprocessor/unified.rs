@@ -150,6 +150,15 @@ const K3_DYNAMIC_OPEN_TAGS: &[(&str, &str)] = &[
     ("message", "<|open|>message"),
 ];
 
+/// Channel names, for recognizing an open marker that lost its `<|open|>`.
+///
+/// Only meaningful at a channel boundary the parser just crossed -- see
+/// `K3StructuralTagFilter::hold_bare_channel_open`. Mid-channel these are
+/// ordinary words and must stay untouched.
+const K3_CHANNEL_NAMES: &[&str] = &[
+    "think", "response", "tools", "call", "argument", "json", "message",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum K3TagMatch {
     Complete(usize),
@@ -161,9 +170,7 @@ enum K3TagMatch {
 ///
 /// Each API channel owns a separate instance. A tag can arrive one token (or
 /// one byte) at a time, so a possible tag prefix is held until another delta
-/// proves or completes it. Incomplete and near-marker text is released
-/// byte-identical at end of stream; containment must not guess that it was a
-/// control token merely because it began with `<|`.
+/// proves or completes it.
 #[derive(Default)]
 struct K3StructuralTagFilter {
     pending: String,
@@ -171,14 +178,58 @@ struct K3StructuralTagFilter {
     /// bytes with an unresolved candidate. Its token logprobs can no longer be
     /// aligned safely with client-visible text and must be dropped.
     logprobs_tainted: bool,
+    /// The parser just crossed into this channel, so a bare channel name here
+    /// is the tail of an open marker rather than prose. Cleared by the first
+    /// text that resolves either way.
+    at_channel_start: bool,
 }
 
 impl K3StructuralTagFilter {
+    /// Drop a channel name and separator whose `<|open|>` never arrived.
+    ///
+    /// Reaching a new channel means the parser consumed a *complete* marker to
+    /// get here, so a leading `response<|sep|>` at that boundary is the tail of
+    /// a second, malformed one -- the shape behind the reasoning-only stops of
+    /// 2026-08-09. The same bytes mid-channel are ordinary text and are left
+    /// alone, which is why this is keyed on an observed transition and never on
+    /// start of stream: a non-thinking prompt ends at `<|open|>response<|sep|>`,
+    /// so the first generated text was never preceded by a marker at all.
+    ///
+    /// Returns true while the candidate is still incomplete and must be held.
+    fn hold_bare_channel_open(&mut self) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        for name in K3_CHANNEL_NAMES {
+            let Some(rest) = self.pending.strip_prefix(name) else {
+                if name.starts_with(self.pending.as_str()) {
+                    return true;
+                }
+                continue;
+            };
+            if let Some(after) = rest.strip_prefix(K3_SEP) {
+                self.pending = after.to_string();
+                self.logprobs_tainted = true;
+                self.at_channel_start = false;
+                return false;
+            }
+            if K3_SEP.starts_with(rest) {
+                return true;
+            }
+        }
+        self.at_channel_start = false;
+        false
+    }
+
     fn push(&mut self, delta: &str) -> String {
         if !self.pending.is_empty() {
             self.logprobs_tainted = true;
         }
         self.pending.push_str(delta);
+        if self.at_channel_start && self.hold_bare_channel_open() {
+            self.logprobs_tainted = true;
+            return String::new();
+        }
         let mut out = String::new();
         loop {
             let Some(at) = self.pending.find('<') else {
@@ -209,8 +260,20 @@ impl K3StructuralTagFilter {
         out
     }
 
+    /// Release what is left, dropping marker debris.
+    ///
+    /// Whatever is still pending is a proper prefix of a structural tag by
+    /// construction -- that is the only thing `push` holds -- so at end of
+    /// stream it is a marker the model started and never finished, not text.
+    /// A lone `<` is the exception: it is far more likely to be real output
+    /// than the start of a tag, so it is kept.
     fn flush(&mut self) -> String {
-        std::mem::take(&mut self.pending)
+        let pending = std::mem::take(&mut self.pending);
+        if pending.len() >= 2 {
+            String::new()
+        } else {
+            pending
+        }
     }
 
     fn take_logprobs_tainted(&mut self) -> bool {
@@ -536,6 +599,35 @@ struct K3OutputFilters {
     /// Parts over scalar Text and would otherwise discard a held prefix when it
     /// is flushed at the end of the stream.
     content_as_parts: bool,
+    /// Channel the previous output belonged to. A change means the parser
+    /// consumed a complete channel marker to get here.
+    last_channel: Option<K3Channel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum K3Channel {
+    Reasoning,
+    Content,
+}
+
+impl K3OutputFilters {
+    /// Note which channel output is about to be written to.
+    ///
+    /// The first channel seen is not a transition: in non-thinking mode the
+    /// prompt already ends at `<|open|>response<|sep|>`, so no marker preceded
+    /// the first generated text and a leading channel name there is prose.
+    fn enter(&mut self, channel: K3Channel) {
+        if self
+            .last_channel
+            .replace(channel)
+            .is_some_and(|last| last != channel)
+        {
+            match channel {
+                K3Channel::Reasoning => self.reasoning.at_channel_start = true,
+                K3Channel::Content => self.content.at_channel_start = true,
+            }
+        }
+    }
 }
 
 fn response_text(text: String, as_parts: bool) -> ChatCompletionMessageContent {
@@ -693,6 +785,7 @@ impl ChoiceState {
             UnifiedParserEvent::Text(text) => {
                 let (text, as_parts, tainted_logprobs) = match self.k3_output_filters.as_mut() {
                     Some(filters) => {
+                        filters.enter(K3Channel::Content);
                         let text = filters.content.push(&text);
                         (
                             text,
@@ -713,6 +806,7 @@ impl ChoiceState {
             UnifiedParserEvent::Reasoning(reasoning) => {
                 let (reasoning, tainted_logprobs) = match self.k3_output_filters.as_mut() {
                     Some(filters) => {
+                        filters.enter(K3Channel::Reasoning);
                         let reasoning = filters.reasoning.push(&reasoning);
                         (reasoning, filters.reasoning.take_logprobs_tainted())
                     }
@@ -738,6 +832,7 @@ impl ChoiceState {
         let Some(filters) = self.k3_output_filters.as_mut() else {
             return Some(reasoning);
         };
+        filters.enter(K3Channel::Reasoning);
         let reasoning = filters.reasoning.push(&reasoning);
         let tainted_logprobs = filters.reasoning.take_logprobs_tainted();
         if tainted_logprobs {
@@ -780,6 +875,7 @@ impl ChoiceState {
         let Some(filters) = self.k3_output_filters.as_mut() else {
             return parts;
         };
+        filters.enter(K3Channel::Content);
         filters.content_as_parts = true;
 
         let mut filtered = Vec::with_capacity(parts.len());
@@ -1382,7 +1478,6 @@ mod k3_output_containment_tests {
     fn preserves_bare_partial_near_and_invalid_attribute_markers() {
         let literals = [
             "constants: <|open|>, <|close|>, and <|sep|>",
-            "incomplete <|close|>mess",
             "near <|closer|>message<|sep|>",
             r#"example <|open|>call tool="Bash" index="0"<|sep|>"#,
             r#"example <|open|>argument key="x" type="imaginary"<|sep|>"#,
@@ -1406,8 +1501,79 @@ mod k3_output_containment_tests {
         let mut filters = K3OutputFilters::default();
         assert_eq!(filters.content.push("<|close|>res"), "");
         assert_eq!(filters.reasoning.push("ponse<|sep|>"), "ponse<|sep|>");
-        assert_eq!(filters.content.flush(), "<|close|>res");
+        assert_eq!(filters.content.flush(), "");
         assert_eq!(filters.reasoning.flush(), "");
+    }
+
+    #[test]
+    fn drops_a_marker_the_model_never_finished() {
+        // Whatever survives to end of stream is a proper prefix of a structural
+        // tag -- that is the only thing `push` holds -- so it is a marker the
+        // model started and abandoned, not text. A lone `<` is the exception.
+        for chunk in [0usize, 1, 3, 7] {
+            assert_eq!(run("incomplete <|close|>mess", chunk), "incomplete ");
+            assert_eq!(run("truncated <|open|>tools", chunk), "truncated ");
+            assert_eq!(run("dangling <", chunk), "dangling <");
+        }
+    }
+
+    #[test]
+    fn strips_a_channel_open_that_lost_its_open_marker() {
+        // The reasoning-only stops of 2026-08-09: the model closed think, then
+        // emitted `response<|sep|>` with no `<|open|>`. Crossing into a channel
+        // means a complete marker was consumed to get there, so a channel name
+        // at that boundary is the tail of a second, malformed one.
+        for chunk in [0usize, 1, 3, 7] {
+            let mut filters = K3OutputFilters::default();
+            filters.enter(K3Channel::Reasoning);
+            assert_eq!(
+                filters.reasoning.push("thinking out loud"),
+                "thinking out loud"
+            );
+
+            filters.enter(K3Channel::Content);
+            let text = "response<|sep|>the answer";
+            let mut out = String::new();
+            if chunk == 0 {
+                out.push_str(&filters.content.push(text));
+            } else {
+                let chars: Vec<char> = text.chars().collect();
+                for piece in chars.chunks(chunk) {
+                    out.push_str(&filters.content.push(&piece.iter().collect::<String>()));
+                }
+            }
+            out.push_str(&filters.content.flush());
+            assert_eq!(out, "the answer", "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn keeps_a_channel_name_that_is_ordinary_prose() {
+        let mut filters = K3OutputFilters::default();
+        filters.enter(K3Channel::Reasoning);
+        assert_eq!(filters.reasoning.push("weighing it"), "weighing it");
+
+        // Same word, same boundary, but no separator follows: plain text.
+        filters.enter(K3Channel::Content);
+        assert_eq!(
+            filters.content.push("response times look fine"),
+            "response times look fine"
+        );
+
+        // And mid-channel the sequence is never touched.
+        assert_eq!(
+            filters.content.push(" -- `response<|sep|>` is the marker"),
+            " -- `response<|sep|>` is the marker"
+        );
+    }
+
+    #[test]
+    fn first_channel_is_not_treated_as_a_transition() {
+        // A non-thinking prompt ends at `<|open|>response<|sep|>`, so the first
+        // generated text was never preceded by a marker in the output stream.
+        let mut filters = K3OutputFilters::default();
+        filters.enter(K3Channel::Content);
+        assert_eq!(filters.content.push("response<|sep|>"), "response<|sep|>");
     }
 
     #[test]
