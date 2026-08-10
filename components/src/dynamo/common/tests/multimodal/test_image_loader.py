@@ -297,6 +297,43 @@ def _make_image_bytes(image_format: str) -> bytes:
     return buffer.getvalue()
 
 
+def _make_heif_sequence_bytes() -> bytes:
+    """Create a two-frame HEIF sequence without using Pillow's plugin.
+
+    Encoding needs pillow-heif: the runtime dependency is pi-heif, the
+    decode-only build of the same project, which ships no encoder. pillow-heif
+    is therefore a test-only dependency (requirements.test.txt) and must not be
+    imported at module scope -- it is absent from the runtime image, whose
+    license policy denies its bundled GPL-2.0 x265 encoder.
+    """
+    pillow_heif = pytest.importorskip(
+        "pillow_heif", reason="HEIF encoding is test-only; see requirements.test.txt"
+    )
+    primary = Image.new("RGB", (8, 6), color="red")
+    secondary = Image.new("RGB", (8, 6), color="blue")
+    heif_file = pillow_heif.from_pillow(primary)
+    heif_file.add_from_pillow(secondary)
+
+    buffer = BytesIO()
+    heif_file.save(buffer, quality=-1)
+    encoded = bytearray(buffer.getvalue())
+    assert encoded[4:8] == b"ftyp"
+    encoded[8:12] = b"msf1"
+    return bytes(encoded)
+
+
+async def test_open_image_sync_decodes_primary_heif_frame_as_rgb() -> None:
+    """HEIF sequences preserve the single-image contract by loading frame zero."""
+    image = ImageLoader._open_image_sync(BytesIO(_make_heif_sequence_bytes()))
+
+    assert image.size == (8, 6)
+    assert image.mode == "RGB"
+    red, green, blue = image.getpixel((0, 0))
+    assert red > 250
+    assert green < 5
+    assert blue < 5
+
+
 async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
     """Fetching a URL that returns an unsupported image format (e.g. SVG) should raise
     HttpStatusError with status 415, not 500."""
@@ -307,7 +344,7 @@ async def test_unsupported_format_url_raises_415(loader: ImageLoader) -> None:
         assert exc_info.value.status == 415
 
 
-@pytest.mark.parametrize("image_format", ["GIF", "BMP", "TIFF"])
+@pytest.mark.parametrize("image_format", ["BMP", "TIFF"])
 async def test_identifiable_blocked_format_raises_415(
     loader: ImageLoader, image_format: str
 ) -> None:
@@ -406,3 +443,67 @@ async def test_cache_is_lru_not_fifo(loader: ImageLoader) -> None:
     assert "https://example.com/b.png" not in loader._image_cache
     assert "https://example.com/c.png" in loader._image_cache
     assert "https://example.com/d.png" in loader._image_cache
+
+
+async def test_load_image_batch_bounds_concurrency() -> None:
+    """load_image_batch must never have more than fetch_concurrency images
+    fetching+decoding at once.
+
+    Regression test: the batch previously did
+    ``asyncio.gather(*[self.load_image(u) for u in urls])`` with no bound, so a
+    request with N images materialised N decoded RGB bitmaps in host memory
+    simultaneously. A 1000-image request OOM-killed a 200Gi prefill worker
+    (cgroup SIGKILL, exit 137). DYN_MM_IMAGE_MAX_BYTES does not help -- it caps
+    the ENCODED payload, while the decoded form is what accumulates.
+    """
+    limit = 4
+    total = 40
+    in_flight = 0
+    peak = 0
+
+    loader = ImageLoader(
+        cache_size=1,  # tiny cache so every url is a real fetch, not a cache hit
+        url_policy=_permissive_policy(),
+        fetch_concurrency=limit,
+    )
+
+    async def _tracking_fetch(url: str, *args, **kwargs) -> bytes:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.005)  # hold the slot so overlap is observable
+            return _make_image_bytes("PNG")
+        finally:
+            in_flight -= 1
+
+    items = [{URL_VARIANT_KEY: f"http://example.com/{i}.png"} for i in range(total)]
+    with patch(_FETCH_BYTES_PATH, side_effect=_tracking_fetch):
+        results = await loader.load_image_batch(items)
+
+    assert len(results) == total
+    assert peak <= limit, f"peak in-flight {peak} exceeded fetch_concurrency {limit}"
+
+
+async def test_load_image_batch_preserves_order_under_bound() -> None:
+    """Bounding concurrency must not reorder results w.r.t. image_mm_items."""
+    loader = ImageLoader(
+        cache_size=1,
+        url_policy=_permissive_policy(),
+        fetch_concurrency=2,
+    )
+    sizes = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7)]
+
+    async def _sized_fetch(url: str, *args, **kwargs) -> bytes:
+        idx = int(url.rsplit("/", 1)[-1].split(".")[0])
+        buffer = BytesIO()
+        Image.new("RGB", sizes[idx], color="red").save(buffer, format="PNG")
+        # later items return faster, so an unordered impl would visibly reorder
+        await asyncio.sleep((len(sizes) - idx) * 0.001)
+        return buffer.getvalue()
+
+    items = [{URL_VARIANT_KEY: f"http://example.com/{i}.png"} for i in range(len(sizes))]
+    with patch(_FETCH_BYTES_PATH, side_effect=_sized_fetch):
+        results = await loader.load_image_batch(items)
+
+    assert [im.size for im in results] == sizes

@@ -11,6 +11,10 @@ from io import BytesIO
 from typing import Any, Dict, Final, List
 from urllib.parse import urlparse
 
+# pi-heif, not pillow-heif: the decode-only build of the same project, which
+# omits the GPL-2.0 x265 encoder that our license policy denies. Identical API,
+# and Dynamo only ever decodes HEIF here.
+from pi_heif import register_heif_opener
 from PIL import Image
 
 from dynamo.common.utils import nvtx_utils as _nvtx
@@ -31,11 +35,23 @@ from ..http.url_validator import (
 
 logger = logging.getLogger(__name__)
 
+register_heif_opener()
+
 # Constants for multimodal data variants
 URL_VARIANT_KEY: Final = "Url"
 DECODED_VARIANT_KEY: Final = "Decoded"
 DEFAULT_MAX_IMAGE_BYTES: Final = int(
     os.environ.get("DYN_MM_IMAGE_MAX_BYTES", str(10 * 1024 * 1024))
+)
+# Upper bound on how many images are fetched+decoded concurrently by
+# load_image_batch(). Without a bound, a request carrying N images materialises
+# N decoded RGB bitmaps in host memory at once: a 1000-image request OOM-killed a
+# 200Gi prefill worker (cgroup SIGKILL, exit 137) after ~200s of ingest. The
+# decoded form is far larger than the encoded bytes DYN_MM_IMAGE_MAX_BYTES caps,
+# so that limit does not constrain the peak. Ordering is unaffected -- results are
+# still zipped back against image_mm_items positionally.
+DEFAULT_FETCH_CONCURRENCY: Final = max(
+    1, int(os.environ.get("DYN_MM_FETCH_CONCURRENCY", "32"))
 )
 
 
@@ -82,6 +98,7 @@ class ImageLoader:
         enable_frontend_decoding: bool = False,
         url_policy: UrlValidationPolicy | None = None,
         max_image_bytes: int | None = DEFAULT_MAX_IMAGE_BYTES,
+        fetch_concurrency: int = DEFAULT_FETCH_CONCURRENCY,
     ):
         """
         Initialize the ImageLoader with caching, HTTP settings, and optional NIXL config for
@@ -90,6 +107,10 @@ class ImageLoader:
         Args:
             cache_size: Maximum number of images to store in the in-memory LRU cache.
                 Defaults to CACHE_SIZE_MAXIMUM.
+            fetch_concurrency: Maximum images fetched+decoded concurrently by
+                load_image_batch. Bounds peak host memory, which scales with this
+                value rather than with the number of images in the request.
+                Defaults to DEFAULT_FETCH_CONCURRENCY.
             http_timeout: Timeout in seconds for HTTP requests when fetching remote images.
                 Defaults to 30.0 seconds.
             enable_frontend_decoding: If True, enables NIXL RDMA for transferring
@@ -102,6 +123,7 @@ class ImageLoader:
         """
         self._http_timeout = http_timeout
         self._cache_size = cache_size
+        self._fetch_concurrency = max(1, fetch_concurrency)
         self._image_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self._inflight: dict[str, asyncio.Task[Image.Image]] = {}
         self._enable_frontend_decoding = enable_frontend_decoding
@@ -127,11 +149,12 @@ class ImageLoader:
                 raise _UnsupportedImageFormatError("Unsupported image format: SVG")
 
             image = Image.open(image_data)
-            if image.format not in ("JPEG", "PNG", "WEBP", "GIF"):
+            if image.format not in ("JPEG", "PNG", "WEBP", "GIF", "HEIF"):
                 raise _UnsupportedImageFormatError(
                     f"Unsupported image format: {image.format}"
                 )
-            # Image.open() is lazy — convert() forces the actual pixel decode.
+            # Image.open() is lazy. Converting forces the current primary frame's
+            # pixel decode while preserving Dynamo's single-image contract.
             return image.convert("RGB")
         except _UnsupportedImageFormatError:
             raise
@@ -332,20 +355,30 @@ class ImageLoader:
             Exception: If any image fails to load for any other reason
             ValueError: If enable_frontend_decoding=True but nixl_connector is None
         """
+        # Semaphore is created here, not in __init__, so it binds to the running
+        # loop of the call rather than whichever loop existed at construction.
+        semaphore = asyncio.Semaphore(self._fetch_concurrency)
+
+        async def _bounded(coro):
+            async with semaphore:
+                return await coro
+
         image_futures = []
 
         for item in image_mm_items:
             if isinstance(item, dict) and URL_VARIANT_KEY in item:
                 # URL path: download and decode in Python backend
                 url = item[URL_VARIANT_KEY]
-                image_futures.append(self.load_image(url))
+                image_futures.append(_bounded(self.load_image(url)))
                 logger.debug(f"Preparing to load image from URL: {url[:80]}...")
             elif isinstance(item, dict) and DECODED_VARIANT_KEY in item:
                 if self._enable_frontend_decoding:
                     metadata = item[DECODED_VARIANT_KEY]
                     if self._nixl_connector is None:
                         raise RuntimeError("NIXL connector is not initialized")
-                    image_futures.append(self._read_and_convert_nixl_image(metadata))
+                    image_futures.append(
+                        _bounded(self._read_and_convert_nixl_image(metadata))
+                    )
                 else:
                     logger.error(
                         "Received Decoded multimodal data but enable_frontend_decoding=False. "
@@ -353,7 +386,8 @@ class ImageLoader:
                     )
                     raise ValueError("Could not load decoded media from frontend")
 
-        # Process images in parallel
+        # Process images in parallel, at most self._fetch_concurrency in flight so
+        # peak host memory scales with the bound rather than with len(image_mm_items).
         results = await asyncio.gather(*image_futures, return_exceptions=True)
         loaded_images = []
         collective_exceptions = ""
