@@ -214,6 +214,7 @@ llm-tokenizer = { version = "=1.4.1", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+vllm-tokenizer = { workspace = true, features = ["test-utils"] }
 approx = "0.5"
 assert_matches = "1.5"
 criterion = { version = "0.5", features = ["html_reports"] }

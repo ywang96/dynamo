@@ -77,6 +77,7 @@ impl OpenAIPreprocessor {
                 self.runtime_config.structural_tag_mode,
                 &convert_tool_choice(tool_choice),
                 &convert_tools(&tools),
+                prompt_injected_reasoning,
                 common_request,
             );
         }
@@ -111,10 +112,15 @@ impl OpenAIPreprocessor {
     }
 }
 
+/// `prompt_injected_reasoning` is K3's effective thinking flag: the renderer
+/// ends the prompt at `<|open|>think<|sep|>` when it is set and
+/// `<|open|>response<|sep|>` when it is not. The grammar needs it to know which
+/// marker the model still owes -- see `build_kimi_k3_structural_tag`.
 fn apply_kimi_k3_structural_tag(
     structural_tag_mode: StructuralTagMode,
     tool_choice: &ToolChoice,
     tools: &[ToolDefinition],
+    prompt_injected_reasoning: bool,
     common_request: &mut PreprocessedRequest,
 ) -> Result<bool, DynamoError> {
     if matches!(tool_choice, ToolChoice::Named(_)) {
@@ -127,8 +133,9 @@ fn apply_kimi_k3_structural_tag(
         return Ok(false);
     }
 
-    let Some(structural_tag) = build_kimi_k3_structural_tag(tool_choice, tools)
-        .map_err(|err| invalid_argument(err.to_string()))?
+    let Some(structural_tag) =
+        build_kimi_k3_structural_tag(tool_choice, tools, prompt_injected_reasoning)
+            .map_err(|err| invalid_argument(err.to_string()))?
     else {
         return Ok(false);
     };
@@ -205,6 +212,139 @@ mod tests {
         }
     }
 
+    /// Every marker a branch may legally begin with. A mandatory element ends
+    /// the walk: nothing after it can be the first thing the model emits.
+    fn first_markers(format: &serde_json::Value, out: &mut Vec<String>) {
+        match format["type"].as_str() {
+            Some("sequence") => {
+                for element in format["elements"].as_array().unwrap() {
+                    first_markers(element, out);
+                    if element["type"] != "optional" {
+                        return;
+                    }
+                }
+            }
+            Some("or") => {
+                for element in format["elements"].as_array().unwrap() {
+                    first_markers(element, out);
+                }
+            }
+            Some("optional") => first_markers(&format["content"], out),
+            Some("const_string") => out.push(format["value"].as_str().unwrap().to_string()),
+            Some("tag") => out.push(format["begin"].as_str().unwrap().to_string()),
+            other => out.push(format!("<free text: {}>", other.unwrap_or("?"))),
+        }
+    }
+
+    fn applied_tag(
+        choice: &ToolChoice,
+        tools: &[ToolDefinition],
+        thinking: bool,
+    ) -> Option<serde_json::Value> {
+        let mut request = preprocessed_request();
+        let applied = apply_kimi_k3_structural_tag(
+            StructuralTagMode::On,
+            choice,
+            tools,
+            thinking,
+            &mut request,
+        )
+        .unwrap();
+        if !applied {
+            return None;
+        }
+        Some(
+            request
+                .sampling_options
+                .guided_decoding
+                .unwrap()
+                .structural_tag
+                .unwrap(),
+        )
+    }
+
+    /// A thinking-on turn may only begin at a channel-open marker. If free text
+    /// or `<|close|>message<|sep|>` were reachable first, a model reaching to
+    /// end the turn would commit part of that marker before the exclusion
+    /// masked its final token, and strand mid-marker.
+    #[test]
+    fn k3_thinking_on_only_ever_starts_at_a_channel_open_marker() {
+        let tools = [tool("lookup", None)];
+        for (label, choice, tools) in [
+            ("auto", ToolChoice::Auto, &tools[..]),
+            ("required", ToolChoice::Required, &tools[..]),
+            ("none", ToolChoice::None, &tools[..]),
+            ("auto/no-tools", ToolChoice::Auto, &[][..]),
+            ("none/no-tools", ToolChoice::None, &[][..]),
+        ] {
+            let tag = applied_tag(&choice, tools, true)
+                .unwrap_or_else(|| panic!("{label} must attach a structural tag"));
+            let mut markers = Vec::new();
+            first_markers(&tag["format"], &mut markers);
+            assert!(
+                markers
+                    .iter()
+                    .all(|m| m == "<|open|>response<|sep|>" || m == "<|open|>tools<|sep|>"),
+                "{label}: only channel-open markers may start the turn, got {markers:?}"
+            );
+        }
+    }
+
+    /// The 2026-08-08 BEAM shape: no tools, thinking on. Without a constraint
+    /// the model could answer inside the think channel and stop -- 49 of 700
+    /// rows, none of which sent a tool.
+    #[test]
+    fn k3_empty_tools_thinking_on_constrains_the_response_channel() {
+        let tag = applied_tag(&ToolChoice::Auto, &[], true)
+            .expect("no-tools thinking-on must attach a response-only constraint");
+        let elements = tag["format"]["elements"].as_array().unwrap();
+
+        assert_eq!(elements.len(), 3, "{tag}");
+        assert_eq!(elements[0]["value"], "<|open|>response<|sep|>");
+        assert_eq!(elements[1]["end"], "<|close|>response<|sep|>");
+        assert_eq!(elements[2]["content"]["value"], "<|close|>message<|sep|>");
+        assert!(
+            elements
+                .iter()
+                .all(|e| e["begin"] != "<|open|>tools<|sep|>"),
+            "no tools channel should be emitted: {tag}"
+        );
+    }
+
+    /// `required` with nothing to call is unsatisfiable, and with thinking off
+    /// the prompt has already opened the response channel. Both build nothing,
+    /// exactly as before.
+    #[test]
+    fn k3_empty_tools_builds_nothing_when_it_cannot_help() {
+        assert!(applied_tag(&ToolChoice::Required, &[], true).is_none());
+        for choice in [ToolChoice::Auto, ToolChoice::None, ToolChoice::Required] {
+            assert!(
+                applied_tag(&choice, &[], false).is_none(),
+                "thinking-off empty tools must stay unconstrained"
+            );
+        }
+    }
+
+    /// Thinking off keeps the permissive shape on every tool policy: the prompt
+    /// already emitted the response-open marker, so it stays optional.
+    #[test]
+    fn k3_thinking_off_keeps_the_optional_response_open_marker() {
+        let tools = [tool("lookup", None)];
+        for (label, choice) in [
+            ("auto", ToolChoice::Auto),
+            ("required", ToolChoice::Required),
+            ("none", ToolChoice::None),
+        ] {
+            let tag = applied_tag(&choice, &tools, false)
+                .unwrap_or_else(|| panic!("{label} must attach a structural tag"));
+            assert!(
+                tag.to_string()
+                    .contains(r#"{"type":"optional","content":{"type":"const_string","value":"<|open|>response<|sep|>"}}"#),
+                "{label}: response-open must stay optional with thinking off: {tag}"
+            );
+        }
+    }
+
     #[test]
     fn k3_required_attaches_structural_tag_for_backend_xgrammar() {
         let mut request = preprocessed_request();
@@ -213,6 +353,7 @@ mod tests {
             StructuralTagMode::On,
             &ToolChoice::Required,
             &[tool("lookup", None)],
+            true,
             &mut request,
         )
         .unwrap();
@@ -234,6 +375,7 @@ mod tests {
             StructuralTagMode::On,
             &ToolChoice::None,
             &[tool("lookup", None)],
+            true,
             &mut request,
         )
         .unwrap();
@@ -262,6 +404,7 @@ mod tests {
             StructuralTagMode::Off,
             &ToolChoice::Named("second".into()),
             &[tool("first", None), tool("second", None)],
+            true,
             &mut request,
         )
         .unwrap_err();
@@ -282,6 +425,7 @@ mod tests {
                 StructuralTagMode::Off,
                 &ToolChoice::Required,
                 &[tool("lookup", None)],
+            true,
                 &mut request,
             )
             .unwrap()
@@ -298,6 +442,7 @@ mod tests {
                 StructuralTagMode::On,
                 &ToolChoice::Auto,
                 &[tool("lookup", None)],
+            true,
                 &mut request,
             )
             .unwrap()
@@ -337,6 +482,7 @@ mod tests {
                 StructuralTagMode::On,
                 &convert_tool_choice(request.inner.tool_choice.as_ref().unwrap()),
                 &convert_tools(&request.effective_tools()),
+            true,
                 &mut preprocessed,
             )
             .unwrap()

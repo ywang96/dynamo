@@ -15,7 +15,10 @@ use crate::protocols::{
     openai::ParsingOptions,
 };
 
-use dynamo_protocols::types::ChatCompletionMessageContent;
+use dynamo_protocols::types::{
+    ChatCompletionMessageContent, ChatCompletionResponseContentPart,
+    ChatCompletionResponseContentPartText,
+};
 use dynamo_runtime::engine::DataStream;
 
 fn is_harmony_parser(parser: &str) -> bool {
@@ -82,6 +85,42 @@ struct DeltaChoice {
 
     /// Accumulated content parts for multimodal responses
     content_parts: Vec<dynamo_protocols::types::ChatCompletionResponseContentPart>,
+
+    /// Once a typed content-parts delta arrives, convert all earlier and later
+    /// scalar text into ordered text parts so unary aggregation cannot discard
+    /// one representation in favor of the other.
+    saw_content_parts: bool,
+}
+
+impl DeltaChoice {
+    fn append_content(&mut self, content: &ChatCompletionMessageContent) {
+        match content {
+            ChatCompletionMessageContent::Text(text) if self.saw_content_parts => {
+                if !text.is_empty() {
+                    self.text.push_str(text);
+                    self.content_parts
+                        .push(ChatCompletionResponseContentPart::Text(
+                            ChatCompletionResponseContentPartText { text: text.clone() },
+                        ));
+                }
+            }
+            ChatCompletionMessageContent::Text(text) => self.text.push_str(text),
+            ChatCompletionMessageContent::Parts(parts) => {
+                if !self.saw_content_parts {
+                    self.saw_content_parts = true;
+                    if !self.text.is_empty() {
+                        self.content_parts
+                            .push(ChatCompletionResponseContentPart::Text(
+                                ChatCompletionResponseContentPartText {
+                                    text: self.text.clone(),
+                                },
+                            ));
+                    }
+                }
+                self.content_parts.extend(parts.clone());
+            }
+        }
+    }
 }
 
 impl Default for DeltaAggregator {
@@ -264,6 +303,7 @@ impl DeltaAggregator {
                                     tool_calls: None,
                                     reasoning_content: None,
                                     content_parts: Vec::new(),
+                                    saw_content_parts: false,
                                 });
 
                         if state_choice.role.is_none() {
@@ -272,14 +312,7 @@ impl DeltaAggregator {
 
                         // Handle content based on type
                         if let Some(content) = &choice.delta.content {
-                            match content {
-                                ChatCompletionMessageContent::Text(text) => {
-                                    state_choice.text.push_str(text);
-                                }
-                                ChatCompletionMessageContent::Parts(parts) => {
-                                    state_choice.content_parts.extend(parts.clone());
-                                }
-                            }
+                            state_choice.append_content(content);
                         }
 
                         if let Some(reasoning_content) = &choice.delta.reasoning_content {
@@ -1017,6 +1050,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mixed_text_and_parts_preserve_all_content_in_stream_order() {
+        let text_before = create_test_delta(
+            0,
+            "before",
+            Some(dynamo_protocols::types::Role::Assistant),
+            None,
+            None,
+            None,
+        );
+        let mut parts = create_test_delta(0, "", None, None, None, None);
+        parts.data.as_mut().unwrap().inner.choices[0].delta.content =
+            Some(ChatCompletionMessageContent::Parts(vec![
+                ChatCompletionResponseContentPart::Text(ChatCompletionResponseContentPartText {
+                    text: "middle".to_string(),
+                }),
+            ]));
+        let text_after = create_test_delta(
+            0,
+            "after",
+            None,
+            Some(dynamo_protocols::types::FinishReason::Stop),
+            None,
+            None,
+        );
+
+        let response = DeltaAggregator::apply(
+            Box::pin(stream::iter(vec![text_before, parts, text_after])),
+            ParsingOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.inner.choices[0].message.content,
+            Some(ChatCompletionMessageContent::Parts(vec![
+                ChatCompletionResponseContentPart::Text(ChatCompletionResponseContentPartText {
+                    text: "before".to_string(),
+                },),
+                ChatCompletionResponseContentPart::Text(ChatCompletionResponseContentPartText {
+                    text: "middle".to_string(),
+                },),
+                ChatCompletionResponseContentPart::Text(ChatCompletionResponseContentPartText {
+                    text: "after".to_string(),
+                },),
+            ]))
+        );
+    }
+
+    #[tokio::test]
     async fn test_missing_stream_role_defaults_to_assistant_without_panic() {
         let deltas = vec![
             create_test_delta(0, "Hello,", None, None, None, None),
@@ -1720,6 +1802,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("Analyzing the question.".to_string()),
             content_parts: vec![],
+            saw_content_parts: false,
         };
 
         let choice: dynamo_protocols::types::ChatChoice = delta.into();
