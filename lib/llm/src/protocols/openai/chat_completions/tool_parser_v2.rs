@@ -432,6 +432,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
         Annotated {
             data: Some(response),

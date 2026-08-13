@@ -418,6 +418,13 @@ pub struct NvCreateChatCompletionStreamResponse {
     /// injects it as `choices[0].usage` on the wire.
     #[serde(skip)]
     pub choice_usage: Option<dynamo_protocols::types::CompletionUsage>,
+    /// Token ids behind this frame's increment (Kimi streaming spec P0.5,
+    /// `stream_options.include_internal_content`). Only set when the request
+    /// opted in; carried out of band for the same external-type reason as
+    /// `choice_usage` and injected by the manual `Serialize` impl as
+    /// `choices[0].delta.internal_content.token_ids`.
+    #[serde(skip)]
+    pub internal_token_ids: Option<Vec<crate::types::TokenIdType>>,
 }
 
 impl Serialize for NvCreateChatCompletionStreamResponse {
@@ -448,11 +455,31 @@ impl Serialize for NvCreateChatCompletionStreamResponse {
                         .is_some_and(|function| function.name.is_none())
             })
         });
-        if !has_sparse_tool_call_chunks && self.choice_usage.is_none() {
+        if !has_sparse_tool_call_chunks
+            && self.choice_usage.is_none()
+            && self.internal_token_ids.is_none()
+        {
             return shadow.serialize(serializer);
         }
 
         let mut value = serde_json::to_value(&shadow).map_err(serde::ser::Error::custom)?;
+        // Streaming spec P0.5: increment frames carry the token ids behind
+        // their increment as `choices[0].delta.internal_content.token_ids`.
+        // The ids live out of band on this wrapper (see `internal_token_ids`)
+        // because `ChatCompletionStreamResponseDelta` is an external type.
+        if let Some(token_ids) = &self.internal_token_ids
+            && !token_ids.is_empty()
+            && let Some(choice) = value
+                .get_mut("choices")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|choices| choices.first_mut())
+            && let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut())
+        {
+            delta.insert(
+                "internal_content".to_string(),
+                serde_json::json!({ "token_ids": token_ids }),
+            );
+        }
         // Streaming spec P0.4 / §5.5: the candidate's end frame carries
         // `choices[0].usage`. The field lives out of band on this wrapper
         // (see `choice_usage`) because `ChatChoiceStream` is an external type.
@@ -507,6 +534,7 @@ pub(super) fn stream_choice_chunk_from_template(
     let mut response = template.clone();
     response.inner.usage = None;
     response.llm_metrics = None;
+    response.internal_token_ids = None;
     #[allow(deprecated)]
     let choice = ChatChoiceStream {
         index,

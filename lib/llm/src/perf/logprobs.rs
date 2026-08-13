@@ -978,6 +978,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 
@@ -1021,6 +1022,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 
@@ -1367,6 +1369,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
 
         let logprobs = response.extract_logprobs_by_choice();
@@ -1586,6 +1589,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 

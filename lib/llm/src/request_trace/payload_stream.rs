@@ -245,6 +245,7 @@ pub fn final_response_to_one_chunk_stream(
         nvext: resp.nvext.clone(),
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     };
 
     let annotated = Annotated {
@@ -301,6 +302,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
 
         Annotated {
@@ -343,6 +345,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
 
         Annotated {
@@ -387,6 +390,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
 
         Annotated {
@@ -431,6 +435,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
 
         Annotated {
@@ -677,6 +682,7 @@ mod tests {
                 nvext: None,
                 llm_metrics: None,
                 choice_usage: None,
+                internal_token_ids: None,
             }),
             id: Some("correlation-123".to_string()),
             event: Some("test-event".to_string()),

@@ -263,6 +263,22 @@ static DIM_FETCH_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
 pub(crate) const PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY: &str =
     "dynamo.llm.preserve_omitted_max_tokens";
 
+/// Context key carrying the raw-body `stream_options.include_internal_content`
+/// flag (Kimi streaming spec P0.5). The typed `ChatCompletionStreamOptions`
+/// (external dynamo-protocols crate) has no such field, so the HTTP handler
+/// extracts it from the raw body and inserts it here for the preprocessor.
+pub(crate) const INCLUDE_INTERNAL_CONTENT_CONTEXT_KEY: &str = "dynamo.llm.include_internal_content";
+
+/// Context key for the P0.18 usage-header cell. The handler inserts a fresh
+/// cell per request; the preprocessor writes `(prompt_tokens, cached_tokens)`
+/// once routing has recorded them (inside `engine.generate()`, before the
+/// response headers are committed).
+pub(crate) const USAGE_HEADERS_CONTEXT_KEY: &str = "dynamo.llm.usage_headers";
+
+/// Shared cell for the P0.18 `X-Msh-Usage-Prompt-Tokens` /
+/// `X-Msh-Usage-Cached-Tokens` streaming response headers.
+pub(crate) type UsageHeaderCell = std::sync::OnceLock<(u64, u64)>;
+
 fn attach_agent_context_from_context(
     request: &mut PreprocessedRequest,
     context: &PipelineContext<()>,
@@ -2885,6 +2901,9 @@ impl OpenAIPreprocessor {
             /// the wrapper-level `choice_usage` must be buffered across the
             /// boundary and reattached to the emitted finish frame.
             choice_usage: Option<dynamo_protocols::types::CompletionUsage>,
+            /// P0.5: token ids behind swallowed increments, in stream order;
+            /// attached to the next emitted increment frame.
+            internal_token_ids: Vec<TokenIdType>,
         }
         let pending = Arc::new(Mutex::new(PendingMetrics::default()));
         let pending_in = Arc::clone(&pending);
@@ -2899,6 +2918,14 @@ impl OpenAIPreprocessor {
             if let Some(choice_usage) = a.data.as_mut().and_then(|nv| nv.choice_usage.take()) {
                 let mut p = pending_in.lock().expect("jail metrics buffer poisoned");
                 p.choice_usage = Some(choice_usage);
+            }
+            // P0.5: the jail swallows increments while accumulating a tool call
+            // and re-emits on different boundaries; buffer the token ids behind
+            // those increments (in stream order) and attach them to the frame
+            // that finally emits the corresponding increment.
+            if let Some(token_ids) = a.data.as_mut().and_then(|nv| nv.internal_token_ids.take()) {
+                let mut p = pending_in.lock().expect("jail metrics buffer poisoned");
+                p.internal_token_ids.extend(token_ids);
             }
             JailAnnotated {
                 data: a.data.map(|nv| nv.inner),
@@ -2947,12 +2974,31 @@ impl OpenAIPreprocessor {
             } else {
                 None
             };
+            // P0.5: attach the buffered token ids to the emitted frame carrying
+            // an increment (spec forbids empty token_ids; frames without an
+            // increment must not carry internal_content — keep buffering).
+            let internal_token_ids = a
+                .data
+                .as_ref()
+                .is_some_and(|inner| {
+                    inner
+                        .choices
+                        .iter()
+                        .any(|choice| wire_shape::delta_has_increment(&choice.delta))
+                })
+                .then(|| {
+                    let mut p = pending.lock().expect("jail metrics buffer poisoned");
+                    (!p.internal_token_ids.is_empty())
+                        .then(|| std::mem::take(&mut p.internal_token_ids))
+                })
+                .flatten();
             Annotated {
                 data: a.data.map(|inner| NvCreateChatCompletionStreamResponse {
                     inner,
                     nvext: None,
                     llm_metrics,
                     choice_usage,
+                    internal_token_ids,
                 }),
                 id: a.id,
                 event: a.event,
@@ -3550,8 +3596,23 @@ impl
         );
 
         // create a response generator
-        let response_generator = request.response_generator(context.id().to_string());
+        let mut response_generator = request.response_generator(context.id().to_string());
+        // Streaming spec P0.5: `stream_options.include_internal_content` cannot
+        // ride the typed stream options (external crate); the HTTP handler
+        // extracted it from the raw body into the request context.
+        if context
+            .get::<bool>(INCLUDE_INTERNAL_CONTENT_CONTEXT_KEY)
+            .ok()
+            .is_some_and(|flag| *flag)
+        {
+            response_generator.set_include_internal_content(true);
+        }
         let tracker = Some(response_generator.tracker());
+        // P0.18: shared cell the handler reads to set the usage headers; filled
+        // below once routing has recorded ISL / cached tokens.
+        let usage_header_cell = context
+            .get::<UsageHeaderCell>(USAGE_HEADERS_CONTEXT_KEY)
+            .ok();
         let preprocess_options = PreprocessRequestOptions {
             preserve_omitted_max_tokens: context
                 .get::<bool>(PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY)
@@ -3660,6 +3721,21 @@ impl
 
         // forward the common completion request to the next operator
         let response_stream = next.generate(common_request).await?;
+
+        // P0.18: publish the usage-header values for the HTTP handler, which
+        // sets them on the response (streaming and non-streaming alike — for
+        // streaming, before the stream starts). Routing (inside the generate
+        // above) records the cached-token count on the tracker. Caveat: if the
+        // backend's final chunk later overrides prompt usage via
+        // `completion_usage`, the headers keep these frontend-computed values —
+        // they exist for stream-interruption accounting, where the final chunk
+        // may never arrive.
+        if let Some(cell) = usage_header_cell {
+            let prompt_tokens = u64::from(response_generator.get_usage().prompt_tokens);
+            let cached_tokens = response_generator.tracker().cached_tokens().unwrap_or(0) as u64;
+            let _ = cell.set((prompt_tokens, cached_tokens));
+        }
+
         // Extract context once
         let context = response_stream.context();
 

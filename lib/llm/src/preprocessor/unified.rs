@@ -975,6 +975,11 @@ impl ChoiceState {
             );
             return None;
         }
+        // Kimi streaming spec P2: tool-call ids are `{function_name}_{index}`
+        // (e.g. `get_weather_0`); vLLM parsers emit `{name}:{index}`. Rewritten
+        // after the structural-tag suppression above so suppression semantics
+        // are unchanged.
+        let id = id.map(spec_tool_call_id);
         self.emitted_tool_calls = true;
 
         Some(ChatCompletionMessageToolCallChunk {
@@ -989,6 +994,22 @@ impl ChoiceState {
     }
 }
 
+/// Kimi streaming spec P2: tool-call ids are `{function_name}_{global_index}`
+/// (matching `^[A-Za-z_][A-Za-z0-9_]*_\d+$`). vLLM parsers generate
+/// `{name}:{index}`; rewrite only a trailing `:<digits>` suffix so other id
+/// shapes (e.g. the `call-{uuid}` fallback) pass through unchanged.
+fn spec_tool_call_id(id: String) -> String {
+    let Some(colon) = id.rfind(':') else {
+        return id;
+    };
+    let (name, index) = id.split_at(colon);
+    let digits = &index[1..];
+    if name.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return id;
+    }
+    format!("{name}_{digits}")
+}
+
 /// Request-scoped unified parser factory and per-choice state.
 struct UnifiedOutputProcessor {
     parser_spec: UnifiedParserSpec,
@@ -998,6 +1019,10 @@ struct UnifiedOutputProcessor {
     choices: HashMap<u32, ChoiceState>,
     spare_parser: Option<Box<dyn UnifiedParser>>,
     last_response: Option<Annotated<NvCreateChatCompletionStreamResponse>>,
+    /// P0.5: token ids behind increments the parser has swallowed but not yet
+    /// re-emitted, in stream order. Attached to the first emitted frame that
+    /// carries an increment (see `wire_shape::attach_token_ids_to_increment`).
+    pending_token_ids: Vec<u32>,
 }
 
 impl UnifiedOutputProcessor {
@@ -1017,6 +1042,7 @@ impl UnifiedOutputProcessor {
             choices: HashMap::new(),
             spare_parser: Some(parser),
             last_response: None,
+            pending_token_ids: Vec::new(),
         })
     }
 
@@ -1050,14 +1076,19 @@ impl UnifiedOutputProcessor {
 
     fn process_response(
         &mut self,
-        response: Annotated<NvCreateChatCompletionStreamResponse>,
+        mut response: Annotated<NvCreateChatCompletionStreamResponse>,
     ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
-        let Some(data) = response.data.as_ref() else {
+        let Some(data) = response.data.as_mut() else {
             return vec![response];
         };
+        // P0.5: buffer the ids behind this frame's increment; they attach to
+        // whichever emitted frame finally carries the corresponding increment.
+        if let Some(token_ids) = data.internal_token_ids.take() {
+            self.pending_token_ids.extend(token_ids);
+        }
+        let source_choices = data.inner.choices.clone();
         self.last_response = Some(response.clone());
 
-        let source_choices = data.inner.choices.clone();
         if source_choices.is_empty() {
             return vec![response];
         }
@@ -1079,7 +1110,9 @@ impl UnifiedOutputProcessor {
             emitted.extend(process_choice(choice, state));
         }
 
-        emit_choices(response, emitted)
+        let mut out = emit_choices(response, emitted);
+        super::wire_shape::attach_token_ids_to_increment(&mut self.pending_token_ids, &mut out);
+        out
     }
 
     fn finish_eof(&mut self) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
@@ -1111,7 +1144,9 @@ impl UnifiedOutputProcessor {
             emitted.extend(choices);
             state.finished = true;
         }
-        emit_choices(response, emitted)
+        let mut out = emit_choices(response, emitted);
+        super::wire_shape::attach_token_ids_to_increment(&mut self.pending_token_ids, &mut out);
+        out
     }
 }
 
@@ -1362,9 +1397,12 @@ mod k3_output_containment_tests {
     use vllm_tokenizer::test_utils::TestTokenizer;
 
     use super::{
-        ChatCompletionMessageContent, ChoiceState, K3_FIXED_STRUCTURAL_TAGS, K3OutputFilters,
-        K3StructuralTagFilter, empty_choice, process_choice, validate_k3_tool_arguments,
+        ChatCompletionMessageContent, ChoiceState, K3_FIXED_STRUCTURAL_TAGS, K3Channel,
+        K3OutputFilters, K3StructuralTagFilter, UnifiedOutputProcessor, UnifiedParserSpec,
+        empty_choice, process_choice, spec_tool_call_id, validate_k3_tool_arguments,
     };
+    use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+    use dynamo_runtime::protocols::annotated::Annotated;
 
     fn text_part(text: impl Into<String>) -> ChatCompletionResponseContentPart {
         ChatCompletionResponseContentPart::Text(ChatCompletionResponseContentPartText {
@@ -1701,7 +1739,7 @@ mod k3_output_containment_tests {
             _tools: &[Tool],
             _tokenizer: DynTokenizer,
         ) -> vllm_parser::unified::Result<Box<dyn UnifiedParser>> {
-            unreachable!("test parser is constructed directly")
+            Ok(Box::new(EchoParser))
         }
 
         fn parse_into(
@@ -2121,5 +2159,162 @@ mod k3_output_containment_tests {
                 .is_none()
         );
         assert!(unsafe_id.suppressed_tool_calls);
+    }
+
+    #[test]
+    fn tool_call_id_rewrites_trailing_colon_index() {
+        // P2: `{name}:{index}` from vLLM parsers becomes `{name}_{index}`.
+        assert_eq!(
+            spec_tool_call_id("get_weather:0".to_string()),
+            "get_weather_0"
+        );
+        assert_eq!(spec_tool_call_id("ns:tool:12".to_string()), "ns:tool_12");
+        // Only a trailing `:<digits>` suffix is rewritten; every other shape
+        // (including the `call-{uuid}` fallback) passes through unchanged.
+        assert_eq!(spec_tool_call_id("call-abc".to_string()), "call-abc");
+        assert_eq!(
+            spec_tool_call_id("get_weather:x".to_string()),
+            "get_weather:x"
+        );
+        assert_eq!(spec_tool_call_id(":0".to_string()), ":0");
+        assert_eq!(
+            spec_tool_call_id("get_weather:".to_string()),
+            "get_weather:"
+        );
+    }
+
+    #[test]
+    fn tool_call_chunk_emits_spec_shaped_id() {
+        let parser = ToolIdParser {
+            id: "get_weather:3".to_string(),
+        };
+        let mut state = ChoiceState::new(Box::new(parser), 0, "other");
+        let chunk = state
+            .tool_call_chunk(ToolCallDelta {
+                tool_index: 3,
+                name: Some("get_weather".to_string()),
+                arguments: "{}".to_string(),
+            })
+            .expect("tool call chunk");
+        assert_eq!(chunk.id.as_deref(), Some("get_weather_3"));
+    }
+
+    /// Parser that swallows every delta and regurgitates the buffered text at
+    /// `finish`, exercising the token-id carry across re-chunked increments.
+    struct BufferingParser {
+        buffered: String,
+    }
+
+    impl UnifiedParser for BufferingParser {
+        fn create(
+            _tools: &[Tool],
+            _tokenizer: DynTokenizer,
+        ) -> vllm_parser::unified::Result<Box<dyn UnifiedParser>> {
+            Ok(Box::new(Self {
+                buffered: String::new(),
+            }))
+        }
+
+        fn parse_into(
+            &mut self,
+            delta: &str,
+            _output: &mut UnifiedParserOutput,
+        ) -> vllm_parser::unified::Result<()> {
+            self.buffered.push_str(delta);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> vllm_parser::unified::Result<UnifiedParserOutput> {
+            let mut output = UnifiedParserOutput::default();
+            output.push_text(std::mem::take(&mut self.buffered));
+            Ok(output)
+        }
+
+        fn reset(&mut self) -> String {
+            std::mem::take(&mut self.buffered)
+        }
+    }
+
+    fn stream_response(
+        choice: super::ChatChoiceStream,
+        token_ids: Option<Vec<u32>>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        Annotated::from_data(NvCreateChatCompletionStreamResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                id: "chatcmpl-test".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "test-model".to_string(),
+                system_fingerprint: None,
+                choices: vec![choice],
+                usage: None,
+                service_tier: None,
+            },
+            nvext: None,
+            llm_metrics: None,
+            choice_usage: None,
+            internal_token_ids: token_ids,
+        })
+    }
+
+    fn content_choice(text: &str) -> super::ChatChoiceStream {
+        let mut choice = empty_choice(0);
+        choice.delta.content = Some(ChatCompletionMessageContent::Text(text.to_string()));
+        choice
+    }
+
+    #[test]
+    fn internal_token_ids_follow_swallowed_increments() {
+        // P0.5: ids behind increments the parser swallows must attach to the
+        // frame that finally emits the corresponding increment.
+        let spec = UnifiedParserSpec {
+            name: "buffering",
+            create: BufferingParser::create,
+        };
+        let tokenizer: DynTokenizer = Arc::new(TestTokenizer::new());
+        let mut processor = UnifiedOutputProcessor::new(spec, vec![], tokenizer, vec![]).unwrap();
+
+        // Swallowed by the parser: nothing emitted, ids buffered.
+        let out = processor.process_response(stream_response(content_choice("hel"), Some(vec![1])));
+        assert!(out.is_empty(), "buffering parser emits nothing mid-stream");
+
+        // The finish frame flushes the buffered text; the emitted increment
+        // carries the swallowed frame's ids plus this frame's own.
+        let mut end = empty_choice(0);
+        end.finish_reason = Some(FinishReason::Stop);
+        let out = processor.process_response(stream_response(end, Some(vec![2])));
+        let increment = out
+            .iter()
+            .filter_map(|a| a.data.as_ref())
+            .find(|data| data.inner.choices.iter().any(|c| c.delta.content.is_some()))
+            .expect("flushed increment frame");
+        assert_eq!(
+            increment.inner.choices[0].delta.content,
+            Some(ChatCompletionMessageContent::Text("hel".to_string()))
+        );
+        assert_eq!(increment.internal_token_ids.as_deref(), Some(&[1, 2][..]));
+        // And it serializes as choices[0].delta.internal_content on the wire.
+        let json = serde_json::to_value(increment).unwrap();
+        assert_eq!(
+            json["choices"][0]["delta"]["internal_content"]["token_ids"],
+            serde_json::json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn internal_token_ids_pass_through_unswallowed_frames() {
+        let spec = UnifiedParserSpec {
+            name: "echo",
+            create: EchoParser::create,
+        };
+        let tokenizer: DynTokenizer = Arc::new(TestTokenizer::new());
+        let mut processor = UnifiedOutputProcessor::new(spec, vec![], tokenizer, vec![]).unwrap();
+
+        let out = processor.process_response(stream_response(content_choice("hi"), Some(vec![7])));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].data.as_ref().unwrap().internal_token_ids.as_deref(),
+            Some(&[7][..])
+        );
     }
 }

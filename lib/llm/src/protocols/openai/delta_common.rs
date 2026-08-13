@@ -26,6 +26,12 @@ pub struct DeltaGeneratorOptions {
     pub return_tokens_as_token_ids: bool,
     /// Determines which nvext response fields may be emitted for this request.
     pub response_fields: NvExtResponseFieldSelection,
+    /// Kimi streaming spec P0.5 (`stream_options.include_internal_content`):
+    /// every increment frame carries `delta.internal_content.token_ids` — the
+    /// token ids behind that frame's increment. The typed
+    /// `ChatCompletionStreamOptions` has no such field, so the HTTP handler
+    /// extracts the flag from the raw body and it arrives here out of band.
+    pub include_internal_content: bool,
 }
 
 impl DeltaGeneratorOptions {
@@ -42,6 +48,7 @@ impl DeltaGeneratorOptions {
             enable_logprobs,
             response_fields,
             return_tokens_as_token_ids: return_tokens_as_token_ids.unwrap_or(false),
+            include_internal_content: false,
         }
     }
 }

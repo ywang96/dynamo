@@ -100,6 +100,7 @@ async fn apply_jail_transformation(
         nvext: None,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     }
 }
 

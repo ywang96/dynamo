@@ -36,7 +36,59 @@ use dynamo_protocols::types::{
     ChatCompletionStreamResponseDelta, FinishReason, Role,
 };
 
+use crate::types::TokenIdType;
+
 pub(crate) type Frame = Annotated<NvCreateChatCompletionStreamResponse>;
+
+/// Whether the delta carries a client-visible increment (Kimi streaming spec
+/// P0.5): non-empty content, reasoning content, or tool calls. Empty-string
+/// increments (the first frame's `content: ""`, the P1.7 reasoning boundary)
+/// and bare end frames are not increments.
+pub(crate) fn delta_has_increment(delta: &ChatCompletionStreamResponseDelta) -> bool {
+    let has_content = delta.content.as_ref().is_some_and(|content| match content {
+        ChatCompletionMessageContent::Text(text) => !text.is_empty(),
+        ChatCompletionMessageContent::Parts(parts) => !parts.is_empty(),
+    });
+    has_content
+        || delta
+            .reasoning_content
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+        || delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+}
+
+/// Attach accumulated `pending` token ids (P0.5) to the first frame carrying
+/// an increment, draining the buffer. Frames without an increment never carry
+/// `internal_content`; if no emitted frame can carry the ids they stay
+/// buffered for the next emitted frame.
+///
+/// When one input frame's increment is split into several emitted increments
+/// (rare — e.g. a mixed reasoning+content frame), the whole buffer lands on
+/// the first of them: the token→increment attribution inside a single backend
+/// chunk is not recoverable once the parsers re-chunk text, and the spec
+/// forbids empty `token_ids` on increment frames.
+pub(crate) fn attach_token_ids_to_increment(pending: &mut Vec<TokenIdType>, frames: &mut [Frame]) {
+    if pending.is_empty() {
+        return;
+    }
+    for frame in frames {
+        let Some(data) = frame.data.as_mut() else {
+            continue;
+        };
+        if data
+            .inner
+            .choices
+            .iter()
+            .any(|choice| delta_has_increment(&choice.delta))
+        {
+            data.internal_token_ids = Some(std::mem::take(pending));
+            return;
+        }
+    }
+}
 
 /// Enforce the streaming wire shape on a chat completion stream.
 pub(crate) fn shape_chat_stream<S>(stream: S) -> impl Stream<Item = Frame> + Send
@@ -94,6 +146,10 @@ pub(crate) struct PendingCarry {
     usage: Option<dynamo_protocols::types::CompletionUsage>,
     nvext: Option<serde_json::Value>,
     llm_metrics: Option<crate::protocols::common::metrics::LLMMetricAnnotation>,
+    /// P0.5: token ids behind increments whose frames were dropped or held
+    /// back. Accumulates in stream order and attaches to the next emitted
+    /// increment frame.
+    internal_token_ids: Vec<TokenIdType>,
 }
 
 impl PendingCarry {
@@ -120,6 +176,18 @@ impl PendingCarry {
                 None => self.llm_metrics = Some(metrics),
             }
         }
+    }
+
+    /// P0.5: buffer token ids from a dropped/held frame, preserving order.
+    pub(crate) fn stash_token_ids(&mut self, token_ids: Option<Vec<TokenIdType>>) {
+        if let Some(token_ids) = token_ids {
+            self.internal_token_ids.extend(token_ids);
+        }
+    }
+
+    /// P0.5: drain the buffered token ids (oldest first).
+    pub(crate) fn take_token_ids(&mut self) -> Vec<TokenIdType> {
+        std::mem::take(&mut self.internal_token_ids)
     }
 
     /// Fold the pending payloads into a frame's own (the frame's own values
@@ -174,6 +242,7 @@ pub(crate) fn frame_from_template(
     response.nvext = None;
     response.llm_metrics = None;
     response.choice_usage = None;
+    response.internal_token_ids = None;
     response
 }
 
@@ -316,6 +385,9 @@ fn shape_frame(
     // Per-candidate usage (P0.4) travels with finish_reason; reattached to
     // the end frame below.
     let choice_usage = data.choice_usage.take();
+    // P0.5: token ids behind this frame's increment; attached to the emitted
+    // increment frame below (or buffered if this frame is dropped).
+    let frame_token_ids = data.internal_token_ids.take();
 
     if let Some(reasoning) = reasoning {
         #[allow(deprecated)]
@@ -429,7 +501,29 @@ fn shape_frame(
         // frame): drop the frame, but never its accounting payloads — buffer
         // them for the next emitted frame.
         carry.stash(usage, nvext, llm_metrics);
+        carry.stash_token_ids(frame_token_ids);
         return Vec::new();
+    }
+
+    // P0.5: token ids buffered from dropped frames precede this frame's own;
+    // all of them attach to the first emitted increment frame. If this input
+    // produced no increment frame (e.g. a bare finish), keep buffering.
+    let mut pending_token_ids = carry.take_token_ids();
+    if let Some(ids) = frame_token_ids {
+        pending_token_ids.extend(ids);
+    }
+    if !pending_token_ids.is_empty() {
+        if let Some(target) = outputs.iter_mut().find(|output| {
+            output
+                .inner
+                .choices
+                .iter()
+                .any(|choice| delta_has_increment(&choice.delta))
+        }) {
+            target.internal_token_ids = Some(pending_token_ids);
+        } else {
+            carry.stash_token_ids(Some(pending_token_ids));
+        }
     }
 
     // Usage, nvext and internal metrics ride the last emitted frame — for a
@@ -482,6 +576,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 
@@ -1004,6 +1099,68 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert!(out[2].inner.choices.is_empty());
         assert!(out[2].inner.usage.is_some());
+    }
+
+    #[test]
+    fn internal_token_ids_ride_increment_frames_only() {
+        // P0.5: ids attached by the delta generator must land on the emitted
+        // increment frame — never on the synthesized first frame, the P1.7
+        // boundary, or the bare end frame.
+        let mut reasoning = frame(0, Some(Role::Assistant), None, Some("Th"), None);
+        reasoning.data.as_mut().unwrap().internal_token_ids = Some(vec![10, 11]);
+        let mut content = frame(0, None, Some("Answer"), None, None);
+        content.data.as_mut().unwrap().internal_token_ids = Some(vec![12]);
+        let mut end = frame(0, None, None, None, Some(FinishReason::Stop));
+        end.data.as_mut().unwrap().internal_token_ids = Some(vec![13]);
+
+        let out = collect(vec![reasoning, content, end]);
+
+        // first frame + reasoning increment + boundary + content increment + end
+        assert_eq!(out.len(), 5);
+        assert!(
+            out[0].internal_token_ids.is_none(),
+            "first frame has no increment"
+        );
+        assert_eq!(out[1].internal_token_ids.as_deref(), Some(&[10, 11][..]));
+        assert!(
+            out[2].internal_token_ids.is_none(),
+            "reasoning boundary is not an increment"
+        );
+        assert_eq!(out[3].internal_token_ids.as_deref(), Some(&[12][..]));
+        assert!(
+            out[4].internal_token_ids.is_none(),
+            "end frame has no increment"
+        );
+
+        // On the wire the ids serialize as choices[0].delta.internal_content.
+        let json = serde_json::to_value(&out[1]).unwrap();
+        assert_eq!(
+            json["choices"][0]["delta"]["internal_content"]["token_ids"],
+            serde_json::json!([10, 11])
+        );
+        let json4 = serde_json::to_value(&out[4]).unwrap();
+        assert!(
+            json4["choices"][0]["delta"]
+                .get("internal_content")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn internal_token_ids_from_dropped_frames_carry_forward() {
+        // A marker-only chunk parsed down to nothing still owns its token ids;
+        // dropping the frame must not lose them (they precede the next
+        // increment's own ids).
+        let mut consumed = frame(0, Some(Role::Assistant), Some(""), None, None);
+        consumed.data.as_mut().unwrap().internal_token_ids = Some(vec![20]);
+        let mut content = frame(0, None, Some("hi"), None, None);
+        content.data.as_mut().unwrap().internal_token_ids = Some(vec![21]);
+
+        let out = collect(vec![consumed, content]);
+
+        // first frame (from the dropped input's role) + content increment.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].internal_token_ids.as_deref(), Some(&[20, 21][..]));
     }
 
     /// Fixture emitter for offline cross-validation against Moonshot's

@@ -81,8 +81,13 @@ pub struct DeltaGenerator {
 impl DeltaGenerator {
     pub fn new(model: String, options: DeltaGeneratorOptions, request_id: String) -> Self {
         let (now, usage, tracker) = delta_common::initial_state();
+        // Kimi streaming spec P2: the response id is `chatcmpl-` + 24 lowercase
+        // hex, generated fresh — the request id may be a UUID or an arbitrary
+        // trace-context id, neither of which matches the required shape.
+        let _ = request_id;
+        let random_hex = uuid::Uuid::new_v4().simple().to_string();
         Self {
-            id: format!("chatcmpl-{request_id}"),
+            id: format!("chatcmpl-{}", &random_hex[..24]),
             object: "chat.completion.chunk".to_string(),
             created: now,
             model,
@@ -158,6 +163,13 @@ impl DeltaGenerator {
     /// * `isl` - Input Sequence Length. The number of prompt tokens used.
     pub fn update_isl(&mut self, isl: u32) {
         self.usage.prompt_tokens = self.adjusted_prompt_tokens(isl);
+    }
+
+    /// Enable per-increment `internal_content.token_ids` emission (Kimi
+    /// streaming spec P0.5). The flag cannot ride the typed stream options
+    /// (external crate), so the preprocessor sets it from the request context.
+    pub fn set_include_internal_content(&mut self, enabled: bool) {
+        self.options.include_internal_content = enabled;
     }
 
     pub fn create_logprobs(
@@ -262,6 +274,7 @@ impl DeltaGenerator {
             nvext: None, // Will be populated by router layer if needed
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 
@@ -287,6 +300,7 @@ impl DeltaGenerator {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 
@@ -410,6 +424,19 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             delta.top_logprobs,
         );
 
+        // Streaming spec P0.5: when the request opted into internal content,
+        // carry the token ids behind this increment out of band; the parsing
+        // stages (reasoning/tool/wire-shape) re-chunk increments and forward
+        // the ids to whichever frame finally emits the corresponding
+        // increment, and the response's manual `Serialize` impl injects them
+        // as `choices[i].delta.internal_content.token_ids`.
+        let internal_token_ids =
+            if self.options.include_internal_content && !delta.token_ids.is_empty() {
+                Some(delta.token_ids.clone())
+            } else {
+                None
+            };
+
         // Map backend finish reasons to OpenAI's finish reasons.
         let finish_reason = match delta.finish_reason {
             Some(common::FinishReason::EoS) => Some(dynamo_protocols::types::FinishReason::Stop),
@@ -433,6 +460,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         // Create the streaming response.
         let index = delta.index.unwrap_or(0);
         let mut stream_response = self.create_choice(index, delta.text, finish_reason, logprobs);
+        stream_response.internal_token_ids = internal_token_ids;
 
         // Streaming spec P0.4 / §5.5: the candidate's end frame carries a
         // per-candidate usage snapshot (same null-free shape as the summary
@@ -679,6 +707,61 @@ mod tests {
             encoder_result: None,
             routing_data: None,
         }
+    }
+
+    #[test]
+    fn response_id_is_chatcmpl_plus_24_lowercase_hex() {
+        // Kimi streaming spec P2: the id shape is fixed regardless of the
+        // (arbitrary) request id — UUIDs and trace-context ids alike.
+        let request = create_test_request();
+        for request_id in [
+            "req-usage-zero",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "trace/abc:123",
+        ] {
+            let generator = request.response_generator(request_id.to_string());
+            let id = generator.create_usage_chunk().inner.id;
+            let hex = id
+                .strip_prefix("chatcmpl-")
+                .expect("id carries the chatcmpl- prefix");
+            assert_eq!(hex.len(), 24, "id suffix is 24 chars: {id}");
+            assert!(
+                hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "id suffix is lowercase hex: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_token_ids_attached_when_include_internal_content() {
+        // P0.5: with the flag on, each increment chunk carries the backend
+        // chunk's token ids out of band, serialized as
+        // choices[0].delta.internal_content.token_ids; with the flag off,
+        // nothing is attached.
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-internal".to_string());
+        generator.set_include_internal_content(true);
+        let response = generator
+            .choice_from_postprocessor(final_backend_output())
+            .unwrap();
+        assert_eq!(response.internal_token_ids.as_deref(), Some(&[1][..]));
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["choices"][0]["delta"]["internal_content"]["token_ids"],
+            serde_json::json!([1])
+        );
+
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-internal-off".to_string());
+        let response = generator
+            .choice_from_postprocessor(final_backend_output())
+            .unwrap();
+        assert!(response.internal_token_ids.is_none());
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json["choices"][0]["delta"].get("internal_content").is_none(),
+            "no internal_content without the opt-in"
+        );
     }
 
     #[test]

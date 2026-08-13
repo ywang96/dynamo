@@ -120,6 +120,7 @@ fn load_test_data(file_path: &str) -> TestData {
                 nvext: None,
                 llm_metrics: None,
                 choice_usage: None,
+                internal_token_ids: None,
             };
 
             Annotated {
@@ -1429,6 +1430,7 @@ mod tests {
                 nvext: None,
                 llm_metrics: None,
                 choice_usage: None,
+                internal_token_ids: None,
             }),
             event: None,
             comment: None,
@@ -1982,6 +1984,7 @@ mod tests {
                         ..Default::default()
                     }),
                     choice_usage: None,
+                    internal_token_ids: None,
                 }),
                 id: None,
                 event: None,

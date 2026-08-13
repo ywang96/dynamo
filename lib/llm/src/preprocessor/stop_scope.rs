@@ -42,7 +42,9 @@ use dynamo_protocols::types::{
 };
 use dynamo_runtime::engine::AsyncEngineContext;
 
-use super::wire_shape::{Frame, bare, empty_delta, frame_from_template};
+use super::wire_shape::{
+    Frame, attach_token_ids_to_increment, bare, empty_delta, frame_from_template,
+};
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
 
 /// Enforce content-scoped stop sequences on a shaped chat stream.
@@ -215,7 +217,16 @@ impl ScanState {
             && let Some(template) = scan.template.clone()
         {
             let held = std::mem::take(&mut scan.held);
-            outs.push(Self::content_frame(&template, index, held));
+            let mut frame = Self::content_frame(&template, index, held);
+            // P0.5: the held content's token ids were buffered when its frame
+            // was withheld; reattach them to this flushed increment.
+            let pending = self.carry.take_token_ids();
+            if !pending.is_empty()
+                && let Some(data) = frame.data.as_mut()
+            {
+                data.internal_token_ids = Some(pending);
+            }
+            outs.push(frame);
         }
     }
 
@@ -281,6 +292,7 @@ impl ScanState {
             template.inner.usage = None;
             template.nvext = None;
             template.llm_metrics = None;
+            template.internal_token_ids = None;
             scan.template = Some(template);
         }
 
@@ -292,6 +304,7 @@ impl ScanState {
                 data.nvext.take(),
                 data.llm_metrics.take(),
             );
+            self.carry.stash_token_ids(data.internal_token_ids.take());
             // This suppressed frame is the engine's own finish frame for the
             // candidate — the only one that knows the final per-candidate
             // token counts. Release the withheld end frame now so it carries
@@ -345,8 +358,23 @@ impl ScanState {
         let mut outs = Vec::new();
         if let Some(pos) = self.find_stop(&combined) {
             // Stop match: emit content before the match, close the candidate.
+            // P0.5: the truncated emission carries every id buffered so far
+            // plus this frame's own — the tokens behind the stopped-away tail
+            // were generated as part of this final increment.
+            let mut pending_token_ids = self.carry.take_token_ids();
+            if let Some(ids) = data.internal_token_ids.take() {
+                pending_token_ids.extend(ids);
+            }
             if pos > 0 {
-                outs.push(Self::content_frame(&template, index, combined[..pos].to_string()));
+                outs.push(Self::content_frame(
+                    &template,
+                    index,
+                    combined[..pos].to_string(),
+                ));
+            }
+            attach_token_ids_to_increment(&mut pending_token_ids, &mut outs);
+            if !pending_token_ids.is_empty() {
+                self.carry.stash_token_ids(Some(pending_token_ids));
             }
             let end = Self::end_frame(&template, index);
             let scan = self.candidates.get_mut(&index).expect("entry created");
@@ -376,6 +404,16 @@ impl ScanState {
             data.inner.choices[0].delta.content = Some(ChatCompletionMessageContent::Text(
                 combined[..emit_len].to_string(),
             ));
+            // P0.5: the emitted text includes any previously held tail, whose
+            // ids sit in the carry buffer; prepend them to this frame's own.
+            let carried = self.carry.take_token_ids();
+            if !carried.is_empty() {
+                let mut ids = carried;
+                if let Some(own) = data.internal_token_ids.take() {
+                    ids.extend(own);
+                }
+                data.internal_token_ids = Some(ids);
+            }
             if finish.is_some() {
                 self.mark_done(index);
             }
@@ -394,6 +432,8 @@ impl ScanState {
                 self.mark_done(index);
                 frame.data = Some(data);
                 outs.push(frame);
+            } else {
+                self.carry.stash_token_ids(data.internal_token_ids.take());
             }
         }
         outs
@@ -447,6 +487,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 

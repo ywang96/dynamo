@@ -45,6 +45,7 @@ fn drive_moved_jail(
                 nvext: None,
                 llm_metrics: None,
                 choice_usage: None,
+                internal_token_ids: None,
             })
         })
 }
@@ -517,6 +518,7 @@ fn make_text_chunk(
         nvext: None,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     }
 }
 

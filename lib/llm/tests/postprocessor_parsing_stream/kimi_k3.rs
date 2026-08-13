@@ -178,9 +178,9 @@ async fn preserves_unified_event_order() {
             // P1.7 end-of-thinking boundary: standalone reasoning_content "".
             "reasoning:",
             "content:I will check.",
-            "tool:0:get_weather:0:get_weather:",
+            "tool:0:get_weather_0:get_weather:",
             "tool:0:-:-:{\"city\":\"Paris\"}",
-            "tool:1:get_time:1:get_time:",
+            "tool:1:get_time_1:get_time:",
             "tool:1:-:-:{\"zone\":\"UTC\"}",
         ]
     );

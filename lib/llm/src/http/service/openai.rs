@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     extract::State,
     http::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -51,7 +51,10 @@ use super::{
 };
 use crate::engines::ValidateRequest;
 use crate::frontend_config::AutoToolChoiceOverrideMode;
-use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
+use crate::preprocessor::{
+    INCLUDE_INTERNAL_CONTENT_CONTEXT_KEY, PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY,
+    USAGE_HEADERS_CONTEXT_KEY, UsageHeaderCell,
+};
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId,
     agent_context_from_headers, apply_header_routing_overrides, session_affinity_from_headers,
@@ -1483,8 +1486,11 @@ async fn handler_chat_completions(
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
-    reject_include_internal_content(&body)?;
-    let normalized_body = normalize_bare_image_urls(&body);
+    let include_internal_content = include_internal_content_requested(&body);
+    let normalized_body = match normalize_stream_options_include_usage(&body) {
+        Some(body) => Some(normalize_bare_image_urls(&body).unwrap_or(body)),
+        None => normalize_bare_image_urls(&body),
+    };
     let body_ref: &[u8] = normalized_body.as_deref().unwrap_or_else(|| body.as_ref());
     let mut request = parse_chat_completion_request(body_ref, state.kimi_api_compliance_config())?;
     enforce_kimi_api_compliance(state.kimi_api_compliance_config(), &mut request)?;
@@ -1528,6 +1534,14 @@ async fn handler_chat_completions(
             captured,
         );
     }
+    // P0.5: the typed stream options cannot carry the internal-content flag
+    // (external crate); the preprocessor reads it from the request context.
+    if include_internal_content {
+        request.insert(INCLUDE_INTERNAL_CONTENT_CONTEXT_KEY, true);
+    }
+    // P0.18: shared cell the preprocessor fills once routing has recorded the
+    // prompt/cached token counts; read back for the usage headers.
+    request.insert(USAGE_HEADERS_CONTEXT_KEY, UsageHeaderCell::new());
     let context = request.context();
 
     // create the connection handles
@@ -1603,47 +1617,52 @@ where
 
 /// Streaming output spec P0.5 (Moonshot internal extension):
 /// `stream_options.include_internal_content=true` asks for
-/// `delta.internal_content.token_id` on every increment frame. This endpoint
-/// does not yet emit per-increment token ids, and the spec forbids silently
-/// ignoring the option ("if unsupported, reject at request-body validation
-/// with a 4xx; MUST NOT silently ignore") — which is what would otherwise
-/// happen, since the typed `StreamOptions` (external dynamo-protocols crate)
-/// has no such field and serde drops the unknown key. Checked on the raw
-/// body before typed parsing, mirroring smg's ingress rejection.
-/// TODO: implement real token-id passthrough (thread the decode chunk's
-/// token ids into each content/reasoning/tool increment frame) and drop
-/// this rejection once supported.
-fn reject_include_internal_content(body: &[u8]) -> Result<(), ErrorResponse> {
+/// `delta.internal_content.token_ids` on every increment frame. The typed
+/// `StreamOptions` (external dynamo-protocols crate) has no such field and
+/// serde drops the unknown key, so the flag is probed on the raw body before
+/// typed parsing and threaded through the request context
+/// (`INCLUDE_INTERNAL_CONTENT_CONTEXT_KEY`) to the delta generator.
+fn include_internal_content_requested(body: &[u8]) -> bool {
     if !body
         .windows(b"include_internal_content".len())
         .any(|window| window == b"include_internal_content")
     {
-        return Ok(());
+        return false;
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         // Malformed JSON is handled (with better diagnostics) by the typed
         // parse below.
-        return Ok(());
+        return false;
     };
-    if value
+    value
         .get("stream_options")
         .and_then(|opts| opts.get("include_internal_content"))
         .and_then(|v| v.as_bool())
         == Some(true)
-    {
-        let code = StatusCode::BAD_REQUEST;
-        return Err((
-            code,
-            Json(ErrorMessage {
-                message: "stream_options.include_internal_content is not supported by this endpoint"
-                    .to_string(),
-                error_type: map_error_code_to_error_type(code),
-                code: code.as_u16(),
-                details: None,
-            }),
-        ));
+}
+
+/// Streaming output spec P0.18: every response (streaming and non-streaming)
+/// carries the `X-Msh-Usage-Prompt-Tokens` / `X-Msh-Usage-Cached-Tokens`
+/// headers, equal to the final usage's `prompt_tokens` and
+/// `prompt_tokens_details.cached_tokens`. The preprocessor fills the shared
+/// cell once routing has recorded both counts (inside `engine.generate()`);
+/// for streaming the headers are therefore set before the stream starts. A
+/// missing cell (or an unrecorded count, e.g. the non-KV-router path)
+/// defaults to 0.
+fn set_usage_headers(response: &mut Response, cell: Option<&UsageHeaderCell>) {
+    let (prompt_tokens, cached_tokens) =
+        cell.and_then(|cell| cell.get().copied()).unwrap_or((0, 0));
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("x-msh-usage-prompt-tokens", prompt_tokens),
+        ("x-msh-usage-cached-tokens", cached_tokens),
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(&value.to_string())
+                .expect("decimal digits are a valid header value"),
+        );
     }
-    Ok(())
 }
 
 /// Normalize Moonshot-compatible bare-string image URLs before typed parsing.
@@ -1679,6 +1698,30 @@ fn normalize_bare_image_urls(body: &[u8]) -> Option<Vec<u8>> {
     }
 
     changed.then(|| serde_json::to_vec(&value).ok()).flatten()
+}
+
+/// Default a missing `stream_options.include_usage` to false before typed parsing.
+///
+/// The typed `ChatCompletionStreamOptions` (external dynamo-protocols crate)
+/// marks `include_usage` as required, so a `stream_options` object without it —
+/// e.g. the streaming-spec P0.5 probe's `{"include_internal_content": true}` —
+/// fails request parsing with "missing field `include_usage`". OpenAI treats a
+/// missing `include_usage` as false; normalize the raw body to match.
+fn normalize_stream_options_include_usage(body: &[u8]) -> Option<Vec<u8>> {
+    if !body
+        .windows(b"stream_options".len())
+        .any(|window| window == b"stream_options")
+    {
+        return None;
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let stream_options = value.get_mut("stream_options")?.as_object_mut()?;
+    if stream_options.contains_key("include_usage") {
+        return None;
+    }
+    stream_options.insert("include_usage".to_string(), serde_json::json!(false));
+    serde_json::to_vec(&value).ok()
 }
 
 fn json_deserialize_error(error: serde_json::Error) -> ErrorResponse {
@@ -2414,6 +2457,11 @@ async fn chat_completions(
     // Capture this before `request` moves into `generate`.
     let request_has_media = request_contains_media(&request);
     let expected_choices = request.inner.n.unwrap_or(1) as usize;
+    // P0.18: shared cell the preprocessor fills with (prompt_tokens,
+    // cached_tokens) once routing completes inside `generate`.
+    let usage_header_cell = request
+        .get::<UsageHeaderCell>(USAGE_HEADERS_CONTEXT_KEY)
+        .ok();
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -2568,7 +2616,9 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        set_usage_headers(&mut response, usage_header_cell.as_deref());
+        Ok(response)
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -2620,7 +2670,9 @@ async fn chat_completions(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        let mut http_response = Json(response).into_response();
+        set_usage_headers(&mut http_response, usage_header_cell.as_deref());
+        Ok(http_response)
     }
 }
 
@@ -4363,21 +4415,77 @@ mod tests {
     }
 
     #[test]
-    fn include_internal_content_true_is_rejected() {
-        // P0.5: must reject, never silently ignore.
+    fn include_internal_content_flag_is_extracted() {
+        // P0.5: the flag is accepted and probed from the raw body; it is never
+        // rejected and never silently dropped.
         let body = br#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true,"include_internal_content":true}}"#;
-        let err = reject_include_internal_content(body).expect_err("must reject");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.0.message.contains("include_internal_content"));
+        assert!(include_internal_content_requested(body));
 
-        // false / absent / other fields pass through.
-        for ok_body in [
-            br#"{"stream_options":{"include_usage":true,"include_internal_content":false}}"#.as_slice(),
+        // false / absent / unrelated text all count as not requested.
+        for other_body in [
+            br#"{"stream_options":{"include_usage":true,"include_internal_content":false}}"#
+                .as_slice(),
             br#"{"stream_options":{"include_usage":true}}"#.as_slice(),
             br#"{"messages":[{"content":"include_internal_content"}]}"#.as_slice(),
+            br#"{"stream_options":{"include_internal_content":1}}"#.as_slice(),
         ] {
-            reject_include_internal_content(ok_body).expect("must pass");
+            assert!(!include_internal_content_requested(other_body));
         }
+    }
+
+    #[test]
+    fn stream_options_without_include_usage_is_defaulted() {
+        // The typed ChatCompletionStreamOptions requires include_usage, so a
+        // bare stream_options object — e.g. the P0.5 probe's
+        // {"include_internal_content": true} — must be normalized to
+        // include_usage=false before typed parsing instead of failing with
+        // "missing field `include_usage`".
+        let body = br#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_internal_content":true}}"#;
+        let normalized = normalize_stream_options_include_usage(body).expect("normalized");
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_slice(&normalized).expect("parses after normalization");
+        assert_eq!(
+            request.inner.stream_options.map(|opts| opts.include_usage),
+            Some(false)
+        );
+
+        // An explicit include_usage is left untouched.
+        let body =
+            br#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#;
+        assert!(normalize_stream_options_include_usage(body).is_none());
+
+        // No stream_options at all: nothing to do.
+        let body = br#"{"model":"m","messages":[],"stream":true}"#;
+        assert!(normalize_stream_options_include_usage(body).is_none());
+    }
+
+    #[test]
+    fn usage_headers_come_from_the_shared_cell() {
+        // P0.18: both headers are always present, defaulting to 0 until the
+        // preprocessor publishes the routing-time counts.
+        let mut response = Response::new(Body::empty());
+        set_usage_headers(&mut response, None);
+        assert_eq!(
+            response.headers().get("x-msh-usage-prompt-tokens").unwrap(),
+            "0"
+        );
+        assert_eq!(
+            response.headers().get("x-msh-usage-cached-tokens").unwrap(),
+            "0"
+        );
+
+        let cell = UsageHeaderCell::new();
+        cell.set((123, 45)).unwrap();
+        let mut response = Response::new(Body::empty());
+        set_usage_headers(&mut response, Some(&cell));
+        assert_eq!(
+            response.headers().get("x-msh-usage-prompt-tokens").unwrap(),
+            "123"
+        );
+        assert_eq!(
+            response.headers().get("x-msh-usage-cached-tokens").unwrap(),
+            "45"
+        );
     }
 
     #[test]
@@ -6032,6 +6140,7 @@ mod tests {
                 nvext: None,
                 llm_metrics: None,
                 choice_usage: None,
+                internal_token_ids: None,
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -6073,6 +6182,7 @@ mod tests {
                 nvext: None,
                 llm_metrics: None,
                 choice_usage: None,
+                internal_token_ids: None,
             }),
             id: Some("msg-1".to_string()),
             event: None,
@@ -6503,6 +6613,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         };
         Annotated {
             id: Some("test-id".to_string()),
@@ -7138,6 +7249,7 @@ mod tests {
             nvext: None,
             llm_metrics: None,
             choice_usage: None,
+            internal_token_ids: None,
         }
     }
 

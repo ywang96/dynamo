@@ -187,6 +187,7 @@ fn make_stream_delta(
         nvext,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     })
 }
 

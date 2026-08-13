@@ -362,6 +362,7 @@ fn mock_content_chunk(content: &str) -> NvCreateChatCompletionStreamResponse {
         nvext: None,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     }
 }
 
@@ -406,6 +407,7 @@ fn mock_multi_choice_content_chunk(
         nvext: None,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     }
 }
 
@@ -447,6 +449,7 @@ fn mock_reasoning_only_chunk(reasoning: &str) -> NvCreateChatCompletionStreamRes
         nvext: None,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     }
 }
 
@@ -483,6 +486,7 @@ fn mock_final_chunk() -> NvCreateChatCompletionStreamResponse {
         nvext: None,
         llm_metrics: None,
         choice_usage: None,
+        internal_token_ids: None,
     }
 }
 
