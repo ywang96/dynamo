@@ -174,10 +174,6 @@ enum K3TagMatch {
 #[derive(Default)]
 struct K3StructuralTagFilter {
     pending: String,
-    /// The current source delta either completed a structural tag or shared
-    /// bytes with an unresolved candidate. Its token logprobs can no longer be
-    /// aligned safely with client-visible text and must be dropped.
-    logprobs_tainted: bool,
     /// The parser just crossed into this channel, so a bare channel name here
     /// is the tail of an open marker rather than prose. Cleared by the first
     /// text that resolves either way.
@@ -209,7 +205,6 @@ impl K3StructuralTagFilter {
             };
             if let Some(after) = rest.strip_prefix(K3_SEP) {
                 self.pending = after.to_string();
-                self.logprobs_tainted = true;
                 self.at_channel_start = false;
                 return false;
             }
@@ -222,12 +217,8 @@ impl K3StructuralTagFilter {
     }
 
     fn push(&mut self, delta: &str) -> String {
-        if !self.pending.is_empty() {
-            self.logprobs_tainted = true;
-        }
         self.pending.push_str(delta);
         if self.at_channel_start && self.hold_bare_channel_open() {
-            self.logprobs_tainted = true;
             return String::new();
         }
         let mut out = String::new();
@@ -243,7 +234,6 @@ impl K3StructuralTagFilter {
             }
             match classify_k3_structural_tag(&self.pending) {
                 K3TagMatch::Complete(len) => {
-                    self.logprobs_tainted = true;
                     self.pending.drain(..len);
                 }
                 K3TagMatch::Prefix => break,
@@ -253,9 +243,6 @@ impl K3StructuralTagFilter {
                     self.pending.drain(..1);
                 }
             }
-        }
-        if !self.pending.is_empty() {
-            self.logprobs_tainted = true;
         }
         out
     }
@@ -274,10 +261,6 @@ impl K3StructuralTagFilter {
         } else {
             pending
         }
-    }
-
-    fn take_logprobs_tainted(&mut self) -> bool {
-        std::mem::take(&mut self.logprobs_tainted)
     }
 }
 
@@ -559,19 +542,6 @@ fn validate_k3_tool_arguments(arguments: &str) -> Result<(), String> {
     deserializer.end().map_err(|error| error.to_string())
 }
 
-fn k3_logprobs_contain_structural_tag(logprobs: &ChatChoiceLogprobs) -> bool {
-    [&logprobs.content, &logprobs.refusal]
-        .into_iter()
-        .filter_map(Option::as_ref)
-        .any(|tokens| {
-            let sampled = tokens
-                .iter()
-                .map(|token| token.token.as_str())
-                .collect::<String>();
-            contains_complete_k3_structural_tag(&sampled)
-        })
-}
-
 fn k3_tool_recovery_should_be_suppressed(error: &dyn fmt::Display, recovered: &str) -> bool {
     let reason = error.to_string().to_ascii_lowercase();
     reason.contains("kimi k3 call")
@@ -698,23 +668,14 @@ impl ChoiceState {
         }
     }
 
+    /// Return the backend's raw generated-token logprobs before parser filtering.
     fn take_pending_logprobs(&mut self) -> Option<ChatChoiceLogprobs> {
-        let logprobs = self.pending_logprobs.take()?;
-        if self.parser_name == "kimi_k3" && k3_logprobs_contain_structural_tag(&logprobs) {
-            tracing::warn!(
-                choice_index = self.choice_index,
-                parser = self.parser_name,
-                "dropping K3 logprobs containing structural tags"
-            );
-            return None;
-        }
-        Some(logprobs)
+        self.pending_logprobs.take()
     }
 
     fn process_delta(&mut self, delta: String) -> UnifiedParserOutput {
         if self.parser_failed {
             if self.suppress_parser_fallback {
-                self.pending_logprobs = None;
                 return UnifiedParserOutput::default();
             }
             let mut output = UnifiedParserOutput::default();
@@ -735,7 +696,6 @@ impl ChoiceState {
             let suppress_recovery = self.parser_name == "kimi_k3"
                 && k3_tool_recovery_should_be_suppressed(&error, &recovered);
             if suppress_recovery {
-                self.pending_logprobs = None;
                 self.suppressed_tool_calls = true;
                 self.suppress_parser_fallback = true;
                 tracing::warn!(
@@ -772,7 +732,6 @@ impl ChoiceState {
                 if self.parser_name == "kimi_k3"
                     && k3_tool_recovery_should_be_suppressed(&error, &recovered)
                 {
-                    self.pending_logprobs = None;
                     self.suppressed_tool_calls = true;
                     self.suppress_parser_fallback = true;
                     tracing::warn!(
@@ -792,38 +751,27 @@ impl ChoiceState {
         let mut choice = empty_choice(self.choice_index);
         match event {
             UnifiedParserEvent::Text(text) => {
-                let (text, as_parts, tainted_logprobs) = match self.k3_output_filters.as_mut() {
+                let (text, as_parts) = match self.k3_output_filters.as_mut() {
                     Some(filters) => {
                         filters.enter(K3Channel::Content);
                         let text = filters.content.push(&text);
-                        (
-                            text,
-                            filters.content_as_parts,
-                            filters.content.take_logprobs_tainted(),
-                        )
+                        (text, filters.content_as_parts)
                     }
-                    None => (text, false, false),
+                    None => (text, false),
                 };
-                if tainted_logprobs {
-                    self.pending_logprobs = None;
-                }
                 if text.is_empty() {
                     return None;
                 }
                 choice.delta.content = Some(response_text(text, as_parts));
             }
             UnifiedParserEvent::Reasoning(reasoning) => {
-                let (reasoning, tainted_logprobs) = match self.k3_output_filters.as_mut() {
+                let reasoning = match self.k3_output_filters.as_mut() {
                     Some(filters) => {
                         filters.enter(K3Channel::Reasoning);
-                        let reasoning = filters.reasoning.push(&reasoning);
-                        (reasoning, filters.reasoning.take_logprobs_tainted())
+                        filters.reasoning.push(&reasoning)
                     }
-                    None => (reasoning, false),
+                    None => reasoning,
                 };
-                if tainted_logprobs {
-                    self.pending_logprobs = None;
-                }
                 if reasoning.is_empty() {
                     return None;
                 }
@@ -843,10 +791,6 @@ impl ChoiceState {
         };
         filters.enter(K3Channel::Reasoning);
         let reasoning = filters.reasoning.push(&reasoning);
-        let tainted_logprobs = filters.reasoning.take_logprobs_tainted();
-        if tainted_logprobs {
-            self.pending_logprobs = None;
-        }
         (!reasoning.is_empty()).then_some(reasoning)
     }
 
@@ -907,10 +851,6 @@ impl ChoiceState {
                 }
             }
         }
-        let tainted_logprobs = filters.content.take_logprobs_tainted();
-        if tainted_logprobs {
-            self.pending_logprobs = None;
-        }
         filtered
     }
 
@@ -921,7 +861,6 @@ impl ChoiceState {
         let Ok(index) = u32::try_from(call.tool_index) else {
             if self.parser_name == "kimi_k3" {
                 self.suppressed_tool_calls = true;
-                self.pending_logprobs = None;
             }
             tracing::warn!(
                 choice_index = self.choice_index,
@@ -938,7 +877,6 @@ impl ChoiceState {
             let invalid_arguments = validate_k3_tool_arguments(&call.arguments).err();
             if unsafe_name || invalid_arguments.is_some() {
                 self.suppressed_tool_calls = true;
-                self.pending_logprobs = None;
                 tracing::warn!(
                     choice_index = self.choice_index,
                     tool_index = call.tool_index,
@@ -967,7 +905,6 @@ impl ChoiceState {
                 .is_some_and(contains_complete_k3_structural_tag)
         {
             self.suppressed_tool_calls = true;
-            self.pending_logprobs = None;
             tracing::warn!(
                 choice_index = self.choice_index,
                 tool_index = call.tool_index,
@@ -1188,7 +1125,6 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
     if state.parser_name == "kimi_k3" {
         if source.delta.tool_calls.take().is_some() {
             state.suppressed_tool_calls = true;
-            state.pending_logprobs = None;
             tracing::warn!(
                 choice_index,
                 parser = state.parser_name,
@@ -1198,7 +1134,6 @@ fn process_choice(mut source: ChatChoiceStream, state: &mut ChoiceState) -> Vec<
         #[allow(deprecated)]
         if source.delta.function_call.take().is_some() {
             state.suppressed_tool_calls = true;
-            state.pending_logprobs = None;
             tracing::warn!(
                 choice_index,
                 parser = state.parser_name,
@@ -1970,7 +1905,16 @@ mod k3_output_containment_tests {
         state.append_logprobs(Some(token_logprobs(&["pytest", " -q"])));
         let followup = state.process_delta("pytest -q".to_string());
         assert!(followup.events.is_empty());
-        assert!(state.pending_logprobs.is_none());
+        assert_eq!(
+            state
+                .take_pending_logprobs()
+                .and_then(|logprobs| logprobs.content)
+                .expect("raw parser-failure logprobs")
+                .into_iter()
+                .map(|entry| entry.token)
+                .collect::<Vec<_>>(),
+            ["pytest", " -q"]
+        );
     }
 
     struct SplitFinishParser;
@@ -2084,7 +2028,52 @@ mod k3_output_containment_tests {
     }
 
     #[test]
-    fn marker_split_across_held_prefix_drops_all_owned_logprobs() {
+    fn k3_structural_prefix_logprobs_keep_raw_positions() {
+        let structural = [
+            "<|close|>",
+            "think",
+            "<|sep|>",
+            "<|open|>",
+            "response",
+            "<|sep|>",
+        ];
+        let mut state = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
+        state.append_logprobs(Some(token_logprobs(&structural)));
+
+        assert!(
+            state
+                .event_choice(UnifiedParserEvent::Reasoning(structural.concat()))
+                .is_none()
+        );
+
+        state.append_logprobs(Some(token_logprobs(&["OK"])));
+        let choice = state
+            .event_choice(UnifiedParserEvent::Text("OK".to_string()))
+            .expect("visible response token");
+        assert_eq!(
+            choice.delta.content,
+            Some(ChatCompletionMessageContent::Text("OK".to_string()))
+        );
+
+        let tokens = state
+            .take_pending_logprobs()
+            .and_then(|logprobs| logprobs.content)
+            .expect("raw generated-token logprobs")
+            .into_iter()
+            .map(|entry| entry.token)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            structural
+                .into_iter()
+                .chain(["OK"])
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn marker_split_across_held_prefix_preserves_raw_logprobs() {
         let mut state = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
         state.append_logprobs(Some(token_logprobs(&["<|close|>", "res"])));
         assert!(
@@ -2092,7 +2081,6 @@ mod k3_output_containment_tests {
                 .event_choice(UnifiedParserEvent::Text("<|close|>res".to_string()))
                 .is_none()
         );
-        assert!(state.pending_logprobs.is_none());
 
         state.append_logprobs(Some(token_logprobs(&["ponse", "<|sep|>", "safe"])));
         let choice = state
@@ -2103,14 +2091,32 @@ mod k3_output_containment_tests {
             choice.delta.content,
             Some(ChatCompletionMessageContent::Text("safe".to_string()))
         );
-        assert!(state.take_pending_logprobs().is_none());
+        assert_eq!(
+            state
+                .take_pending_logprobs()
+                .and_then(|logprobs| logprobs.content)
+                .expect("raw split-marker logprobs")
+                .into_iter()
+                .map(|entry| entry.token)
+                .collect::<Vec<_>>(),
+            ["<|close|>", "res", "ponse", "<|sep|>", "safe"]
+        );
     }
 
     #[test]
-    fn complete_structural_tag_in_sampled_logprobs_is_dropped() {
+    fn complete_structural_tag_in_sampled_logprobs_is_preserved() {
         let mut state = ChoiceState::new(Box::new(NoopParser), 0, "kimi_k3");
         state.append_logprobs(Some(token_logprobs(&["<|close|>", "message", "<|sep|>"])));
-        assert!(state.take_pending_logprobs().is_none());
+        assert_eq!(
+            state
+                .take_pending_logprobs()
+                .and_then(|logprobs| logprobs.content)
+                .expect("raw structural-tag logprobs")
+                .into_iter()
+                .map(|entry| entry.token)
+                .collect::<Vec<_>>(),
+            ["<|close|>", "message", "<|sep|>"]
+        );
     }
 
     #[test]
