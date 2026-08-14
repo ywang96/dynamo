@@ -18,7 +18,7 @@
 import asyncio
 import base64
 from io import BytesIO
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 from PIL import Image
@@ -280,10 +280,174 @@ async def test_http_status_error_propagated(loader: ImageLoader) -> None:
 async def test_cache_hit_skips_fetch(loader: ImageLoader) -> None:
     """A cached image should be returned without making an HTTP request."""
     img = Image.new("RGB", (2, 2))
-    loader._image_cache["https://example.com/img.png"] = img
+    loader._cache_put("https://example.com/img.png", img)
 
     result = await loader.load_image("https://example.com/img.png")
     assert result is img
+
+
+async def test_stable_key_reuses_decoded_image_across_rotating_urls() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=1024,
+        url_policy=_permissive_policy(),
+    )
+    mock_fetch = _mock_fetch_bytes()
+
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        first = await loader.load_image(
+            "https://example.com/image.png?signature=first",
+            cache_key="stable-image-key",
+        )
+        second = await loader.load_image(
+            "https://example.com/image.png?signature=second",
+            cache_key="stable-image-key",
+        )
+
+    assert first is second
+    assert mock_fetch.call_count == 1
+    assert loader.cache_stats == {
+        "hits": 1,
+        "misses": 1,
+        "evictions": 0,
+        "entries": 1,
+        "bytes": 12,
+    }
+
+
+async def test_concurrent_rotating_urls_coalesce_by_stable_key() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=1024,
+        url_policy=_permissive_policy(),
+    )
+    mock_fetch = _mock_fetch_bytes(delay=0.05)
+
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        images = await asyncio.gather(
+            loader.load_image(
+                "https://example.com/image.png?signature=first",
+                cache_key="stable-image-key",
+            ),
+            loader.load_image(
+                "https://example.com/image.png?signature=second",
+                cache_key="stable-image-key",
+            ),
+        )
+
+    assert images[0] is images[1]
+    assert mock_fetch.call_count == 1
+
+
+async def test_missing_stable_key_keeps_complete_url_identity() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=1024,
+        url_policy=_permissive_policy(),
+    )
+    mock_fetch = _mock_fetch_bytes()
+    urls = [
+        "https://example.com/image.png?signature=first",
+        "https://example.com/image.png?signature=second",
+    ]
+
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        await loader.load_image(urls[0])
+        await loader.load_image(urls[1])
+
+    assert mock_fetch.call_count == 2
+
+
+async def test_stable_key_cannot_bypass_url_validation() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=1024,
+        url_policy=UrlValidationPolicy(),
+    )
+    loader._cache_put("stable-image-key", Image.new("RGB", (2, 2)))
+
+    with pytest.raises(UrlValidationError, match="blocked range"):
+        await loader.load_image(_METADATA_IP_URL, cache_key="stable-image-key")
+
+    assert loader.cache_stats["hits"] == 0
+
+
+async def test_failed_decode_is_not_cached_under_stable_key() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=1024,
+        url_policy=_permissive_policy(),
+    )
+    mock_fetch = _mock_fetch_bytes(content=b"not an image")
+
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        with pytest.raises(ImageValidationError, match="Invalid image data"):
+            await loader.load_image(
+                "https://example.com/image.png",
+                cache_key="stable-image-key",
+            )
+
+    assert "stable-image-key" not in loader._image_cache
+
+
+async def test_decoded_byte_budget_evicts_lru_entries() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=15,
+        url_policy=_permissive_policy(),
+    )
+    mock_fetch = _mock_fetch_bytes()
+
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        await loader.load_image("https://example.com/a.png")
+        await loader.load_image("https://example.com/b.png")
+
+    assert "https://example.com/a.png" not in loader._image_cache
+    assert "https://example.com/b.png" in loader._image_cache
+    assert loader.cache_stats["bytes"] == 12
+    assert loader.cache_stats["evictions"] == 1
+
+
+async def test_image_larger_than_cache_budget_is_not_cached() -> None:
+    loader = ImageLoader(
+        cache_size=4,
+        cache_max_bytes=11,
+        url_policy=_permissive_policy(),
+    )
+    mock_fetch = _mock_fetch_bytes()
+
+    with patch(_FETCH_BYTES_PATH, mock_fetch):
+        await loader.load_image("https://example.com/image.png")
+        await loader.load_image("https://example.com/image.png")
+
+    assert mock_fetch.call_count == 2
+    assert loader.cache_stats["entries"] == 0
+    assert loader.cache_stats["bytes"] == 0
+
+
+async def test_batch_forwards_positionally_aligned_cache_keys(
+    loader: ImageLoader,
+) -> None:
+    loader.load_image = AsyncMock(return_value=Image.new("RGB", (1, 1)))  # type: ignore[method-assign]
+    items = [
+        {URL_VARIANT_KEY: "https://example.com/a.png"},
+        {URL_VARIANT_KEY: "https://example.com/b.png"},
+    ]
+
+    await loader.load_image_batch(items, cache_keys=["stable-a", None])
+
+    assert loader.load_image.await_args_list == [
+        call(items[0][URL_VARIANT_KEY], cache_key="stable-a"),
+        call(items[1][URL_VARIANT_KEY], cache_key=None),
+    ]
+
+
+async def test_batch_rejects_misaligned_cache_keys(loader: ImageLoader) -> None:
+    with pytest.raises(ValueError, match="same length"):
+        await loader.load_image_batch(
+            [{URL_VARIANT_KEY: "https://example.com/a.png"}],
+            cache_keys=[],
+        )
 
 
 def _make_svg_bytes() -> bytes:
@@ -502,7 +666,9 @@ async def test_load_image_batch_preserves_order_under_bound() -> None:
         await asyncio.sleep((len(sizes) - idx) * 0.001)
         return buffer.getvalue()
 
-    items = [{URL_VARIANT_KEY: f"http://example.com/{i}.png"} for i in range(len(sizes))]
+    items = [
+        {URL_VARIANT_KEY: f"http://example.com/{i}.png"} for i in range(len(sizes))
+    ]
     with patch(_FETCH_BYTES_PATH, side_effect=_sized_fetch):
         results = await loader.load_image_batch(items)
 

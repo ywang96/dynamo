@@ -39,6 +39,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_renderer::OAIPromptFormatter;
 use dynamo_runtime::config::is_truthy;
+use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
 use dynamo_runtime::error::{DynamoError, ErrorType};
 use futures::Stream;
 use futures::stream::{self, StreamExt};
@@ -74,7 +75,10 @@ use crate::protocols::{
     TokenIdType,
     common::{
         OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider,
-        extensions::{AgentHints, NvExtProvider, request_cache_salt, routing_constraints_to_kv},
+        extensions::{
+            AgentHints, NvExtProvider, request_cache_salt, request_trusted_tenant_id,
+            routing_constraints_to_kv,
+        },
     },
     openai::{
         DeltaGeneratorExt,
@@ -197,6 +201,31 @@ pub struct MmImageEntry {
     pub mm_hash: u64,
     pub width: u32,
     pub height: u32,
+}
+
+const MEDIA_CACHE_KEYS_BY_MODALITY: &str = "media_cache_keys_by_modality";
+const MEDIA_CACHE_KEY_VERSION: &[u8] = b"dynamo-media-cache-key-v1";
+const IMAGE_MODALITY: &[u8] = b"image";
+
+fn update_length_prefixed(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Derive an opaque tenant-scoped cache identity for a trusted media UUID.
+fn stable_media_cache_key(tenant_id: &str, modality: &[u8], media_uuid: &uuid::Uuid) -> String {
+    let mut hasher = blake3::Hasher::new();
+    update_length_prefixed(&mut hasher, MEDIA_CACHE_KEY_VERSION);
+    update_length_prefixed(&mut hasher, tenant_id.as_bytes());
+    update_length_prefixed(&mut hasher, modality);
+    update_length_prefixed(&mut hasher, media_uuid.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn stable_media_routing_hash(stable_key: &str) -> Option<u64> {
+    stable_key
+        .get(..16)
+        .and_then(|prefix| u64::from_str_radix(prefix, 16).ok())
 }
 
 /// Per-request media content-part counts, carried to the metrics annotation.
@@ -1364,6 +1393,12 @@ impl OpenAIPreprocessor {
         let _ = token_ids;
 
         let mut media_map: MultimodalDataMap = HashMap::new();
+        let trusted_tenant_id = env_is_truthy(env_llm::DYN_MM_TRUST_MEDIA_UUIDS)
+            .then(|| request_trusted_tenant_id(request))
+            .flatten();
+        // One entry per image content part in message order. `None` preserves
+        // positional alignment and tells the worker to use full-URL identity.
+        let mut image_cache_keys: Vec<Option<String>> = Vec::new();
         let mut fetch_tasks: Vec<(String, &ChatCompletionRequestUserMessageContentPart)> =
             Vec::new();
         // Per-image (mm_hash, width, height) for the MM-routing path.
@@ -1389,7 +1424,7 @@ impl OpenAIPreprocessor {
         // URLs here and resolve dims via header-only HTTP after the loop so we
         // can issue all fetches in parallel.
         #[cfg(feature = "mm-routing")]
-        let mut url_passthrough_images: Vec<(u64, String)> = Vec::new();
+        let mut url_passthrough_images: Vec<(u64, String, bool)> = Vec::new();
 
         let Some(messages) = request.typed_messages() else {
             return Ok(Vec::new());
@@ -1415,11 +1450,35 @@ impl OpenAIPreprocessor {
                     if type_str == "image_url" {
                         total_image_count += 1;
                     }
+                    if let ChatCompletionRequestUserMessageContentPart::ImageUrl(part) =
+                        content_part
+                    {
+                        image_cache_keys.push(
+                            trusted_tenant_id.zip(part.image_url.uuid.as_ref()).map(
+                                |(tenant_id, media_uuid)| {
+                                    stable_media_cache_key(tenant_id, IMAGE_MODALITY, media_uuid)
+                                },
+                            ),
+                        );
+                    }
                     fetch_tasks.push((type_str.to_string(), content_part));
                 } else {
                     let (type_str, url) = match content_part {
                         ChatCompletionRequestUserMessageContentPart::ImageUrl(p) => {
-                            ("image_url", p.image_url.url.clone())
+                            let url = p.image_url.url.clone();
+                            let stable_key = trusted_tenant_id.zip(p.image_url.uuid.as_ref()).map(
+                                |(tenant_id, media_uuid)| {
+                                    stable_media_cache_key(tenant_id, IMAGE_MODALITY, media_uuid)
+                                },
+                            );
+                            #[cfg(feature = "mm-routing")]
+                            url_passthrough_images.push((
+                                Self::image_routing_hash(url.as_str(), stable_key.as_deref()),
+                                url.to_string(),
+                                stable_key.is_some(),
+                            ));
+                            image_cache_keys.push(stable_key);
+                            ("image_url", url)
                         }
                         ChatCompletionRequestUserMessageContentPart::VideoUrl(p) => {
                             ("video_url", p.video_url.url.clone())
@@ -1432,8 +1491,6 @@ impl OpenAIPreprocessor {
                     #[cfg(feature = "mm-routing")]
                     if type_str == "image_url" {
                         total_image_count += 1;
-                        let mm_hash = Self::hash_image_url(url.as_str());
-                        url_passthrough_images.push((mm_hash, url.to_string()));
                     }
                     media_map
                         .entry(type_str.to_string())
@@ -1511,19 +1568,21 @@ impl OpenAIPreprocessor {
             }
         }
 
-        // URL-passthrough path (media_loader is None): fetch image headers in
-        // parallel to get (W, H) per image without downloading the full bytes.
-        // Enables MM-aware routing for backends that register
+        // URL-passthrough path (media_loader is None): fetch image dimensions
+        // in parallel. Range-capable origins return only headers; a trusted
+        // stable identity may use one bounded full response when Range is
+        // ignored. Enables MM-aware routing for backends that register
         // `media_decoder: null` and decode images on the worker.
         #[cfg(feature = "mm-routing")]
         if !url_passthrough_images.is_empty() {
-            let dim_results = futures::future::join_all(
-                url_passthrough_images
-                    .iter()
-                    .map(|(mm_hash, url)| Self::fetch_image_dims(*mm_hash, url.as_str())),
-            )
+            let dim_results = futures::future::join_all(url_passthrough_images.iter().map(
+                |(mm_hash, url, has_stable_key)| {
+                    Self::fetch_image_dims(*mm_hash, url.as_str(), *has_stable_key)
+                },
+            ))
             .await;
-            for ((mm_hash, url), dim_res) in url_passthrough_images.into_iter().zip(dim_results) {
+            for ((mm_hash, url, _), dim_res) in url_passthrough_images.into_iter().zip(dim_results)
+            {
                 match dim_res {
                     Ok((w, h)) => {
                         if let Some(counter) = self.image_token_counter.as_ref() {
@@ -1535,7 +1594,7 @@ impl OpenAIPreprocessor {
                                 height = h,
                                 tokens = n,
                                 mm_hash = mm_hash,
-                                source = "url_passthrough_header_fetch",
+                                source = "url_passthrough_dimension_fetch",
                                 "image-token count"
                             );
                         }
@@ -1596,6 +1655,12 @@ impl OpenAIPreprocessor {
                 extra_args["formatted_prompt"] = serde_json::Value::String(prompt.to_string());
             }
 
+            if image_cache_keys.iter().any(Option::is_some) {
+                extra_args[MEDIA_CACHE_KEYS_BY_MODALITY] = serde_json::json!({
+                    "image": image_cache_keys,
+                });
+            }
+
             if let Some(serde_json::Value::Object(backend_extra_args)) = Self::backend_extra_args(
                 request,
                 self.runtime_config.reasoning_parser.is_some(),
@@ -1608,6 +1673,16 @@ impl OpenAIPreprocessor {
                     .as_object_mut()
                     .expect("multimodal extra_args must be an object");
                 extra_args_obj.extend(backend_extra_args);
+            }
+
+            #[cfg(feature = "mm-routing")]
+            if mm_image_entries.len() == image_cache_keys.len() {
+                for (entry, stable_key) in mm_image_entries.iter_mut().zip(&image_cache_keys) {
+                    if let Some(stable_key) = stable_key {
+                        entry.mm_hash = stable_media_routing_hash(stable_key)
+                            .expect("derived stable media key is a BLAKE3 hex digest");
+                    }
+                }
             }
 
             // Forward routing-side mm_hashes in `extra_args["mm_hashes"]` so the
@@ -1795,27 +1870,38 @@ impl OpenAIPreprocessor {
     /// cache-busted fetch of the same image" or "version 2 of a different
     /// image", and the URL alone doesn't tell us which. Keeping the hash
     /// URL-identical avoids the heuristic and the false-positive collisions
-    /// that come with it. Workloads with rotating signed URLs (S3, GCS,
-    /// Azure SAS) should use `--frontend-decoding`: that path hashes the
-    /// decoded RGB bytes instead, so cross-URL cache reuse is restored
-    /// without depending on URL conventions.
+    /// that come with it. Trusted media UUIDs or `--frontend-decoding` provide
+    /// explicit cross-URL identity without depending on URL conventions.
     #[cfg(feature = "mm-routing")]
     fn hash_image_url(url: &str) -> u64 {
         xxhash_rust::xxh3::xxh3_64(url.as_bytes())
     }
 
-    /// Header-only image dim fetch. For HTTP/HTTPS we issue a Range request
-    /// for the first 64 KB (covers PNG/WebP in <1 KB and JPEG SOF in worst
-    /// case). For data: URIs we decode the base64 payload locally and parse
-    /// the header. Caller treats Err as "MM routing entry unavailable for
-    /// this image" — request still proceeds with text-prefix routing.
+    #[cfg(feature = "mm-routing")]
+    fn image_routing_hash(url: &str, stable_key: Option<&str>) -> u64 {
+        stable_key
+            .and_then(stable_media_routing_hash)
+            .unwrap_or_else(|| Self::hash_image_url(url))
+    }
+
+    /// Image dimension fetch. For HTTP/HTTPS we issue a Range request for the
+    /// first 64 KB (covers PNG/WebP in <1 KB and JPEG SOF in worst case). A
+    /// trusted stable identity may accept one bounded full response from an
+    /// origin that ignores Range. For data: URIs we decode the base64 payload
+    /// locally and parse the header. Caller treats Err as "MM routing entry
+    /// unavailable for this image" — request still proceeds with text-prefix
+    /// routing.
     ///
     /// Results are cached by `mm_hash` so repeated requests for the same image
     /// (typical of multi-turn / session workloads) hit the cache and skip the
     /// HTTP fetch entirely. Without this cache, sticky-routing workloads pay
     /// 4–5× HTTP Range fetches per request just to compute routing tokens.
     #[cfg(feature = "mm-routing")]
-    async fn fetch_image_dims(mm_hash: u64, url: &str) -> Result<(u32, u32)> {
+    async fn fetch_image_dims(
+        mm_hash: u64,
+        url: &str,
+        allow_bounded_full_response: bool,
+    ) -> Result<(u32, u32)> {
         use moka::future::Cache;
         use std::sync::LazyLock;
 
@@ -1851,7 +1937,7 @@ impl OpenAIPreprocessor {
         let url_owned = url.to_string();
         DIM_CACHE
             .try_get_with(mm_hash, async move {
-                Self::fetch_image_dims_uncached(&url_owned)
+                Self::fetch_image_dims_uncached(&url_owned, allow_bounded_full_response)
                     .await
                     .map_err(|e| e.to_string())
             })
@@ -1860,7 +1946,64 @@ impl OpenAIPreprocessor {
     }
 
     #[cfg(feature = "mm-routing")]
-    async fn fetch_image_dims_uncached(url: &str) -> Result<(u32, u32)> {
+    async fn read_dim_response_body(
+        mut response: reqwest::Response,
+        allow_bounded_full_response: bool,
+        range_end: usize,
+    ) -> Result<(Vec<u8>, bool)> {
+        // A trusted stable identity lets a Range-ignoring origin pay one
+        // bounded full download per frontend and then reuse DIM_CACHE. Keep
+        // the old fail-closed behavior for URL-identity requests, where every
+        // rotating signature would otherwise trigger another full response.
+        const MAX_FULL_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+        let status = response.status();
+        let is_full_response = status == reqwest::StatusCode::OK;
+        let max_bytes = match status {
+            reqwest::StatusCode::PARTIAL_CONTENT => range_end + 1,
+            reqwest::StatusCode::OK if allow_bounded_full_response => MAX_FULL_RESPONSE_BYTES,
+            _ => {
+                anyhow::bail!(
+                    "image dim fetch expected 206 Partial Content, got HTTP {}",
+                    status
+                )
+            }
+        };
+
+        if response
+            .content_length()
+            .is_some_and(|content_length| content_length > max_bytes as u64)
+        {
+            anyhow::bail!(
+                "image dim response exceeds maximum size of {} bytes",
+                max_bytes
+            );
+        }
+
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(max_bytes as u64) as usize,
+        );
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+                anyhow::bail!(
+                    "image dim response exceeds maximum size of {} bytes",
+                    max_bytes
+                );
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        anyhow::ensure!(!bytes.is_empty(), "image dim response is empty");
+        Ok((bytes, is_full_response))
+    }
+
+    #[cfg(feature = "mm-routing")]
+    async fn fetch_image_dims_uncached(
+        url: &str,
+        allow_bounded_full_response: bool,
+    ) -> Result<(u32, u32)> {
         use image::ImageReader;
         use std::io::Cursor;
 
@@ -1920,28 +2063,19 @@ impl OpenAIPreprocessor {
                 .timeout(DIM_FETCH_TIMEOUT)
                 .send()
                 .await?;
-            let status = resp.status();
-            // Require 206 Partial Content — if the origin ignored the
-            // Range header and answered 200 OK, `.bytes()` would buffer
-            // the full image into memory. Bail in that case rather than
-            // download an unbounded payload just to peek at dimensions.
-            // The caller treats Err as "MM routing entry unavailable for
-            // this image", which falls back to text-prefix routing.
-            if status != reqwest::StatusCode::PARTIAL_CONTENT {
-                anyhow::bail!(
-                    "image dim fetch expected 206 Partial Content, got HTTP {}",
-                    status
-                );
-            }
-            let bytes = resp.bytes().await?;
+            let (bytes, is_full_response) =
+                Self::read_dim_response_body(resp, allow_bounded_full_response, range_end).await?;
             match ImageReader::new(Cursor::new(&bytes))
                 .with_guessed_format()
                 .and_then(|r| r.into_dimensions().map_err(std::io::Error::other))
             {
                 Ok((w, h)) => return Ok((w, h)),
-                Err(_) if range_end < LARGE_RANGE => {
+                Err(_) if !is_full_response && range_end < LARGE_RANGE => {
                     range_end = LARGE_RANGE;
                     continue;
+                }
+                Err(e) if is_full_response => {
+                    anyhow::bail!("image parse failed after bounded full response: {}", e)
                 }
                 Err(e) => anyhow::bail!("image header parse failed after 64KB: {}", e),
             }
@@ -4129,6 +4263,145 @@ mod tests {
 
     fn url_entry(u: &str) -> MultimodalData {
         MultimodalData::Url(url::Url::parse(u).unwrap())
+    }
+
+    #[test]
+    fn stable_media_cache_key_is_scoped_and_canonical() {
+        let media_uuid = uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let same = stable_media_cache_key("tenant-a", IMAGE_MODALITY, &media_uuid);
+
+        assert_eq!(
+            same,
+            stable_media_cache_key("tenant-a", IMAGE_MODALITY, &media_uuid)
+        );
+        assert_ne!(
+            same,
+            stable_media_cache_key("tenant-b", IMAGE_MODALITY, &media_uuid)
+        );
+        assert_ne!(
+            same,
+            stable_media_cache_key("tenant-a", b"video", &media_uuid)
+        );
+        assert_eq!(same.len(), 64);
+        assert!(
+            same.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            stable_media_routing_hash(&same),
+            u64::from_str_radix(&same[..16], 16).ok()
+        );
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[test]
+    fn stable_media_key_reuses_routing_dimension_identity_across_rotating_urls() {
+        let media_uuid = uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let stable_key = stable_media_cache_key("tenant-a", IMAGE_MODALITY, &media_uuid);
+        let first_url = "https://example.com/image.png?signature=first";
+        let second_url = "https://example.com/image.png?signature=second";
+        let expected = stable_media_routing_hash(&stable_key).unwrap();
+
+        assert_eq!(
+            OpenAIPreprocessor::image_routing_hash(first_url, Some(&stable_key)),
+            expected
+        );
+        assert_eq!(
+            OpenAIPreprocessor::image_routing_hash(second_url, Some(&stable_key)),
+            expected
+        );
+        assert_ne!(
+            OpenAIPreprocessor::image_routing_hash(first_url, None),
+            OpenAIPreprocessor::image_routing_hash(second_url, None)
+        );
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[tokio::test]
+    async fn stable_media_dimension_probe_accepts_bounded_http_200() {
+        use base64::Engine as _;
+        use image::ImageReader;
+        use std::io::Cursor;
+
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            )
+            .unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/image.png")
+            .with_status(200)
+            .with_body(&png)
+            .create_async()
+            .await;
+        let response = reqwest::Client::new()
+            .get(format!("{}/image.png", server.url()))
+            .send()
+            .await
+            .unwrap();
+
+        let (bytes, is_full_response) =
+            OpenAIPreprocessor::read_dim_response_body(response, true, 4095)
+            .await
+            .unwrap();
+        let dims = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+
+        assert_eq!(dims, (1, 1));
+        assert!(is_full_response);
+        mock.assert_async().await;
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[tokio::test]
+    async fn url_identity_dimension_probe_rejects_http_200() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/image.png")
+            .with_status(200)
+            .with_body("image bytes")
+            .create_async()
+            .await;
+        let response = reqwest::Client::new()
+            .get(format!("{}/image.png", server.url()))
+            .send()
+            .await
+            .unwrap();
+
+        let error = OpenAIPreprocessor::read_dim_response_body(response, false, 4095)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("expected 206 Partial Content"));
+        mock.assert_async().await;
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[tokio::test]
+    async fn partial_dimension_probe_rejects_oversized_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/image.png")
+            .with_status(206)
+            .with_body("12345")
+            .create_async()
+            .await;
+        let response = reqwest::Client::new()
+            .get(format!("{}/image.png", server.url()))
+            .send()
+            .await
+            .unwrap();
+
+        let error = OpenAIPreprocessor::read_dim_response_body(response, false, 3)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("maximum size of 4 bytes"));
+        mock.assert_async().await;
     }
 
     fn preprocessed_with_media(media: Option<MultimodalDataMap>) -> PreprocessedRequest {

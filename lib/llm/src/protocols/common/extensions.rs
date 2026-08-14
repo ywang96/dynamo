@@ -158,6 +158,16 @@ pub struct NvExt {
     #[builder(default, setter(strip_option))]
     pub cache_salt: Option<String>,
 
+    /// Tenant identity copied from the HTTP header path.
+    ///
+    /// This field is deliberately absent from serde and from the generated
+    /// builder. A request body can set `cache_salt`, but only
+    /// `apply_header_routing_overrides` can establish this provenance.
+    #[doc(hidden)]
+    #[serde(skip)]
+    #[builder(default, setter(skip))]
+    pub trusted_tenant_id: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub extra_fields: Option<Vec<String>>,
@@ -381,7 +391,8 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         }
     }
     if let Some(salt) = tenant_id {
-        ext.cache_salt = Some(salt);
+        ext.cache_salt = Some(salt.clone());
+        ext.trusted_tenant_id = Some(salt);
     }
     Some(ext)
 }
@@ -412,6 +423,18 @@ pub fn request_cache_salt<R: NvExtProvider>(request: &R) -> Option<&str> {
                 .and_then(|value| value.as_str())
                 .filter(|salt| !salt.is_empty())
         })
+}
+
+/// Return the non-empty tenant identity established by `x-tenant-id`.
+///
+/// Unlike [`request_cache_salt`], this never accepts request-body or legacy
+/// values. Deployments using this for media reuse must arrange for a trusted
+/// gateway to replace caller-provided tenant and media identity first.
+pub fn request_trusted_tenant_id<R: NvExtProvider>(request: &R) -> Option<&str> {
+    request
+        .nvext()
+        .and_then(|nvext| nvext.trusted_tenant_id.as_deref())
+        .filter(|tenant_id| !tenant_id.is_empty())
 }
 
 pub fn routing_constraints_to_kv(
@@ -704,6 +727,29 @@ mod tests {
     }
 
     #[test]
+    fn trusted_tenant_identity_requires_header_provenance() {
+        let mut request = CacheSaltRequest {
+            nvext: Some(NvExt {
+                cache_salt: Some("body-tenant".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(request_trusted_tenant_id(&request), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_TENANT_ID, "header-tenant".parse().unwrap());
+        request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
+
+        assert_eq!(request_trusted_tenant_id(&request), Some("header-tenant"));
+        assert_eq!(
+            serde_json::to_value(request.nvext.as_ref().unwrap()).unwrap()["trusted_tenant_id"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn shared_nvext_builder_default() {
         let nv_ext = NvExt::builder().build().unwrap();
         assert_eq!(nv_ext.greed_sampling, None);
@@ -889,6 +935,7 @@ mod tests {
 
         let nvext = apply_header_routing_overrides(None, &headers).unwrap();
         assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-a"));
+        assert_eq!(nvext.trusted_tenant_id.as_deref(), Some("tenant-a"));
 
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_TENANT_ID, "tenant-header".parse().unwrap());
@@ -899,6 +946,7 @@ mod tests {
 
         let nvext = apply_header_routing_overrides(Some(nvext), &headers).unwrap();
         assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-header"));
+        assert_eq!(nvext.trusted_tenant_id.as_deref(), Some("tenant-header"));
     }
 
     #[test]

@@ -54,6 +54,30 @@ fn multimodal_cache_key_from_url(url: &str) -> String {
     blake3::hash(url.as_bytes()).to_hex().to_string()
 }
 
+fn stable_image_cache_keys(request: &PreprocessedRequest) -> Option<Vec<Option<String>>> {
+    let values = request
+        .extra_args
+        .as_ref()?
+        .get("media_cache_keys_by_modality")?
+        .get("image")?
+        .as_array()?;
+    values
+        .iter()
+        .map(|value| match value {
+            serde_json::Value::Null => Some(None),
+            serde_json::Value::String(key)
+                if key.len() == 64
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Some(Some(key.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn preprocessed_multimodal_cache_keys(request: &PreprocessedRequest) -> Vec<String> {
     let Some(items) = request
         .multi_modal_data
@@ -63,12 +87,19 @@ fn preprocessed_multimodal_cache_keys(request: &PreprocessedRequest) -> Vec<Stri
         return Vec::new();
     };
 
+    let stable_keys = stable_image_cache_keys(request)
+        .filter(|keys| keys.len() == items.len())
+        .unwrap_or_else(|| vec![None; items.len()]);
+
     let mut keys = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            MultimodalData::Url(url) => keys.push(multimodal_cache_key_from_url(url.as_str())),
-            MultimodalData::RawUrl(url) => keys.push(multimodal_cache_key_from_url(url)),
-            MultimodalData::Decoded(_) => {}
+    for (item, stable_key) in items.iter().zip(stable_keys) {
+        match (item, stable_key) {
+            (_, Some(key)) => keys.push(key),
+            (MultimodalData::Url(url), None) => {
+                keys.push(multimodal_cache_key_from_url(url.as_str()))
+            }
+            (MultimodalData::RawUrl(url), None) => keys.push(multimodal_cache_key_from_url(url)),
+            (MultimodalData::Decoded(_), None) => {}
         }
     }
     keys.sort();
@@ -550,6 +581,81 @@ impl PreprocessedRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with_image_keys(
+        urls: &[&str],
+        stable_keys: Option<Vec<Option<&str>>>,
+    ) -> PreprocessedRequest {
+        let media = urls
+            .iter()
+            .map(|url| MultimodalData::Url(url::Url::parse(url).unwrap()))
+            .collect();
+        let mut builder = PreprocessedRequest::builder();
+        builder
+            .model("m".to_string())
+            .token_ids(vec![1])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .multi_modal_data(Some(std::collections::HashMap::from([(
+                "image_url".to_string(),
+                media,
+            )])));
+        if let Some(keys) = stable_keys {
+            builder.extra_args(Some(serde_json::json!({
+                "media_cache_keys_by_modality": {"image": keys},
+            })));
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn multimodal_cache_routing_prefers_aligned_stable_keys() {
+        let stable = "a".repeat(64);
+        let request = request_with_image_keys(
+            &["https://example.com/a?signature=1", "https://example.com/b"],
+            Some(vec![Some(stable.as_str()), None]),
+        );
+
+        let keys = preprocessed_multimodal_cache_keys(&request);
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&stable));
+        assert!(keys.contains(&multimodal_cache_key_from_url("https://example.com/b")));
+    }
+
+    #[test]
+    fn multimodal_cache_routing_rejects_misaligned_stable_keys() {
+        let request = request_with_image_keys(
+            &["https://example.com/a", "https://example.com/b"],
+            Some(vec![Some("a")]),
+        );
+
+        let keys = preprocessed_multimodal_cache_keys(&request);
+
+        assert_eq!(keys, {
+            let mut expected = vec![
+                multimodal_cache_key_from_url("https://example.com/a"),
+                multimodal_cache_key_from_url("https://example.com/b"),
+            ];
+            expected.sort();
+            expected
+        });
+    }
+
+    #[test]
+    fn multimodal_cache_routing_rejects_malformed_stable_keys() {
+        let request = request_with_image_keys(
+            &["https://example.com/a", "https://example.com/b"],
+            Some(vec![Some("caller-controlled"), None]),
+        );
+
+        let keys = preprocessed_multimodal_cache_keys(&request);
+
+        assert!(keys.contains(&multimodal_cache_key_from_url("https://example.com/a")));
+        assert!(keys.contains(&multimodal_cache_key_from_url("https://example.com/b")));
+        assert!(!keys.iter().any(|key| key == "caller-controlled"));
+    }
 
     #[test]
     fn test_validate_router_mode_for_lora() {

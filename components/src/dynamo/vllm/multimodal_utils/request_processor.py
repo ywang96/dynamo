@@ -67,14 +67,51 @@ def _normalize_forwarded_mm_modality(
     return modality
 
 
+def _is_stable_media_cache_key(value: Any) -> bool:
+    """Accept only frontend-derived BLAKE3 identities or an untrusted sentinel."""
+    return value is None or (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _stable_media_cache_keys(
+    extra_args: dict[str, Any],
+    modality: str,
+    expected_count: int | None = None,
+) -> list[str | None] | None:
+    """Return an aligned stable-key list containing at least one trusted key."""
+    grouped_keys = extra_args.get("media_cache_keys_by_modality")
+    if not isinstance(grouped_keys, dict):
+        return None
+    keys = grouped_keys.get(modality)
+    if not isinstance(keys, list) or not keys:
+        return None
+    if expected_count is not None and len(keys) != expected_count:
+        logger.warning(
+            "Ignoring misaligned stable %s cache keys: %s keys for %s items",
+            modality,
+            len(keys),
+            expected_count,
+        )
+        return None
+    if not all(_is_stable_media_cache_key(key) for key in keys):
+        logger.warning("Ignoring malformed stable %s cache keys", modality)
+        return None
+    if not any(key is not None for key in keys):
+        return None
+    return keys
+
+
 def _build_forwarded_mm_uuids(
     extra_args: dict[str, Any],
     use_unified_vision_chunk: bool,
 ) -> Optional[dict[str, Any]]:
     """Preserve frontend cache identities, including mixed modalities."""
+    mm_uuids: dict[str, Any] = {}
     grouped_hashes = extra_args.get("mm_hashes_by_modality")
     if isinstance(grouped_hashes, dict):
-        mm_uuids: dict[str, Any] = {}
         for modality, hashes in grouped_hashes.items():
             if not hashes:
                 continue
@@ -85,8 +122,6 @@ def _build_forwarded_mm_uuids(
             mm_uuids.setdefault(modality_key, []).extend(
                 pad_mm_hashes_to_64(list(hashes))
             )
-        if mm_uuids:
-            return mm_uuids
 
     forwarded_hashes = extra_args.get("mm_hashes")
     if forwarded_hashes:
@@ -94,9 +129,30 @@ def _build_forwarded_mm_uuids(
             "image",
             use_unified_vision_chunk,
         )
-        return {modality_key: pad_mm_hashes_to_64(list(forwarded_hashes))}
+        if modality_key not in mm_uuids:
+            mm_uuids[modality_key] = pad_mm_hashes_to_64(list(forwarded_hashes))
 
-    return None
+    stable_keys_by_modality = extra_args.get("media_cache_keys_by_modality")
+    if isinstance(stable_keys_by_modality, dict):
+        for modality in stable_keys_by_modality:
+            keys = _stable_media_cache_keys(extra_args, str(modality))
+            if keys is None:
+                continue
+            modality_key = _normalize_forwarded_mm_modality(
+                str(modality),
+                use_unified_vision_chunk,
+            )
+            fallbacks = mm_uuids.get(modality_key)
+            if not isinstance(fallbacks, list) or len(fallbacks) != len(keys):
+                fallbacks = [None] * len(keys)
+            # Keep routing-provided UUIDs at untrusted positions when they are
+            # aligned. Without routing metadata, None asks vLLM to hash content.
+            mm_uuids[modality_key] = [
+                key if key is not None else fallbacks[index]
+                for index, key in enumerate(keys)
+            ]
+
+    return mm_uuids or None
 
 
 def _get_modality_extra_values(
@@ -321,6 +377,13 @@ class VllmMultimodalRequestProcessor:
                 return None
 
             vllm_mm_data: dict[str, Any] = {}
+            image_items = mm_map.get(IMAGE_URL_KEY, [])
+            extra_args = request.get("extra_args") or {}
+            image_cache_keys = _stable_media_cache_keys(
+                extra_args,
+                "image",
+                len(image_items),
+            )
 
             # A separate encoder currently supports URL-based images only. Keep
             # processing other modalities locally so mixed image/video requests
@@ -339,15 +402,21 @@ class VllmMultimodalRequestProcessor:
                             image_urls,
                             request_id,
                             model=self.model,
+                            cache_keys=image_cache_keys,
                             context=context,
                         )
                     )
 
-            image_items = mm_map.get(IMAGE_URL_KEY, [])
             image_key = "vision_chunk" if self.use_unified_vision_chunk else "image"
             if image_key not in vllm_mm_data and image_items:
                 with _nvtx.annotate("mm_backend:image_download", color="green"):
-                    images = await self.image_loader.load_image_batch(image_items)
+                    if image_cache_keys is None:
+                        images = await self.image_loader.load_image_batch(image_items)
+                    else:
+                        images = await self.image_loader.load_image_batch(
+                            image_items,
+                            cache_keys=image_cache_keys,
+                        )
                 if images:
                     if self.use_unified_vision_chunk:
                         chunks = [

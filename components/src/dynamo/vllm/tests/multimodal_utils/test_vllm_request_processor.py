@@ -79,6 +79,72 @@ async def test_extracts_mixed_url_data_url_and_decoded_media():
 
 
 @pytest.mark.asyncio
+async def test_extract_forwards_aligned_stable_image_cache_keys():
+    processor = _processor()
+    image = Image.new("RGB", (1, 1))
+    image_items = [
+        {"Url": "https://example.com/a.png?signature=first"},
+        {"Url": "https://example.com/b.png?signature=second"},
+    ]
+    stable_keys = ["a" * 64, None]
+    processor.image_loader.load_image_batch.return_value = [image, image]
+
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {"image_url": image_items},
+            "extra_args": {
+                "media_cache_keys_by_modality": {"image": stable_keys},
+            },
+        },
+        "request-stable-cache",
+        None,
+    )
+
+    processor.image_loader.load_image_batch.assert_awaited_once_with(
+        image_items,
+        cache_keys=stable_keys,
+    )
+
+
+@pytest.mark.asyncio
+async def test_extract_ignores_misaligned_stable_image_cache_keys():
+    processor = _processor()
+    image_items = [{"Url": "https://example.com/a.png"}]
+
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {"image_url": image_items},
+            "extra_args": {
+                "media_cache_keys_by_modality": {"image": ["a" * 64, "b" * 64]},
+            },
+        },
+        "request-misaligned-cache",
+        None,
+    )
+
+    processor.image_loader.load_image_batch.assert_awaited_once_with(image_items)
+
+
+@pytest.mark.asyncio
+async def test_extract_ignores_malformed_stable_image_cache_keys():
+    processor = _processor()
+    image_items = [{"Url": "https://example.com/a.png"}]
+
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {"image_url": image_items},
+            "extra_args": {
+                "media_cache_keys_by_modality": {"image": ["caller-controlled"]},
+            },
+        },
+        "request-malformed-cache",
+        None,
+    )
+
+    processor.image_loader.load_image_batch.assert_awaited_once_with(image_items)
+
+
+@pytest.mark.asyncio
 async def test_merges_encoder_images_with_local_video_and_decoded_fallback():
     processor = _processor()
     encoded_image = {"image_embeds": object()}
@@ -111,7 +177,45 @@ async def test_merges_encoder_images_with_local_video_and_decoded_fallback():
     )
 
     assert result == {"image": decoded_image}
-    processor.embedding_loader.load_multimodal_embeddings.assert_awaited_once()
+    processor.embedding_loader.load_multimodal_embeddings.assert_awaited_once_with(
+        ["https://example.com/image.png"],
+        "request-encoder",
+        model=processor.model,
+        cache_keys=None,
+        context=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_encoder_loader_receives_stable_image_cache_keys():
+    processor = _processor()
+    stable_keys = ["a" * 64]
+    processor.embedding_loader = SimpleNamespace(
+        load_multimodal_embeddings=AsyncMock(
+            return_value={"image": {"image_embeds": object()}}
+        )
+    )
+
+    await processor.extract_multimodal_data(
+        {
+            "multi_modal_data": {
+                "image_url": [{"Url": "https://example.com/image.png?signature=1"}]
+            },
+            "extra_args": {
+                "media_cache_keys_by_modality": {"image": stable_keys},
+            },
+        },
+        "request-encoder-stable-cache",
+        None,
+    )
+
+    processor.embedding_loader.load_multimodal_embeddings.assert_awaited_once_with(
+        ["https://example.com/image.png?signature=1"],
+        "request-encoder-stable-cache",
+        model=processor.model,
+        cache_keys=stable_keys,
+        context=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -326,6 +430,68 @@ def test_build_tokens_prompt_remaps_grouped_image_hashes_to_vision_chunk():
 
     assert prompt["multi_modal_uuids"] == {
         "vision_chunk": ["image_hash".ljust(64, "0")]
+    }
+
+
+def test_build_tokens_prompt_prefers_stable_keys_and_preserves_nulls():
+    stable_key = "a" * 64
+    prompt = _processor(unified_vision_chunk=True).build_tokens_prompt(
+        {
+            "token_ids": [1, 2, 3],
+            "extra_args": {
+                "media_cache_keys_by_modality": {
+                    "image": [stable_key, None],
+                },
+                "mm_hashes": ["legacy-a", "legacy-b"],
+            },
+        },
+        {"vision_chunk": [object(), object()]},
+        None,
+    )
+
+    assert prompt["multi_modal_uuids"] == {
+        "vision_chunk": [stable_key, "legacy-b".ljust(64, "0")],
+    }
+
+
+def test_build_tokens_prompt_stable_keys_without_routing_hashes_preserve_nulls():
+    stable_key = "a" * 64
+    prompt = _processor().build_tokens_prompt(
+        {
+            "token_ids": [1, 2, 3],
+            "extra_args": {
+                "media_cache_keys_by_modality": {
+                    "image": [stable_key, None],
+                },
+            },
+        },
+        {"image": [object(), object()]},
+        None,
+    )
+
+    assert prompt["multi_modal_uuids"] == {
+        "image": [stable_key, None],
+    }
+
+
+def test_build_tokens_prompt_all_null_stable_keys_keep_legacy_hashes():
+    prompt = _processor().build_tokens_prompt(
+        {
+            "token_ids": [1, 2, 3],
+            "extra_args": {
+                "media_cache_keys_by_modality": {"image": [None, None]},
+                "mm_hashes": ["legacy-a", "legacy-b"],
+            },
+        },
+        {"image": [object(), object()]},
+        None,
+    )
+
+    assert prompt["multi_modal_uuids"] == {
+        "image": [
+            "legacy-a".ljust(64, "0"),
+            "legacy-b".ljust(64, "0"),
+        ],
     }
 
 

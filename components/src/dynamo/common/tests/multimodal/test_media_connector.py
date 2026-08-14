@@ -31,6 +31,7 @@ class TestImageLoaderCache:
         loader._cache_put(url.lower(), img)
         assert url.lower() in loader._image_cache
         assert loader._image_cache[url.lower()] is img
+        assert loader.cache_stats["bytes"] == 48
 
     def test_cache_eviction(self):
         """Oldest entry is evicted when cache is full."""
@@ -57,3 +58,4 @@ class TestImageLoaderCache:
         loader._cache_put("url1", img)
         loader._cache_put("url1", img)
         assert len(loader._image_cache) == 1
+        assert loader.cache_stats["bytes"] == 48

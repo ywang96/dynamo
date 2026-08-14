@@ -223,6 +223,7 @@ async def _fetch_embeddings(
     request_id: str,
     receiver: AbstractEmbeddingReceiver,
     cache: MultimodalEmbeddingCacheManager | None = None,
+    cache_keys: list[str | None] | None = None,
     context=None,
 ) -> tuple[list[MultiModalGroup], _PendingRelease | None]:
     """Fetch multimodal embeddings with transparent cache-through.
@@ -237,11 +238,14 @@ async def _fetch_embeddings(
     """
     results: list[MultiModalGroup | None] = [None] * len(image_urls)
     to_fetch: list[tuple[int, str, str | None]] = []
+    if cache_keys is not None and len(cache_keys) != len(image_urls):
+        raise ValueError("cache_keys must have the same length as image_urls")
 
     # ── 1. Check cache (no-op when cache is None) ────────────────────
     for idx, url in enumerate(image_urls):
         if cache is not None:
-            key = get_embedding_hash(url)
+            stable_key = cache_keys[idx] if cache_keys is not None else None
+            key = stable_key or get_embedding_hash(url)
             cached = cache.get(key)
             if cached is not None:
                 logger.debug(f"[{request_id}] Cache hit for URL index {idx}")
@@ -305,6 +309,7 @@ class MultiModalEmbeddingLoader:
         request_id: str,
         *,
         model: str,
+        cache_keys: list[str | None] | None = None,
         context=None,
     ) -> Dict[str, Any]:
         """Fetch embeddings and build engine-ready ``multi_modal_data``.
@@ -323,6 +328,7 @@ class MultiModalEmbeddingLoader:
             request_id,
             self._receiver,
             cache=self._embedding_cache_manager,
+            cache_keys=cache_keys,
             context=context,
         )
 

@@ -53,6 +53,83 @@ class TestMultimodalEmbeddingLoader:
         assert torch.equal(mm_data["image"], tensor)
 
     @pytest.mark.asyncio
+    async def test_stable_key_reuses_embedding_across_rotating_urls(self):
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=1024 * 1024)
+        tensor = torch.randn(1, 10, dtype=DTYPE)
+        stable_key = "a" * 64
+        cache.set(
+            stable_key,
+            CachedEmbedding(tensor=tensor, image_grid_thw=[[1, 2, 3]]),
+        )
+
+        with patch.object(
+            mod,
+            "_fetch_from_encode_workers",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            embedding_loader = mod.MultiModalEmbeddingLoader(AsyncMock(), None, cache)
+            mm_data = await embedding_loader.load_multimodal_embeddings(
+                ["https://example.com/image.png?signature=rotated"],
+                "req-stable",
+                model=MODEL,
+                cache_keys=[stable_key],
+            )
+
+        mock_fetch.assert_not_awaited()
+        assert torch.equal(mm_data["image"], tensor)
+
+    @pytest.mark.asyncio
+    async def test_mixed_stable_and_url_embedding_cache_keys(self):
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=1024 * 1024)
+        stable_tensor = torch.randn(1, 10, dtype=DTYPE)
+        url_tensor = torch.randn(1, 10, dtype=DTYPE)
+        stable_key = "a" * 64
+        url = "https://example.com/untrusted.png?signature=1"
+        cache.set(
+            stable_key,
+            CachedEmbedding(tensor=stable_tensor, image_grid_thw=None),
+        )
+        cache.set(
+            mod.get_embedding_hash(url),
+            CachedEmbedding(tensor=url_tensor, image_grid_thw=None),
+        )
+
+        with patch.object(
+            mod,
+            "_fetch_from_encode_workers",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            embedding_loader = mod.MultiModalEmbeddingLoader(AsyncMock(), None, cache)
+            mm_data = await embedding_loader.load_multimodal_embeddings(
+                ["https://example.com/stable.png?signature=2", url],
+                "req-mixed",
+                model=MODEL,
+                cache_keys=[stable_key, None],
+            )
+
+        mock_fetch.assert_not_awaited()
+        assert torch.equal(
+            mm_data["image"],
+            torch.cat((stable_tensor, url_tensor)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_embedding_cache_rejects_misaligned_stable_keys(self):
+        embedding_loader = mod.MultiModalEmbeddingLoader(
+            AsyncMock(),
+            None,
+            MultimodalEmbeddingCacheManager(capacity_bytes=1024 * 1024),
+        )
+
+        with pytest.raises(ValueError, match="same length"):
+            await embedding_loader.load_multimodal_embeddings(
+                ["https://example.com/image.png"],
+                "req-misaligned",
+                model=MODEL,
+                cache_keys=[],
+            )
+
+    @pytest.mark.asyncio
     async def test_all_uncached_with_cache(self):
         """All URLs uncached with cache -> encode worker call, results cached."""
         cache = MultimodalEmbeddingCacheManager(capacity_bytes=1024 * 1024)

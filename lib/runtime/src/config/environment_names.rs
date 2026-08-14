@@ -294,6 +294,9 @@ pub mod llm {
     /// HTTP body size limit in MB
     pub const DYN_HTTP_BODY_LIMIT_MB: &str = "DYN_HTTP_BODY_LIMIT_MB";
 
+    /// Trust gateway-provided, tenant-scoped media UUIDs for cross-URL cache reuse.
+    pub const DYN_MM_TRUST_MEDIA_UUIDS: &str = "DYN_MM_TRUST_MEDIA_UUIDS";
+
     pub const DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: &str =
         "DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS";
 

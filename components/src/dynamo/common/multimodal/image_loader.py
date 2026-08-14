@@ -53,6 +53,10 @@ DEFAULT_MAX_IMAGE_BYTES: Final = int(
 DEFAULT_FETCH_CONCURRENCY: Final = max(
     1, int(os.environ.get("DYN_MM_FETCH_CONCURRENCY", "32"))
 )
+DEFAULT_IMAGE_CACHE_MAX_BYTES: Final = max(
+    0,
+    int(os.environ.get("DYN_MM_IMAGE_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
+)
 
 
 class ImageValidationError(ValueError):
@@ -89,7 +93,7 @@ async def read_decoded_media_via_nixl(*args: Any, **kwargs: Any) -> Any:
 
 
 class ImageLoader:
-    CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "8"))
+    CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "1024"))
 
     def __init__(
         self,
@@ -99,6 +103,7 @@ class ImageLoader:
         url_policy: UrlValidationPolicy | None = None,
         max_image_bytes: int | None = DEFAULT_MAX_IMAGE_BYTES,
         fetch_concurrency: int = DEFAULT_FETCH_CONCURRENCY,
+        cache_max_bytes: int = DEFAULT_IMAGE_CACHE_MAX_BYTES,
     ):
         """
         Initialize the ImageLoader with caching, HTTP settings, and optional NIXL config for
@@ -107,6 +112,9 @@ class ImageLoader:
         Args:
             cache_size: Maximum number of images to store in the in-memory LRU cache.
                 Defaults to CACHE_SIZE_MAXIMUM.
+            cache_max_bytes: Maximum decoded bytes retained by the LRU cache.
+                Defaults to DYN_MM_IMAGE_CACHE_MAX_BYTES or 512 MiB. A
+                non-positive value disables decoded-image caching.
             fetch_concurrency: Maximum images fetched+decoded concurrently by
                 load_image_batch. Bounds peak host memory, which scales with this
                 value rather than with the number of images in the request.
@@ -123,9 +131,15 @@ class ImageLoader:
         """
         self._http_timeout = http_timeout
         self._cache_size = cache_size
+        self._cache_max_bytes = max(0, cache_max_bytes)
+        self._cache_bytes = 0
         self._fetch_concurrency = max(1, fetch_concurrency)
         self._image_cache: OrderedDict[str, Image.Image] = OrderedDict()
+        self._cache_entry_bytes: dict[str, int] = {}
         self._inflight: dict[str, asyncio.Task[Image.Image]] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
         self._enable_frontend_decoding = enable_frontend_decoding
         self._url_policy = url_policy or UrlValidationPolicy.from_env()
         self._max_image_bytes = max_image_bytes
@@ -182,12 +196,60 @@ class ImageLoader:
                 f"{size_bytes} bytes > {self._max_image_bytes} bytes ({source})"
             )
 
+    @staticmethod
+    def _decoded_image_bytes(image: Image.Image) -> int:
+        """Return the decoded pixel-buffer size retained by Pillow."""
+        bits_per_pixel = {
+            "1": 1,
+            "L": 8,
+            "LA": 16,
+            "P": 8,
+            "RGB": 24,
+            "RGBA": 32,
+            "CMYK": 32,
+            "I": 32,
+            "F": 32,
+            "I;16": 16,
+        }.get(image.mode, 8 * len(image.getbands()))
+        return (image.width * image.height * bits_per_pixel + 7) // 8
+
     def _cache_put(self, key: str, image: Image.Image) -> None:
-        """Insert into cache if not already present. Sync — no awaits."""
-        if key not in self._image_cache:
-            if len(self._image_cache) >= self._cache_size:
-                self._image_cache.popitem(last=False)
-            self._image_cache[key] = image
+        """Insert into the count- and decoded-byte-bounded LRU."""
+        size_bytes = self._decoded_image_bytes(image)
+        if (
+            self._cache_size <= 0
+            or self._cache_max_bytes <= 0
+            or size_bytes > self._cache_max_bytes
+        ):
+            return
+
+        existing = self._image_cache.pop(key, None)
+        if existing is not None:
+            self._cache_bytes -= self._cache_entry_bytes.pop(key)
+
+        while self._image_cache and (
+            len(self._image_cache) >= self._cache_size
+            or self._cache_bytes + size_bytes > self._cache_max_bytes
+        ):
+            evicted_key, _ = self._image_cache.popitem(last=False)
+            evicted_bytes = self._cache_entry_bytes.pop(evicted_key)
+            self._cache_bytes -= evicted_bytes
+            self._cache_evictions += 1
+
+        self._image_cache[key] = image
+        self._cache_entry_bytes[key] = size_bytes
+        self._cache_bytes += size_bytes
+
+    @property
+    def cache_stats(self) -> dict[str, int]:
+        """Return a snapshot of decoded-image cache counters and occupancy."""
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "evictions": self._cache_evictions,
+            "entries": len(self._image_cache),
+            "bytes": self._cache_bytes,
+        }
 
     async def _fetch_and_process(self, image_url: str) -> Image.Image:
         """Fetch image via HTTP(S), decode with PIL, return RGB Image.
@@ -267,7 +329,9 @@ class ImageLoader:
         return Image.fromarray(arr)
 
     @_nvtx.annotate("mm:img:load_image", color="lime")
-    async def load_image(self, image_url: str) -> Image.Image:
+    async def load_image(
+        self, image_url: str, cache_key: str | None = None
+    ) -> Image.Image:
         parsed_url = urlparse(image_url)
         if parsed_url.scheme in ("", "file"):
             raise ImageValidationError(
@@ -277,12 +341,18 @@ class ImageLoader:
         parsed_url = urlparse(normalized_url)
 
         if parsed_url.scheme in ("http", "https"):
-            key = normalized_url.lower()
+            # Validation deliberately precedes cache identity selection. A new
+            # signed URL cannot use a stable cache key to bypass the SSRF
+            # policy, even when its image is already resident.
+            key = cache_key or normalized_url
 
             if key in self._image_cache:
-                logger.debug(f"Image found in cache for URL: {image_url}")
+                self._cache_hits += 1
+                logger.debug("Image found in cache for key: %s", key)
                 self._image_cache.move_to_end(key)
                 return self._image_cache[key]
+
+            self._cache_misses += 1
 
             if key not in self._inflight:
                 task = asyncio.create_task(self._fetch_and_cache(key, normalized_url))
@@ -330,6 +400,7 @@ class ImageLoader:
     async def load_image_batch(
         self,
         image_mm_items: List[Dict[str, Any]],
+        cache_keys: List[str | None] | None = None,
     ) -> List[Any]:
         """
         Load a batch of images from multimodal data items.
@@ -340,6 +411,9 @@ class ImageLoader:
 
         Args:
             image_mm_items: List of multimodal data items for images
+            cache_keys: Optional list aligned with image_mm_items. Non-null
+                entries are trusted stable identities derived by the frontend;
+                null entries retain full-URL identity.
 
         Returns:
             List of loaded image data
@@ -363,13 +437,20 @@ class ImageLoader:
             async with semaphore:
                 return await coro
 
+        if cache_keys is None:
+            cache_keys = [None] * len(image_mm_items)
+        if len(cache_keys) != len(image_mm_items):
+            raise ValueError("cache_keys must have the same length as image_mm_items")
+
         image_futures = []
 
-        for item in image_mm_items:
+        for item, cache_key in zip(image_mm_items, cache_keys):
             if isinstance(item, dict) and URL_VARIANT_KEY in item:
                 # URL path: download and decode in Python backend
                 url = item[URL_VARIANT_KEY]
-                image_futures.append(_bounded(self.load_image(url)))
+                image_futures.append(
+                    _bounded(self.load_image(url, cache_key=cache_key))
+                )
                 logger.debug(f"Preparing to load image from URL: {url[:80]}...")
             elif isinstance(item, dict) and DECODED_VARIANT_KEY in item:
                 if self._enable_frontend_decoding:
